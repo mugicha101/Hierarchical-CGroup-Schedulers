@@ -79,7 +79,7 @@ restart:
 
 	SCX_OPS_LOAD(skel, wrr_ops, scx_wrr, uei);
 	link = SCX_OPS_ATTACH(skel, wrr_ops, scx_wrr);
-	fprintf(stdout, "PASSED THE VERIFIER!\n");
+	fprintf(stdout, "SCX WRR ATTACHED\n");
 
 	while (!exit_req && !UEI_EXITED(skel, uei)) {
 		sleep(1);
@@ -88,6 +88,7 @@ restart:
 	bpf_link__destroy(link);
 	ecode = UEI_REPORT(skel, uei);
 	scx_wrr__destroy(skel);
+	fprintf(stdout, "SCX WRR DETACHED\n");
 
 	if (UEI_ECODE_RESTART(ecode))
 		goto restart;

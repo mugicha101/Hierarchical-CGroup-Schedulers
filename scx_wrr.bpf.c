@@ -164,6 +164,7 @@ static int budget_timer_callback(void *map, int *key, struct bpf_timer *timer) {
 
 s32 BPF_STRUCT_OPS_SLEEPABLE(wrr_init)
 {
+	bpf_printk("[INFO] [INIT] Initializing SCX WRR Scheduler");
 	u32 err = 0;
 	u32 cpu;
 	bpf_for(cpu, 0, scx_bpf_nr_cpu_ids()) {
@@ -178,7 +179,7 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(wrr_init)
 
 void BPF_STRUCT_OPS(wrr_exit)
 {
-	bpf_printk("[INFO] [EXIT] Exiting SCX Deadline Scheduler\n");
+	bpf_printk("[INFO] [EXIT] Exiting SCX WRR Scheduler\n");
 }
 
 // looks for cgroup in global_subs
@@ -214,6 +215,7 @@ bool global_sub_lookup(struct global_sub_params *global_subs, u64 cgrp_id, struc
 s32 BPF_STRUCT_OPS(wrr_sub_attach, struct scx_sub_attach_args *args)
 {
 	u64 cgrp_id = args->ops->sub_cgroup_id;
+	bpf_printk("[INFO] [SUB_ATTACH] Attaching cgroup %llu", cgrp_id);
 	struct global_sub_params *gsp;
 	struct global_data *global = fetch_global();
 	if (unlikely(!global)) return -EINVAL; // for verifier, should not happen
@@ -224,12 +226,12 @@ s32 BPF_STRUCT_OPS(wrr_sub_attach, struct scx_sub_attach_args *args)
 
 	if (global_sub_lookup(global_subs, cgrp_id, &gsp, NULL)) {
 		bpf_spin_unlock(global_subs_write_lock);
- 		bpf_printk("[INFO] [ATTACH] %llu already attached", cgrp_id);
+ 		bpf_printk("[INFO] [SUB_ATTACH] %llu already attached", cgrp_id);
 		return -EEXIST;
 	}
 	if (!gsp) {
 		bpf_spin_unlock(global_subs_write_lock);
-		bpf_printk("[INFO] [ATTACH] %llu attaching sub would exceed MAX_SUB_SCHEDS", cgrp_id);
+		bpf_printk("[INFO] [SUB_ATTACH] %llu attaching sub would exceed MAX_SUB_SCHEDS", cgrp_id);
 		return -ENOMEM;
 	}
 
@@ -248,6 +250,7 @@ s32 BPF_STRUCT_OPS(wrr_sub_attach, struct scx_sub_attach_args *args)
 void BPF_STRUCT_OPS(wrr_sub_detach, struct scx_sub_detach_args *args)
 {
   u64 cgrp_id = args->ops->sub_cgroup_id;
+	bpf_printk("[INFO] [SUB_DETACH] Detaching cgroup %llu", cgrp_id);
 	struct global_sub_params *gsp;
 	struct global_data *global = fetch_global();
 	if (unlikely(!global)) return; // for verifier, should not happen
@@ -258,7 +261,7 @@ void BPF_STRUCT_OPS(wrr_sub_detach, struct scx_sub_detach_args *args)
 
 	if (!global_sub_lookup(global_subs, cgrp_id, &gsp, NULL) || !gsp) {
 		bpf_spin_unlock(global_subs_write_lock);
- 		bpf_printk("[INFO] [DETACH] %llu not attached", cgrp_id);
+ 		bpf_printk("[INFO] [SUB_DETACH] %llu not attached", cgrp_id);
 		return;
 	}
 
@@ -274,7 +277,8 @@ void BPF_STRUCT_OPS(wrr_sub_detach, struct scx_sub_detach_args *args)
 
 void BPF_STRUCT_OPS(wrr_cgroup_set_weight, struct cgroup *cgrp, u32 weight)
 {
-  u64 cgrp_id = cgrp->kn->id;
+	u64 cgrp_id = cgrp->kn->id;
+	bpf_printk("[INFO] [SET_WEIGHT] Setting cgroup %llu weight to %u", cgrp, weight);
 	struct global_sub_params *gsp;
 	struct global_data *global = fetch_global();
 	if (unlikely(!global)) return; // for verifier, should not happen
@@ -321,6 +325,7 @@ bool try_sub_dispatch(struct local_sub_params *lsp, struct cpu_sched_state *ss, 
 
 void BPF_STRUCT_OPS(wrr_dispatch, s32 cpu, struct task_struct *prev)
 {
+	bpf_printk("[INFO] [DISPATCH] dispatching on cpu %u", cpu);
 	u32 ucpu = cpu;
 	struct cpu_sched_state *ss = bpf_map_lookup_elem(&sched_state, &ucpu);
 	struct global_data *global = fetch_global();
@@ -366,59 +371,69 @@ s32 BPF_STRUCT_OPS(wrr_cgroup_init, struct cgroup *cgrp, struct scx_cgroup_init_
 // task scheduling functions that should not be called
 s32 BPF_STRUCT_OPS(wrr_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake_flags)
 {
-  scx_bpf_error("wrr_select_cpu called unexpectedly");
+	bpf_printk("[INFO] wrr_select_cpu called unexpectedly");
+  // scx_bpf_error("wrr_select_cpu called unexpectedly");
     return prev_cpu; // Required to return a valid CPU even when erroring
 }
 
 void BPF_STRUCT_OPS(wrr_enqueue, struct task_struct *p, u64 enq_flags)
 {
-  scx_bpf_error("wrr_enqueue called unexpectedly");
+	bpf_printk("[INFO] wrr_enqueue called unexpectedly");
+  // scx_bpf_error("wrr_enqueue called unexpectedly");
 }
 
 void BPF_STRUCT_OPS(wrr_dequeue, struct task_struct *p, u64 deq_flags)
 {
-  scx_bpf_error("wrr_dequeue called unexpectedly");
+	bpf_printk("[INFO] wrr_dequeue called unexpectedly");
+  // scx_bpf_error("wrr_dequeue called unexpectedly");
 }
 
 void BPF_STRUCT_OPS(wrr_cpu_acquire, s32 cpu, struct scx_cpu_acquire_args *args)
 {
-  scx_bpf_error("wrr_cpu_acquire called unexpectedly");
+	bpf_printk("[INFO] wrr_cpu_acquire called unexpectedly");
+  // scx_bpf_error("wrr_cpu_acquire called unexpectedly");
 }
 
 void BPF_STRUCT_OPS(wrr_cpu_release, s32 cpu, struct scx_cpu_release_args *args)
 {
-  scx_bpf_error("wrr_cpu_release called unexpectedly");
+	bpf_printk("[INFO] wrr_cpu_release called unexpectedly");
+  // scx_bpf_error("wrr_cpu_release called unexpectedly");
 }
 
 void BPF_STRUCT_OPS(wrr_running, struct task_struct *p)
 {
-  scx_bpf_error("wrr_running called unexpectedly");
+	bpf_printk("[INFO] wrr_running called unexpectedly");
+  // scx_bpf_error("wrr_running called unexpectedly");
 }
 
 void BPF_STRUCT_OPS(wrr_stopping, struct task_struct *p, bool runnable)
 {
-  scx_bpf_error("wrr_stopping called unexpectedly");
+	bpf_printk("[INFO] wrr_stopping called unexpectedly");
+  // scx_bpf_error("wrr_stopping called unexpectedly");
 }
 
 void BPF_STRUCT_OPS(wrr_runnable, struct task_struct *p, u64 enq_flags)
 {
-  scx_bpf_error("wrr_runnable called unexpectedly");
+	bpf_printk("[INFO] wrr_runnable called unexpectedly");
+  // scx_bpf_error("wrr_runnable called unexpectedly");
 }
 
 void BPF_STRUCT_OPS(wrr_quiescent, struct task_struct *p, u64 deq_flags)
 {
-  scx_bpf_error("wrr_quiescent called unexpectedly");
+	bpf_printk("[INFO] wrr_quiescent called unexpectedly");
+  // scx_bpf_error("wrr_quiescent called unexpectedly");
 }
 
 s32 BPF_STRUCT_OPS(wrr_init_task, struct task_struct *p, struct scx_init_task_args *args)
 {
-  scx_bpf_error("wrr_init_task called unexpectedly");
-    return -EINVAL;
+	bpf_printk("[INFO] wrr_init_task called (pid: %u policy: %d)", p->pid, p->policy);
+	return 0;
 }
 
 void BPF_STRUCT_OPS(wrr_exit_task, struct task_struct *p, struct scx_exit_task_args *args)
 {
-  scx_bpf_error("wrr_exit_task called unexpectedly");
+	bpf_printk("[INFO] wrr_exit_task called unexpectedly");
+  // scx_bpf_error("wrr_exit_task called unexpectedly");
 }
 
 // ops
