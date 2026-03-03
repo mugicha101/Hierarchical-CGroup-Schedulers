@@ -11,11 +11,17 @@
 #include <bpf/bpf.h>
 #include <scx/common.h>
 #include <stdint.h>
-#include "scx_deadline.bpf.skel.h"
-struct task_ctx {
-	u64	abs_deadline;
+
+struct seqlock_global {
+	__u64 gen_fin;
+	__u64 gen_beg;
 };
-// #include "include/deadline_structs.h"
+
+struct seqlock_local {
+	__u64 gen;
+};
+
+#include "scx_wrr.bpf.skel.h"
 
 const char help_fmt[] =
 "A simple sched_ext scheduler.\n"
@@ -45,7 +51,7 @@ static void sigint_handler(int simple)
 
 int main(int argc, char **argv)
 {
-	struct scx_deadline *skel;
+	struct scx_wrr *skel;
 	struct bpf_link *link;
 	__u32 opt;
 	__u64 ecode;
@@ -54,7 +60,7 @@ int main(int argc, char **argv)
 	signal(SIGINT, sigint_handler);
 	signal(SIGTERM, sigint_handler);
 restart:
-	skel = SCX_OPS_OPEN(deadline_ops, scx_deadline);
+	skel = SCX_OPS_OPEN(wrr_ops, scx_wrr);
 
 	while ((opt = getopt(argc, argv, "fvh")) != -1) {
 		switch (opt) {
@@ -71,8 +77,9 @@ restart:
 		}
 	}
 
-	SCX_OPS_LOAD(skel, deadline_ops, scx_deadline, uei);
-	link = SCX_OPS_ATTACH(skel, deadline_ops, scx_deadline);
+	SCX_OPS_LOAD(skel, wrr_ops, scx_wrr, uei);
+	link = SCX_OPS_ATTACH(skel, wrr_ops, scx_wrr);
+	fprintf(stdout, "PASSED THE VERIFIER!\n");
 
 	while (!exit_req && !UEI_EXITED(skel, uei)) {
 		sleep(1);
@@ -80,7 +87,7 @@ restart:
 
 	bpf_link__destroy(link);
 	ecode = UEI_REPORT(skel, uei);
-	scx_deadline__destroy(skel);
+	scx_wrr__destroy(skel);
 
 	if (UEI_ECODE_RESTART(ecode))
 		goto restart;

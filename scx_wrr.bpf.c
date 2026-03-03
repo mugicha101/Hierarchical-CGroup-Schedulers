@@ -1,5 +1,7 @@
 #include <scx/common.bpf.h>
 
+char _license[] SEC("license") = "GPL";
+
 // weighted round robin hierarchical scheduler
 // cannot directly handle tasks, only allocate runtime to subschedulers
 // subscheduler requirements:
@@ -15,10 +17,10 @@
 const bool cgroup_msgs = true;
 
 #define wrr_DSQ 1
-#define MAX_SUB_SCHEDS 64
+#define MAX_SUB_SCHEDS 64 // must be power of 2
 #define DEFAULT_WEIGHT 1000
 #define MAX_PENDING_UPDATES 1024
-#define CPUSET_SIZE NR_CPUS / 64
+// #define CPUSET_SIZE NR_CPUS / 64
 
 #ifndef smp_rmb
 # if defined(__TARGET_ARCH_x86)
@@ -45,12 +47,12 @@ UEI_DEFINE(uei);
 // parent seqlocks only need to update when update not contained in a single nested seqlock
 // need to call sync on nested synclocks, cannot call sync on just parent synclock for data to be protected
 struct seqlock_global {
-	u64 gen_fin; // incremented when update ends (generation of the last finished update)
-	u64 gen_beg; // incremented when update begins (generation of the last started update)
+	__u64 gen_fin; // incremented when update ends (generation of the last finished update)
+	__u64 gen_beg; // incremented when update begins (generation of the last started update)
 };
 
 struct seqlock_local {
-	u64 gen;
+	__u64 gen;
 };
 
 inline void seqlock_update_start(struct seqlock_global *g) {
@@ -64,9 +66,9 @@ inline void seqlock_update_end(struct seqlock_global *g) {
 }
 
 struct sub_params {
-	u64 cgrp_id;
-  u64 weight;
-	// u64 cpuset[CPUSET_SIZE]; WIP
+	__u64 cgrp_id;
+  __u64 weight;
+	// __u64 cpuset[CPUSET_SIZE]; WIP
 };
 
 struct global_sub_params {
@@ -86,18 +88,21 @@ struct cpu_sched_state {
 	u64 budget_depletion_time; // time when budget runs out
 };
 
-// subscheduler maps
-// concurrency: single writer multiple readers
+// data shared between all cores
+// concurrency: single writer, multiple readers
+struct global_data {
+	struct bpf_spin_lock global_subs_write_lock;
+	struct global_sub_params global_subs[MAX_SUB_SCHEDS];
+	// struct seqlock_global global_subs_seqlock; // used when update modifies entire array (not needed currently)
+};
 struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY);
-	__uint(max_entries, MAX_SUB_SCHEDS);
+	__uint(max_entries, 1);
 	__type(key, u32);
-	__type(value, struct global_sub_params);
-} global_subs SEC(".maps");
-struct bpf_spin_lock global_subs_write_lock;
-struct seqlock_global global_subs_seqlock; // used when update modifies entire array
+	__type(value, struct global_data);
+} global SEC(".maps");
 
-// synced with global sub map
+// synced with global_subs
 struct {
 	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
 	__uint(max_entries, MAX_SUB_SCHEDS);
@@ -113,6 +118,11 @@ struct {
 	__type(value, struct cpu_sched_state);
 } sched_state SEC(".maps");
 
+inline struct global_data *fetch_global() {
+	const u32 idx = 0;
+	return bpf_map_lookup_elem(&global, &idx);
+}
+
 // seqlock sync
 // sync local sp to global sp if global sp is consistent
 // local copies (gen_fin, sp, gen_beg) in that order
@@ -120,10 +130,13 @@ struct {
 // thus if gen_fin = gen_beg, data is consistent and of generation gen_fin = gen_beg
 // so local sp updated with copied global sp
 // if this is not the case, this update is ignored until the next sync
-bool sync_local_sub(u32 idx) {
+static __always_inline bool sync_local_sub(struct global_sub_params *global_subs, u32 idx) {
+	if (idx >= MAX_SUB_SCHEDS) return false;
+
 	struct local_sub_params *lsp = bpf_map_lookup_elem(&local_subs, &idx);
-	struct global_sub_params *gsp = bpf_map_lookup_elem(&global_subs, &idx);
-	if (!lsp || !gsp) return false;
+	if (unlikely(!lsp)) return false; // for verifier, should not happen
+
+	struct global_sub_params *gsp = &global_subs[idx & (MAX_SUB_SCHEDS - 1)];
 
 	struct sub_params tmp_data;
 	u64 gen_fin = READ_ONCE(gsp->lock.gen_fin);
@@ -152,12 +165,15 @@ static int budget_timer_callback(void *map, int *key, struct bpf_timer *timer) {
 s32 BPF_STRUCT_OPS_SLEEPABLE(wrr_init)
 {
 	u32 err = 0;
-	for (u32 cpu = 0; cpu < NR_CPUS && !err; ++cpu) {
+	u32 cpu;
+	bpf_for(cpu, 0, scx_bpf_nr_cpu_ids()) {
 		struct cpu_sched_state *ss = bpf_map_lookup_elem(&sched_state, &cpu);
+		if (unlikely(!ss)) return -EINVAL; // for verifier, should not happen
 		bpf_timer_init(&ss->budget_timer, &sched_state, CLOCK_MONOTONIC);
 		err = bpf_timer_set_callback(&ss->budget_timer, budget_timer_callback);
+		if (err) break;
 	}
-	return 0;
+	return err;
 }
 
 void BPF_STRUCT_OPS(wrr_exit)
@@ -172,39 +188,47 @@ void BPF_STRUCT_OPS(wrr_exit)
 // special case if cgrp_id is 0: returns true and first free location if exists, false if no more free locations
 // does not handle locking
 // assigns index of res to res_idx if not null (if res = NULL, assigns it MAX_SUB_SCHEDS)
-bool global_sub_lookup(u64 cgrp_id, struct global_sub_params **res, u32 *res_idx) {
+bool global_sub_lookup(struct global_sub_params *global_subs, u64 cgrp_id, struct global_sub_params **res, u32 *res_idx) {
 	struct global_sub_params *first_free = NULL;
 	u32 first_free_idx = MAX_SUB_SCHEDS;
 	for (u32 idx = 0; idx < MAX_SUB_SCHEDS; ++idx) {
-		struct global_sub_params *gsp = (struct global_sub_params *)bpf_map_lookup_elem(&global_subs, &idx);
-		if (unlikely(!gsp)) continue; // for compiler, should not happen
+		struct global_sub_params *gsp = &global_subs[idx];
+		if (unlikely(!gsp)) continue; // for verifier, should not happen
 		if (gsp->sp.cgrp_id == cgrp_id) {
 			*res = gsp;
 			if (res_idx) *res_idx = idx;
 			return true;
 		}
-		if (gsp->sp.cgrp_id == 0 && !first_free) first_free = gsp;
+		if (gsp->sp.cgrp_id == 0 && first_free_idx == MAX_SUB_SCHEDS) {
+			first_free = gsp;
+			first_free_idx = idx;
+		}
 	}
 	*res = first_free;
 	if (res_idx) *res_idx = first_free_idx;
 	return false;
 }
 
+// NOTE: assume sub_attach, sub_detach, and cgroup_set_weight are done sequentially
+
 s32 BPF_STRUCT_OPS(wrr_sub_attach, struct scx_sub_attach_args *args)
 {
 	u64 cgrp_id = args->ops->sub_cgroup_id;
 	struct global_sub_params *gsp;
+	struct global_data *global = fetch_global();
+	if (unlikely(!global)) return -EINVAL; // for verifier, should not happen
 	
-	bpf_spin_lock(&global_subs_write_lock);
+	struct global_sub_params *global_subs = global->global_subs;
+	struct bpf_spin_lock *global_subs_write_lock = &global->global_subs_write_lock;
+	bpf_spin_lock(global_subs_write_lock);
 
-	if (global_sub_lookup(cgrp_id, &gsp, NULL)) {
+	if (global_sub_lookup(global_subs, cgrp_id, &gsp, NULL)) {
+		bpf_spin_unlock(global_subs_write_lock);
  		bpf_printk("[INFO] [ATTACH] %llu already attached", cgrp_id);
-		bpf_spin_unlock(&global_subs_write_lock);
 		return -EEXIST;
 	}
 	if (!gsp) {
-		bpf_spin_unlock(&global_subs_write_lock);
-
+		bpf_spin_unlock(global_subs_write_lock);
 		bpf_printk("[INFO] [ATTACH] %llu attaching sub would exceed MAX_SUB_SCHEDS", cgrp_id);
 		return -ENOMEM;
 	}
@@ -216,7 +240,7 @@ s32 BPF_STRUCT_OPS(wrr_sub_attach, struct scx_sub_attach_args *args)
 	
 	seqlock_update_end(&gsp->lock);
 
-	bpf_spin_unlock(&global_subs_write_lock);
+	bpf_spin_unlock(global_subs_write_lock);
 
   return 0;
 }
@@ -225,12 +249,15 @@ void BPF_STRUCT_OPS(wrr_sub_detach, struct scx_sub_detach_args *args)
 {
   u64 cgrp_id = args->ops->sub_cgroup_id;
 	struct global_sub_params *gsp;
+	struct global_data *global = fetch_global();
+	if (unlikely(!global)) return; // for verifier, should not happen
+	
+	struct global_sub_params *global_subs = global->global_subs;
+	struct bpf_spin_lock *global_subs_write_lock = &global->global_subs_write_lock;
+	bpf_spin_lock(global_subs_write_lock);
 
-	bpf_spin_lock(&global_subs_write_lock);
-
-	if (!global_sub_lookup(cgrp_id, &gsp, NULL) || !gsp) {
-		bpf_spin_unlock(&global_subs_write_lock);
-
+	if (!global_sub_lookup(global_subs, cgrp_id, &gsp, NULL) || !gsp) {
+		bpf_spin_unlock(global_subs_write_lock);
  		bpf_printk("[INFO] [DETACH] %llu not attached", cgrp_id);
 		return;
 	}
@@ -242,18 +269,23 @@ void BPF_STRUCT_OPS(wrr_sub_detach, struct scx_sub_detach_args *args)
 	
 	seqlock_update_end(&gsp->lock);
 
-	bpf_spin_unlock(&global_subs_write_lock);
+	bpf_spin_unlock(global_subs_write_lock);
 }
 
 void BPF_STRUCT_OPS(wrr_cgroup_set_weight, struct cgroup *cgrp, u32 weight)
 {
   u64 cgrp_id = cgrp->kn->id;
 	struct global_sub_params *gsp;
+	struct global_data *global = fetch_global();
+	if (unlikely(!global)) return; // for verifier, should not happen
 
-	bpf_spin_lock(&global_subs_write_lock);
-	if (!global_sub_lookup(cgrp_id, &gsp, NULL) || !gsp) {
+	struct global_sub_params *global_subs = global->global_subs;
+	struct bpf_spin_lock *global_subs_write_lock = &global->global_subs_write_lock;
+	bpf_spin_lock(global_subs_write_lock);
+
+	if (!global_sub_lookup(global_subs, cgrp_id, &gsp, NULL) || !gsp) {
+		bpf_spin_unlock(global_subs_write_lock);
  		bpf_printk("[INFO] [SET_WEIGHT] cgroup_set_weight %llu not attached", cgrp_id);
-		bpf_spin_unlock(&global_subs_write_lock);
 		return;
 	}
 	
@@ -261,7 +293,7 @@ void BPF_STRUCT_OPS(wrr_cgroup_set_weight, struct cgroup *cgrp, u32 weight)
 	gsp->sp.weight = weight;
 	seqlock_update_end(&gsp->lock);
 
-	bpf_spin_unlock(&global_subs_write_lock);
+	bpf_spin_unlock(global_subs_write_lock);
 }
 
 // re-purpose for assigning affinities
@@ -291,24 +323,31 @@ void BPF_STRUCT_OPS(wrr_dispatch, s32 cpu, struct task_struct *prev)
 {
 	u32 ucpu = cpu;
 	struct cpu_sched_state *ss = bpf_map_lookup_elem(&sched_state, &ucpu);
-	if (unlikely(!ss)) return; // for compiler, should not happen
+	struct global_data *global = fetch_global();
+	if (unlikely(!ss) || unlikely(!global)) return; // for verifier, should not happen
 
 	// check if sub yielded early, in which case should dispatch itself again until budget gone
 	if (bpf_timer_cancel(&ss->budget_timer)) {
 		u64 now = bpf_ktime_get_ns();
 		struct local_sub_params *lsp = bpf_map_lookup_elem(&local_subs, &ss->curr_rr_idx);
+		if (unlikely(!lsp)) return; // for verifier, should not happen
 		if (now < ss->budget_depletion_time && try_sub_dispatch(lsp, ss, now)) {
 			return;
 		}
 	}
 
-	for (u32 i = 0; i < MAX_SUB_SCHEDS; ++i) {
-		sync_local_sub(ss->next_rr_idx);
+	u32 i;
+	bpf_for(i, 0, MAX_SUB_SCHEDS) {
+		sync_local_sub(global->global_subs, ss->next_rr_idx);
 		struct local_sub_params *lsp = bpf_map_lookup_elem(&local_subs, &ss->next_rr_idx);
+		if (unlikely(!lsp)) return; // for verifier, should not happen
+
 		u64 now = bpf_ktime_get_ns();
 		ss->budget_depletion_time = now + lsp->sp.weight;
+
 		ss->curr_rr_idx = ss->next_rr_idx;
 		ss->next_rr_idx = ss->next_rr_idx + 1 == MAX_SUB_SCHEDS ? 0 : ss->next_rr_idx + 1;
+		
 		if (try_sub_dispatch(lsp, ss, now)) {
 			return;
 		}
