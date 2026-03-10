@@ -18,8 +18,9 @@ const bool cgroup_msgs = true;
 
 #define wrr_DSQ 1
 #define MAX_SUB_SCHEDS 64 // must be power of 2
-#define DEFAULT_WEIGHT 1000
+#define DEFAULT_WEIGHT 100000000ull // 100ms
 #define MAX_PENDING_UPDATES 1024
+#define NS_PER_WEIGHT 10000000 // weight 1 = 10ms
 // #define CPUSET_SIZE NR_CPUS / 64
 
 #ifndef smp_rmb
@@ -102,6 +103,14 @@ struct {
 	__type(value, struct global_data);
 } global SEC(".maps");
 
+// used to get cgroup weight on attach
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 1024);
+    __type(key, u64);
+    __type(value, u32);
+} cgroup_weights SEC(".maps");
+
 // synced with global_subs
 struct {
 	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
@@ -140,31 +149,35 @@ static __always_inline bool sync_local_sub(struct global_sub_params *global_subs
 
 	struct sub_params tmp_data;
 	u64 gen_fin = READ_ONCE(gsp->lock.gen_fin);
-	smp_rmb();
-	if (gen_fin != lsp->lock.gen) return false;
-
-	__builtin_memcpy(&tmp_data, &gsp->sp, sizeof(struct sub_params));
+	if (gen_fin == lsp->lock.gen) return false;
 	
 	smp_rmb();
+	tmp_data.cgrp_id = gsp->sp.cgrp_id;
+	tmp_data.weight = gsp->sp.weight;
+	smp_rmb();
+	
 	u64 gen_beg = READ_ONCE(gsp->lock.gen_beg);
-
 	if (gen_beg != gen_fin) return false;
 
-	__builtin_memcpy(&lsp->sp, &tmp_data, sizeof(struct sub_params));
+	lsp->sp.cgrp_id = tmp_data.cgrp_id;
+	lsp->sp.weight = tmp_data.weight;
+	u64 old_gen = lsp->lock.gen;
 	lsp->lock.gen = gen_fin;
+	bpf_printk("[INFO] [WRR] [SYNC] cpu %d: Synced index %u: gen %llu -> gen %llu (new weight: %llu)", bpf_get_smp_processor_id(), idx, old_gen, gen_fin, lsp->sp.weight);
 
 	return true;
 }
 
 static int budget_timer_callback(void *map, int *key, struct bpf_timer *timer) {
-	u32 cpu = *key;
-	scx_bpf_kick_cpu(cpu, SCX_KICK_PREEMPT);
+	bpf_printk("[INFO] [WRR] [TIMER] timer callback on cpu %d", bpf_get_smp_processor_id());
+	s32 cpu = *key;
+	scx_bpf_kick_cpu(cpu, (u64)SCX_KICK_PREEMPT);
 	return 0;
 }
 
 s32 BPF_STRUCT_OPS_SLEEPABLE(wrr_init)
 {
-	bpf_printk("[INFO] [INIT] Initializing SCX WRR Scheduler");
+	bpf_printk("[INFO] [WRR] [INIT] Initializing SCX WRR Scheduler");
 	u32 err = 0;
 	u32 cpu;
 	bpf_for(cpu, 0, scx_bpf_nr_cpu_ids()) {
@@ -179,7 +192,7 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(wrr_init)
 
 void BPF_STRUCT_OPS(wrr_exit)
 {
-	bpf_printk("[INFO] [EXIT] Exiting SCX WRR Scheduler\n");
+	bpf_printk("[INFO] [WRR] [EXIT] Exiting SCX WRR Scheduler\n");
 }
 
 // looks for cgroup in global_subs
@@ -215,10 +228,13 @@ bool global_sub_lookup(struct global_sub_params *global_subs, u64 cgrp_id, struc
 s32 BPF_STRUCT_OPS(wrr_sub_attach, struct scx_sub_attach_args *args)
 {
 	u64 cgrp_id = args->ops->sub_cgroup_id;
-	bpf_printk("[INFO] [SUB_ATTACH] Attaching cgroup %llu", cgrp_id);
+	bpf_printk("[INFO] [WRR] [SUB_ATTACH] Attaching cgroup %llu", cgrp_id);
 	struct global_sub_params *gsp;
 	struct global_data *global = fetch_global();
 	if (unlikely(!global)) return -EINVAL; // for verifier, should not happen
+
+	u32 *cached_weight = bpf_map_lookup_elem(&cgroup_weights, &cgrp_id);
+	u64 weight = cached_weight ? *cached_weight * NS_PER_WEIGHT : DEFAULT_WEIGHT;
 	
 	struct global_sub_params *global_subs = global->global_subs;
 	struct bpf_spin_lock *global_subs_write_lock = &global->global_subs_write_lock;
@@ -226,31 +242,32 @@ s32 BPF_STRUCT_OPS(wrr_sub_attach, struct scx_sub_attach_args *args)
 
 	if (global_sub_lookup(global_subs, cgrp_id, &gsp, NULL)) {
 		bpf_spin_unlock(global_subs_write_lock);
- 		bpf_printk("[INFO] [SUB_ATTACH] %llu already attached", cgrp_id);
+ 		bpf_printk("[INFO] [WRR] [SUB_ATTACH] %llu already attached", cgrp_id);
 		return -EEXIST;
 	}
 	if (!gsp) {
 		bpf_spin_unlock(global_subs_write_lock);
-		bpf_printk("[INFO] [SUB_ATTACH] %llu attaching sub would exceed MAX_SUB_SCHEDS", cgrp_id);
+		bpf_printk("[INFO] [WRR] [SUB_ATTACH] %llu attaching sub would exceed MAX_SUB_SCHEDS", cgrp_id);
 		return -ENOMEM;
 	}
 
 	seqlock_update_start(&gsp->lock);
 	
 	gsp->sp.cgrp_id = cgrp_id;
-	gsp->sp.weight = DEFAULT_WEIGHT;
+	gsp->sp.weight = weight;
 	
 	seqlock_update_end(&gsp->lock);
-
+	
 	bpf_spin_unlock(global_subs_write_lock);
-
+	bpf_printk("[INFO] [WRR] [SUB_ATTACH] cgroup %llu attached with weight %llu", cgrp_id, weight);
+	
   return 0;
 }
 
 void BPF_STRUCT_OPS(wrr_sub_detach, struct scx_sub_detach_args *args)
 {
   u64 cgrp_id = args->ops->sub_cgroup_id;
-	bpf_printk("[INFO] [SUB_DETACH] Detaching cgroup %llu", cgrp_id);
+	bpf_printk("[INFO] [WRR] [SUB_DETACH] Detaching cgroup %llu", cgrp_id);
 	struct global_sub_params *gsp;
 	struct global_data *global = fetch_global();
 	if (unlikely(!global)) return; // for verifier, should not happen
@@ -261,7 +278,7 @@ void BPF_STRUCT_OPS(wrr_sub_detach, struct scx_sub_detach_args *args)
 
 	if (!global_sub_lookup(global_subs, cgrp_id, &gsp, NULL) || !gsp) {
 		bpf_spin_unlock(global_subs_write_lock);
- 		bpf_printk("[INFO] [SUB_DETACH] %llu not attached", cgrp_id);
+ 		bpf_printk("[INFO] [WRR] [SUB_DETACH] %llu not attached", cgrp_id);
 		return;
 	}
 
@@ -278,7 +295,8 @@ void BPF_STRUCT_OPS(wrr_sub_detach, struct scx_sub_detach_args *args)
 void BPF_STRUCT_OPS(wrr_cgroup_set_weight, struct cgroup *cgrp, u32 weight)
 {
 	u64 cgrp_id = cgrp->kn->id;
-	bpf_printk("[INFO] [SET_WEIGHT] Setting cgroup %llu weight to %u", cgrp, weight);
+	bpf_printk("[INFO] [WRR] [SET_WEIGHT] Setting cgroup %llu weight to %u", cgrp_id, weight);
+	bpf_map_update_elem(&cgroup_weights, &cgrp_id, &weight, BPF_ANY);
 	struct global_sub_params *gsp;
 	struct global_data *global = fetch_global();
 	if (unlikely(!global)) return; // for verifier, should not happen
@@ -289,12 +307,12 @@ void BPF_STRUCT_OPS(wrr_cgroup_set_weight, struct cgroup *cgrp, u32 weight)
 
 	if (!global_sub_lookup(global_subs, cgrp_id, &gsp, NULL) || !gsp) {
 		bpf_spin_unlock(global_subs_write_lock);
- 		bpf_printk("[INFO] [SET_WEIGHT] cgroup_set_weight %llu not attached", cgrp_id);
+ 		bpf_printk("[INFO] [WRR] [SET_WEIGHT] cgroup_set_weight %llu not attached", cgrp_id);
 		return;
 	}
 	
 	seqlock_update_start(&gsp->lock);
-	gsp->sp.weight = weight;
+	gsp->sp.weight = (u64)weight * NS_PER_WEIGHT;
 	seqlock_update_end(&gsp->lock);
 
 	bpf_spin_unlock(global_subs_write_lock);
@@ -313,10 +331,12 @@ bool try_sub_dispatch(struct local_sub_params *lsp, struct cpu_sched_state *ss, 
 	if (now >= ss->budget_depletion_time) return false;
 
 	u64 rem_time = ss->budget_depletion_time - now;
-	bpf_timer_start(&ss->budget_timer, rem_time, 0);
+	bpf_timer_start(&ss->budget_timer, rem_time, BPF_F_TIMER_CPU_PIN);
 
+	bpf_printk("[INFO] [WRR] [DISPATCH] dispatching cgroup %d rem_time=%llu", lsp->sp.cgrp_id, rem_time);
 	if (!scx_bpf_sub_dispatch(lsp->sp.cgrp_id)) {
 		bpf_timer_cancel(&ss->budget_timer);
+		bpf_printk("[INFO] [WRR] [TIMER] timer cancelled");
 		return false;
 	}
 
@@ -325,7 +345,10 @@ bool try_sub_dispatch(struct local_sub_params *lsp, struct cpu_sched_state *ss, 
 
 void BPF_STRUCT_OPS(wrr_dispatch, s32 cpu, struct task_struct *prev)
 {
-	bpf_printk("[INFO] [DISPATCH] dispatching on cpu %u", cpu);
+	// FOR TESTING (limits CPUs to prevent freezing)
+	if (cpu >= 4) return;
+
+	// bpf_printk("[INFO] [WRR] [DISPATCH] dispatching on cpu %u", cpu);
 	u32 ucpu = cpu;
 	struct cpu_sched_state *ss = bpf_map_lookup_elem(&sched_state, &ucpu);
 	struct global_data *global = fetch_global();
@@ -333,6 +356,7 @@ void BPF_STRUCT_OPS(wrr_dispatch, s32 cpu, struct task_struct *prev)
 
 	// check if sub yielded early, in which case should dispatch itself again until budget gone
 	if (bpf_timer_cancel(&ss->budget_timer)) {
+		bpf_printk("[INFO] [WRR] [TIMER] timer cancelled");
 		u64 now = bpf_ktime_get_ns();
 		struct local_sub_params *lsp = bpf_map_lookup_elem(&local_subs, &ss->curr_rr_idx);
 		if (unlikely(!lsp)) return; // for verifier, should not happen
@@ -346,9 +370,11 @@ void BPF_STRUCT_OPS(wrr_dispatch, s32 cpu, struct task_struct *prev)
 		sync_local_sub(global->global_subs, ss->next_rr_idx);
 		struct local_sub_params *lsp = bpf_map_lookup_elem(&local_subs, &ss->next_rr_idx);
 		if (unlikely(!lsp)) return; // for verifier, should not happen
+		if (lsp->sp.cgrp_id == 0) continue;
 
 		u64 now = bpf_ktime_get_ns();
 		ss->budget_depletion_time = now + lsp->sp.weight;
+		bpf_printk("[INFO] [WRR] [DISPATCH] cgroup %d weight: %llu", lsp->sp.cgrp_id, lsp->sp.weight);
 
 		ss->curr_rr_idx = ss->next_rr_idx;
 		ss->next_rr_idx = ss->next_rr_idx + 1 == MAX_SUB_SCHEDS ? 0 : ss->next_rr_idx + 1;
@@ -362,77 +388,80 @@ void BPF_STRUCT_OPS(wrr_dispatch, s32 cpu, struct task_struct *prev)
 
 s32 BPF_STRUCT_OPS(wrr_cgroup_init, struct cgroup *cgrp, struct scx_cgroup_init_args *args)
 {
-	bpf_printk("[INFO] [CGROUP_INIT] %llu weight=%u period=%lu quota=%ld burst=%lu",
+	bpf_printk("[INFO] [WRR] [CGROUP_INIT] %llu weight=%u period=%lu quota=%ld burst=%lu",
 				cgrp->kn->id, args->weight, args->bw_period_us,
 				args->bw_quota_us, args->bw_burst_us);
+	u64 cgrp_id = cgrp->kn->id;
+	u32 weight = args->weight;
+	bpf_map_update_elem(&cgroup_weights, &cgrp_id, &weight, BPF_ANY);
 	return 0;
 }
 
 // task scheduling functions that should not be called
 s32 BPF_STRUCT_OPS(wrr_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake_flags)
 {
-	bpf_printk("[INFO] wrr_select_cpu called unexpectedly");
+	// bpf_printk("[INFO] [WRR] wrr_select_cpu called unexpectedly");
   // scx_bpf_error("wrr_select_cpu called unexpectedly");
     return prev_cpu; // Required to return a valid CPU even when erroring
 }
 
 void BPF_STRUCT_OPS(wrr_enqueue, struct task_struct *p, u64 enq_flags)
 {
-	bpf_printk("[INFO] wrr_enqueue called unexpectedly");
+	bpf_printk("[INFO] [WRR] wrr_enqueue called");
   // scx_bpf_error("wrr_enqueue called unexpectedly");
 }
 
 void BPF_STRUCT_OPS(wrr_dequeue, struct task_struct *p, u64 deq_flags)
 {
-	bpf_printk("[INFO] wrr_dequeue called unexpectedly");
+	// bpf_printk("[INFO] [WRR] wrr_dequeue called unexpectedly");
   // scx_bpf_error("wrr_dequeue called unexpectedly");
 }
 
 void BPF_STRUCT_OPS(wrr_cpu_acquire, s32 cpu, struct scx_cpu_acquire_args *args)
 {
-	bpf_printk("[INFO] wrr_cpu_acquire called unexpectedly");
+	// bpf_printk("[INFO] [WRR] wrr_cpu_acquire called unexpectedly");
   // scx_bpf_error("wrr_cpu_acquire called unexpectedly");
 }
 
 void BPF_STRUCT_OPS(wrr_cpu_release, s32 cpu, struct scx_cpu_release_args *args)
 {
-	bpf_printk("[INFO] wrr_cpu_release called unexpectedly");
+	// bpf_printk("[INFO] [WRR] wrr_cpu_release called unexpectedly");
   // scx_bpf_error("wrr_cpu_release called unexpectedly");
 }
 
 void BPF_STRUCT_OPS(wrr_running, struct task_struct *p)
 {
-	bpf_printk("[INFO] wrr_running called unexpectedly");
+	// bpf_printk("[INFO] [WRR] wrr_running called unexpectedly");
   // scx_bpf_error("wrr_running called unexpectedly");
 }
 
 void BPF_STRUCT_OPS(wrr_stopping, struct task_struct *p, bool runnable)
 {
-	bpf_printk("[INFO] wrr_stopping called unexpectedly");
+	// bpf_printk("[INFO] [WRR] wrr_stopping called unexpectedly");
   // scx_bpf_error("wrr_stopping called unexpectedly");
 }
 
 void BPF_STRUCT_OPS(wrr_runnable, struct task_struct *p, u64 enq_flags)
 {
-	bpf_printk("[INFO] wrr_runnable called unexpectedly");
+	// bpf_printk("[INFO] [WRR] wrr_runnable called unexpectedly");
   // scx_bpf_error("wrr_runnable called unexpectedly");
 }
 
 void BPF_STRUCT_OPS(wrr_quiescent, struct task_struct *p, u64 deq_flags)
 {
-	bpf_printk("[INFO] wrr_quiescent called unexpectedly");
+	// bpf_printk("[INFO] [WRR] wrr_quiescent called unexpectedly");
   // scx_bpf_error("wrr_quiescent called unexpectedly");
 }
 
 s32 BPF_STRUCT_OPS(wrr_init_task, struct task_struct *p, struct scx_init_task_args *args)
 {
-	bpf_printk("[INFO] wrr_init_task called (pid: %u policy: %d)", p->pid, p->policy);
+	// bpf_printk("[INFO] [WRR] wrr_init_task called (pid: %u policy: %d)", p->pid, p->policy);
 	return 0;
 }
 
 void BPF_STRUCT_OPS(wrr_exit_task, struct task_struct *p, struct scx_exit_task_args *args)
 {
-	bpf_printk("[INFO] wrr_exit_task called unexpectedly");
+	// bpf_printk("[INFO] [WRR] wrr_exit_task called unexpectedly");
   // scx_bpf_error("wrr_exit_task called unexpectedly");
 }
 
