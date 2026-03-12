@@ -23,7 +23,7 @@
 #define SCHED_EXT 7
 #endif
 
-#define NSUB 1
+#define NSUB 2
 
 struct seqlock_global {
 	__u64 gen_fin;

@@ -416,32 +416,7 @@ s32 BPF_STRUCT_OPS(wrr_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake
 void BPF_STRUCT_OPS(wrr_enqueue, struct task_struct *p, u64 enq_flags)
 {
 	bpf_printk("[INFO] [WRR] [ENQUEUE] enqueueing pid=%d", p->pid);
-	
-	// TODO: figure out why the task on the subscheduler's cgroup enqueued here instead
-	
-	// u32 cpu = bpf_get_smp_processor_id();
-	// struct cpu_sched_state *ss = bpf_map_lookup_elem(&sched_state, &cpu);
-	// struct global_data *global = fetch_global();
-	// if (unlikely(!ss) || unlikely(!global)) return; // for verifier, should not happen
-
-	// struct cgroup *cgrp = scx_bpf_task_cgroup(p);
-	// if (unlikely(!cgrp)) return; // for verifier, should not happen
-
-	// u64 cgrp_id = BPF_CORE_READ(cgrp, kn, id);
-	// bpf_cgroup_release(cgrp);
-	
-	// u32 i;
-	// bpf_for(i, 0, MAX_SUB_SCHEDS) {
-	// 	sync_local_sub(global->global_subs, ss->next_rr_idx);
-	// 	struct local_sub_params *lsp = bpf_map_lookup_elem(&local_subs, &ss->next_rr_idx);
-	// 	if (unlikely(!lsp)) return; // for verifier, should not happen
-	// 	if (lsp->sp.cgrp_id == cgrp_id) {
-	// 		scx_bpf_dsq_insert(p, cgrp_id, SCX_SLICE_DFL, enq_flags);
-	// 		return;
-	// 	}
-	// }
-
-	// scx_bpf_dsq_insert(p, SCX_DSQ_GLOBAL, SCX_SLICE_DFL, enq_flags);
+	// scx_bpf_error("wrr_enqueue called unexpectedly");
 }
 
 void BPF_STRUCT_OPS(wrr_dequeue, struct task_struct *p, u64 deq_flags)
