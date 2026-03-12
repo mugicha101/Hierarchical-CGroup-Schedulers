@@ -5,6 +5,7 @@ char _license[] SEC("license") = "GPL";
 UEI_DEFINE(uei);
 
 const volatile u64 cgroup_id = 0;
+u64 dsq_id = 0;
 
 // very simple earliest arrival first scheduler
 // does not use SCX_DSQ_GLOBAL to allow hierarchical scheduling
@@ -12,7 +13,13 @@ const volatile u64 cgroup_id = 0;
 s32 BPF_STRUCT_OPS_SLEEPABLE(eaf_init)
 {
 	bpf_printk("[INFO] [EAF] [INIT] cgroup=%d", cgroup_id);
-	return scx_bpf_create_dsq(cgroup_id, -1);
+	dsq_id = cgroup_id;
+	s32 err = scx_bpf_create_dsq(dsq_id, -1);
+	if (err < 0) {
+		bpf_printk("[INFO] [EAF] [INIT] [DEBUG] cgroup=%d failed to init dsq err=%d", cgroup_id, err);
+	}
+	return err;
+	return 0;
 }
 
 void BPF_STRUCT_OPS(eaf_exit)
@@ -23,7 +30,8 @@ void BPF_STRUCT_OPS(eaf_exit)
 void BPF_STRUCT_OPS(eaf_dispatch, s32 cpu, struct task_struct *prev)
 {
 	bpf_printk("[INFO] [EAF] [DISPATCH] cgroup=%d cpu=%d", cgroup_id, cpu);
-	scx_bpf_dsq_move_to_local(cgroup_id);
+	struct task_struct *p;
+	scx_bpf_dsq_move_to_local(dsq_id);
 }
 
 s32 BPF_STRUCT_OPS(eaf_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake_flags)
@@ -34,12 +42,12 @@ s32 BPF_STRUCT_OPS(eaf_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake
 void BPF_STRUCT_OPS(eaf_enqueue, struct task_struct *p, u64 enq_flags)
 {
 	bpf_printk("[INFO] [EAF] [ENQUEUE] cgroup=%d pid=%d comm=%s", cgroup_id, p->pid, p->comm);
-	scx_bpf_dsq_insert(p, cgroup_id, 1 * 1000000000ull, enq_flags);
+	scx_bpf_dsq_insert(p, dsq_id, 1 * 1000000000ull, enq_flags);
 }
 
 void BPF_STRUCT_OPS(eaf_dequeue, struct task_struct *p, u64 deq_flags)
 {
-	// bpf_printk("[INFO] [EAF] [DEQUEUE] cgroup=%d pid=%d comm=%s", cgroup_id, p->pid, p->comm);
+	bpf_printk("[INFO] [EAF] [DEQUEUE] cgroup=%d pid=%d comm=%s", cgroup_id, p->pid, p->comm);
 }
 
 void BPF_STRUCT_OPS(eaf_cpu_acquire, s32 cpu, struct scx_cpu_acquire_args *args)

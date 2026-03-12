@@ -15,6 +15,7 @@ char _license[] SEC("license") = "GPL";
 // if subscheduler's dispatch schedules nothing, moves on to the next subscheduler
 
 const bool cgroup_msgs = true;
+const volatile u64 cgroup_id;
 
 #define wrr_DSQ 1
 #define MAX_SUB_SCHEDS 64 // must be power of 2
@@ -336,7 +337,7 @@ bool try_sub_dispatch(struct local_sub_params *lsp, struct cpu_sched_state *ss, 
 	bpf_printk("[INFO] [WRR] [DISPATCH] dispatching cgroup %d rem_time=%llu", lsp->sp.cgrp_id, rem_time);
 	if (!scx_bpf_sub_dispatch(lsp->sp.cgrp_id)) {
 		bpf_timer_cancel(&ss->budget_timer);
-		bpf_printk("[INFO] [WRR] [TIMER] timer cancelled");
+		bpf_printk("[INFO] [WRR] [TIMER] timer cancelled: dispatch failed");
 		return false;
 	}
 
@@ -356,21 +357,28 @@ void BPF_STRUCT_OPS(wrr_dispatch, s32 cpu, struct task_struct *prev)
 
 	// check if sub yielded early, in which case should dispatch itself again until budget gone
 	if (bpf_timer_cancel(&ss->budget_timer)) {
-		bpf_printk("[INFO] [WRR] [TIMER] timer cancelled");
+		// bpf_printk("[INFO] [WRR] [TIMER] timer cancelled: yielded early");
 		u64 now = bpf_ktime_get_ns();
 		struct local_sub_params *lsp = bpf_map_lookup_elem(&local_subs, &ss->curr_rr_idx);
 		if (unlikely(!lsp)) return; // for verifier, should not happen
+
 		if (now < ss->budget_depletion_time && try_sub_dispatch(lsp, ss, now)) {
 			return;
 		}
 	}
+	// bpf_printk("[INFO] [WRR] [DISPATCH] cpu=%d finding next cgroup to run...", cpu);
 
 	u32 i;
 	bpf_for(i, 0, MAX_SUB_SCHEDS) {
 		sync_local_sub(global->global_subs, ss->next_rr_idx);
 		struct local_sub_params *lsp = bpf_map_lookup_elem(&local_subs, &ss->next_rr_idx);
 		if (unlikely(!lsp)) return; // for verifier, should not happen
-		if (lsp->sp.cgrp_id == 0) continue;
+
+		if (lsp->sp.cgrp_id == 0) {
+			ss->curr_rr_idx = ss->next_rr_idx;
+			ss->next_rr_idx = ss->next_rr_idx + 1 == MAX_SUB_SCHEDS ? 0 : ss->next_rr_idx + 1;
+			continue;
+		}
 
 		u64 now = bpf_ktime_get_ns();
 		ss->budget_depletion_time = now + lsp->sp.weight;
@@ -407,13 +415,38 @@ s32 BPF_STRUCT_OPS(wrr_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake
 
 void BPF_STRUCT_OPS(wrr_enqueue, struct task_struct *p, u64 enq_flags)
 {
-	bpf_printk("[INFO] [WRR] wrr_enqueue called");
-  // scx_bpf_error("wrr_enqueue called unexpectedly");
+	bpf_printk("[INFO] [WRR] [ENQUEUE] enqueueing pid=%d", p->pid);
+	
+	// TODO: figure out why the task on the subscheduler's cgroup enqueued here instead
+	
+	// u32 cpu = bpf_get_smp_processor_id();
+	// struct cpu_sched_state *ss = bpf_map_lookup_elem(&sched_state, &cpu);
+	// struct global_data *global = fetch_global();
+	// if (unlikely(!ss) || unlikely(!global)) return; // for verifier, should not happen
+
+	// struct cgroup *cgrp = scx_bpf_task_cgroup(p);
+	// if (unlikely(!cgrp)) return; // for verifier, should not happen
+
+	// u64 cgrp_id = BPF_CORE_READ(cgrp, kn, id);
+	// bpf_cgroup_release(cgrp);
+	
+	// u32 i;
+	// bpf_for(i, 0, MAX_SUB_SCHEDS) {
+	// 	sync_local_sub(global->global_subs, ss->next_rr_idx);
+	// 	struct local_sub_params *lsp = bpf_map_lookup_elem(&local_subs, &ss->next_rr_idx);
+	// 	if (unlikely(!lsp)) return; // for verifier, should not happen
+	// 	if (lsp->sp.cgrp_id == cgrp_id) {
+	// 		scx_bpf_dsq_insert(p, cgrp_id, SCX_SLICE_DFL, enq_flags);
+	// 		return;
+	// 	}
+	// }
+
+	// scx_bpf_dsq_insert(p, SCX_DSQ_GLOBAL, SCX_SLICE_DFL, enq_flags);
 }
 
 void BPF_STRUCT_OPS(wrr_dequeue, struct task_struct *p, u64 deq_flags)
 {
-	// bpf_printk("[INFO] [WRR] wrr_dequeue called unexpectedly");
+	bpf_printk("[INFO] [WRR] [DEQUEUE] dequeuing pid=%d", p->pid);
   // scx_bpf_error("wrr_dequeue called unexpectedly");
 }
 
