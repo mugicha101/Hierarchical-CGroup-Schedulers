@@ -19,5 +19,5 @@ $(BINDIR)/scx_wrr: $(INCLUDE_DIR)/scx_eaf.bpf.skel.h
 build and run WRR scheduler (need sudo):
 ```
 echo "+cpu" | sudo tee /sys/fs/cgroup/cgroup.subtree_control
-bear -- make CC="clang-21 -Wno-unused-command-line-argument" CLANG=clang-21 LLVM_STRIP=llvm-strip-21 VMLINUX_BTF=/<path to kernel>/btf/vmlinux BPFTOOL=/<path to tj_sched_ext_kernel>/tools/bpf/bpftool/bpftool && ./build/bin/scx_wrr
+bear -- make CC="clang-21 -Wno-unused-command-line-argument" CLANG=clang-21 LLVM_STRIP=llvm-strip-21 VMLINUX_BTF=/sys/kernel/btf/vmlinux BPFTOOL=/<path to tj_sched_ext_kernel>/tools/bpf/bpftool/bpftool && ./build/bin/scx_wrr
 ```
