@@ -1,5 +1,8 @@
 #include <scx/common.bpf.h>
 
+#include "trace_events.h"
+CREATE_TRACE_BUFF();
+
 char _license[] SEC("license") = "GPL";
 
 // weighted round robin hierarchical scheduler
@@ -17,7 +20,6 @@ char _license[] SEC("license") = "GPL";
 const bool cgroup_msgs = true;
 const volatile u64 cgroup_id;
 
-#define wrr_DSQ 1
 #define MAX_SUB_SCHEDS 64 // must be power of 2
 #define DEFAULT_WEIGHT 100000000ull // 100ms
 #define MAX_PENDING_UPDATES 1024
@@ -164,13 +166,13 @@ static __always_inline bool sync_local_sub(struct global_sub_params *global_subs
 	lsp->sp.weight = tmp_data.weight;
 	u64 old_gen = lsp->lock.gen;
 	lsp->lock.gen = gen_fin;
-	bpf_printk("[INFO] [WRR] [SYNC] cpu %d: Synced index %u: gen %llu -> gen %llu (new weight: %llu)", bpf_get_smp_processor_id(), idx, old_gen, gen_fin, lsp->sp.weight);
+	// bpf_printk("[INFO] [WRR] [SYNC] cpu %d: Synced index %u: gen %llu -> gen %llu (new weight: %llu)", bpf_get_smp_processor_id(), idx, old_gen, gen_fin, lsp->sp.weight);
 
 	return true;
 }
 
 static int budget_timer_callback(void *map, int *key, struct bpf_timer *timer) {
-	bpf_printk("[INFO] [WRR] [TIMER] timer callback on cpu %d", bpf_get_smp_processor_id());
+	// bpf_printk("[INFO] [WRR] [TIMER] timer callback on cpu %d", bpf_get_smp_processor_id());
 	s32 cpu = *key;
 	scx_bpf_kick_cpu(cpu, (u64)SCX_KICK_PREEMPT);
 	return 0;
@@ -178,7 +180,8 @@ static int budget_timer_callback(void *map, int *key, struct bpf_timer *timer) {
 
 s32 BPF_STRUCT_OPS_SLEEPABLE(wrr_init)
 {
-	bpf_printk("[INFO] [WRR] [INIT] Initializing SCX WRR Scheduler");
+	// bpf_printk("[INFO] [WRR] [INIT] Initializing SCX WRR Scheduler");
+	TRACE_FUNC_START("init");
 	u32 err = 0;
 	u32 cpu;
 	bpf_for(cpu, 0, scx_bpf_nr_cpu_ids()) {
@@ -188,12 +191,13 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(wrr_init)
 		err = bpf_timer_set_callback(&ss->budget_timer, budget_timer_callback);
 		if (err) break;
 	}
+	TRACE_FUNC_END("init", "");
 	return err;
 }
 
 void BPF_STRUCT_OPS(wrr_exit)
 {
-	bpf_printk("[INFO] [WRR] [EXIT] Exiting SCX WRR Scheduler\n");
+	// bpf_printk("[INFO] [WRR] [EXIT] Exiting SCX WRR Scheduler\n");
 }
 
 // looks for cgroup in global_subs
@@ -229,7 +233,8 @@ bool global_sub_lookup(struct global_sub_params *global_subs, u64 cgrp_id, struc
 s32 BPF_STRUCT_OPS(wrr_sub_attach, struct scx_sub_attach_args *args)
 {
 	u64 cgrp_id = args->ops->sub_cgroup_id;
-	bpf_printk("[INFO] [WRR] [SUB_ATTACH] Attaching cgroup %llu", cgrp_id);
+	TRACE_FUNC_START("sub_attach");
+	// bpf_printk("[INFO] [WRR] [SUB_ATTACH] Attaching cgroup %llu", cgrp_id);
 	struct global_sub_params *gsp;
 	struct global_data *global = fetch_global();
 	if (unlikely(!global)) return -EINVAL; // for verifier, should not happen
@@ -243,12 +248,14 @@ s32 BPF_STRUCT_OPS(wrr_sub_attach, struct scx_sub_attach_args *args)
 
 	if (global_sub_lookup(global_subs, cgrp_id, &gsp, NULL)) {
 		bpf_spin_unlock(global_subs_write_lock);
- 		bpf_printk("[INFO] [WRR] [SUB_ATTACH] %llu already attached", cgrp_id);
+ 		// bpf_printk("[INFO] [WRR] [SUB_ATTACH] %llu already attached", cgrp_id);
+		TRACE_FUNC_END("sub_attach", "ALREADY ATTACHED");
 		return -EEXIST;
 	}
 	if (!gsp) {
 		bpf_spin_unlock(global_subs_write_lock);
-		bpf_printk("[INFO] [WRR] [SUB_ATTACH] %llu attaching sub would exceed MAX_SUB_SCHEDS", cgrp_id);
+		// bpf_printk("[INFO] [WRR] [SUB_ATTACH] %llu attaching sub would exceed MAX_SUB_SCHEDS", cgrp_id);
+		TRACE_FUNC_END("sub_attach", "MAX SUBS EXCEEDED");
 		return -ENOMEM;
 	}
 
@@ -260,15 +267,17 @@ s32 BPF_STRUCT_OPS(wrr_sub_attach, struct scx_sub_attach_args *args)
 	seqlock_update_end(&gsp->lock);
 	
 	bpf_spin_unlock(global_subs_write_lock);
-	bpf_printk("[INFO] [WRR] [SUB_ATTACH] cgroup %llu attached with weight %llu", cgrp_id, weight);
+	// bpf_printk("[INFO] [WRR] [SUB_ATTACH] cgroup %llu attached with weight %llu", cgrp_id, weight);
 	
+	TRACE_FUNC_END("sub_attach", "");
   return 0;
 }
 
 void BPF_STRUCT_OPS(wrr_sub_detach, struct scx_sub_detach_args *args)
 {
   u64 cgrp_id = args->ops->sub_cgroup_id;
-	bpf_printk("[INFO] [WRR] [SUB_DETACH] Detaching cgroup %llu", cgrp_id);
+	// bpf_printk("[INFO] [WRR] [SUB_DETACH] Detaching cgroup %llu", cgrp_id);
+	TRACE_FUNC_START("sub_detach");
 	struct global_sub_params *gsp;
 	struct global_data *global = fetch_global();
 	if (unlikely(!global)) return; // for verifier, should not happen
@@ -279,7 +288,8 @@ void BPF_STRUCT_OPS(wrr_sub_detach, struct scx_sub_detach_args *args)
 
 	if (!global_sub_lookup(global_subs, cgrp_id, &gsp, NULL) || !gsp) {
 		bpf_spin_unlock(global_subs_write_lock);
- 		bpf_printk("[INFO] [WRR] [SUB_DETACH] %llu not attached", cgrp_id);
+ 		// bpf_printk("[INFO] [WRR] [SUB_DETACH] %llu not attached", cgrp_id);
+		TRACE_FUNC_END("sub_detach", "NOT ATTACHED");
 		return;
 	}
 
@@ -291,12 +301,14 @@ void BPF_STRUCT_OPS(wrr_sub_detach, struct scx_sub_detach_args *args)
 	seqlock_update_end(&gsp->lock);
 
 	bpf_spin_unlock(global_subs_write_lock);
+	TRACE_FUNC_END("sub_detach", "");
 }
 
 void BPF_STRUCT_OPS(wrr_cgroup_set_weight, struct cgroup *cgrp, u32 weight)
 {
 	u64 cgrp_id = cgrp->kn->id;
-	bpf_printk("[INFO] [WRR] [SET_WEIGHT] Setting cgroup %llu weight to %u", cgrp_id, weight);
+	// bpf_printk("[INFO] [WRR] [SET_WEIGHT] Setting cgroup %llu weight to %u", cgrp_id, weight);
+	TRACE_FUNC_START("cgroup_set_weight");
 	bpf_map_update_elem(&cgroup_weights, &cgrp_id, &weight, BPF_ANY);
 	struct global_sub_params *gsp;
 	struct global_data *global = fetch_global();
@@ -308,7 +320,8 @@ void BPF_STRUCT_OPS(wrr_cgroup_set_weight, struct cgroup *cgrp, u32 weight)
 
 	if (!global_sub_lookup(global_subs, cgrp_id, &gsp, NULL) || !gsp) {
 		bpf_spin_unlock(global_subs_write_lock);
- 		bpf_printk("[INFO] [WRR] [SET_WEIGHT] cgroup_set_weight %llu not attached", cgrp_id);
+ 		// bpf_printk("[INFO] [WRR] [SET_WEIGHT] cgroup_set_weight %llu not attached", cgrp_id);
+		TRACE_FUNC_END("cgroup_set_weight", "NOT ATTACHED");
 		return;
 	}
 	
@@ -317,14 +330,15 @@ void BPF_STRUCT_OPS(wrr_cgroup_set_weight, struct cgroup *cgrp, u32 weight)
 	seqlock_update_end(&gsp->lock);
 
 	bpf_spin_unlock(global_subs_write_lock);
+	TRACE_FUNC_END("cgroup_set_weight", "");
 }
 
 // re-purpose for assigning affinities
 void BPF_STRUCT_OPS(wrr_cgroup_set_bandwidth, struct cgroup *cgrp,
 		    u64 period_us, u64 quota_us, u64 burst_us)
 {
-	bpf_printk("[INFP] [CGROUP_SET_BANDWIDTH] %llu period=%lu quota=%ld burst=%lu",
-				cgrp->kn->id, period_us, quota_us, burst_us);
+	// bpf_printk("[INFP] [CGROUP_SET_BANDWIDTH] %llu period=%lu quota=%ld burst=%lu",
+				// cgrp->kn->id, period_us, quota_us, burst_us);
 }
 
 // returns true if dispatched successfully
@@ -334,10 +348,10 @@ bool try_sub_dispatch(struct local_sub_params *lsp, struct cpu_sched_state *ss, 
 	u64 rem_time = ss->budget_depletion_time - now;
 	bpf_timer_start(&ss->budget_timer, rem_time, BPF_F_TIMER_CPU_PIN);
 
-	bpf_printk("[INFO] [WRR] [DISPATCH] dispatching cgroup %d rem_time=%llu", lsp->sp.cgrp_id, rem_time);
+	// bpf_printk("[INFO] [WRR] [DISPATCH] dispatching cgroup %d rem_time=%llu", lsp->sp.cgrp_id, rem_time);
 	if (!scx_bpf_sub_dispatch(lsp->sp.cgrp_id)) {
 		bpf_timer_cancel(&ss->budget_timer);
-		bpf_printk("[INFO] [WRR] [TIMER] timer cancelled: dispatch failed");
+		// bpf_printk("[INFO] [WRR] [TIMER] timer cancelled: dispatch failed");
 		return false;
 	}
 
@@ -350,6 +364,7 @@ void BPF_STRUCT_OPS(wrr_dispatch, s32 cpu, struct task_struct *prev)
 	if (cpu >= 4) return;
 
 	// bpf_printk("[INFO] [WRR] [DISPATCH] dispatching on cpu %u", cpu);
+	TRACE_FUNC_START("dispatch");
 	u32 ucpu = cpu;
 	struct cpu_sched_state *ss = bpf_map_lookup_elem(&sched_state, &ucpu);
 	struct global_data *global = fetch_global();
@@ -363,6 +378,7 @@ void BPF_STRUCT_OPS(wrr_dispatch, s32 cpu, struct task_struct *prev)
 		if (unlikely(!lsp)) return; // for verifier, should not happen
 
 		if (now < ss->budget_depletion_time && try_sub_dispatch(lsp, ss, now)) {
+			TRACE_FUNC_END("dispatch", "YIELDED EARLY");
 			return;
 		}
 	}
@@ -382,26 +398,35 @@ void BPF_STRUCT_OPS(wrr_dispatch, s32 cpu, struct task_struct *prev)
 
 		u64 now = bpf_ktime_get_ns();
 		ss->budget_depletion_time = now + lsp->sp.weight;
-		bpf_printk("[INFO] [WRR] [DISPATCH] cgroup %d weight: %llu", lsp->sp.cgrp_id, lsp->sp.weight);
+		// bpf_printk("[INFO] [WRR] [DISPATCH] cgroup %d weight: %llu", lsp->sp.cgrp_id, lsp->sp.weight);
 
 		ss->curr_rr_idx = ss->next_rr_idx;
 		ss->next_rr_idx = ss->next_rr_idx + 1 == MAX_SUB_SCHEDS ? 0 : ss->next_rr_idx + 1;
 		
 		if (try_sub_dispatch(lsp, ss, now)) {
+			TRACE_FUNC_END("dispatch", "");
 			return;
 		}
 	}
+	TRACE_FUNC_END("dispatch", "NO READY SUBS");
 	return; // no sub schedulers
 }
 
 s32 BPF_STRUCT_OPS(wrr_cgroup_init, struct cgroup *cgrp, struct scx_cgroup_init_args *args)
 {
-	bpf_printk("[INFO] [WRR] [CGROUP_INIT] %llu weight=%u period=%lu quota=%ld burst=%lu",
-				cgrp->kn->id, args->weight, args->bw_period_us,
-				args->bw_quota_us, args->bw_burst_us);
+	// bpf_printk("[INFO] [WRR] [CGROUP_INIT] %llu weight=%u period=%lu quota=%ld burst=%lu",
+				// cgrp->kn->id, args->weight, args->bw_period_us,
+				// args->bw_quota_us, args->bw_burst_us);
+				
+	TRACE_FUNC_START("cgroup_init");
 	u64 cgrp_id = cgrp->kn->id;
 	u32 weight = args->weight;
+	TRACE_EVENT(struct sched_trace_event_cgroup_init_args, SCHED_TRACE_CGROUP_INIT_ARGS,
+		e->cgrp_id = cgrp_id;
+		e->weight = weight;
+	);
 	bpf_map_update_elem(&cgroup_weights, &cgrp_id, &weight, BPF_ANY);
+	TRACE_FUNC_END("cgroup_init", "");
 	return 0;
 }
 
@@ -415,13 +440,13 @@ s32 BPF_STRUCT_OPS(wrr_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake
 
 void BPF_STRUCT_OPS(wrr_enqueue, struct task_struct *p, u64 enq_flags)
 {
-	bpf_printk("[INFO] [WRR] [ENQUEUE] enqueueing pid=%d", p->pid);
+	// bpf_printk("[INFO] [WRR] [ENQUEUE] enqueueing pid=%d", p->pid);
 	// scx_bpf_error("wrr_enqueue called unexpectedly");
 }
 
 void BPF_STRUCT_OPS(wrr_dequeue, struct task_struct *p, u64 deq_flags)
 {
-	bpf_printk("[INFO] [WRR] [DEQUEUE] dequeuing pid=%d", p->pid);
+	// bpf_printk("[INFO] [WRR] [DEQUEUE] dequeuing pid=%d", p->pid);
   // scx_bpf_error("wrr_dequeue called unexpectedly");
 }
 
