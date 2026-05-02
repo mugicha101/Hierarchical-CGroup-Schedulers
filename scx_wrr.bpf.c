@@ -20,6 +20,10 @@ char _license[] SEC("license") = "GPL";
 const bool cgroup_msgs = true;
 const volatile u64 cgroup_id;
 
+#ifndef SCX_KICK_REPICK
+#define SCX_KICK_REPICK 0b10
+#endif
+
 #define MAX_SUB_SCHEDS 64 // must be power of 2
 #define DEFAULT_WEIGHT 100000000ull // 100ms
 #define MAX_PENDING_UPDATES 1024
@@ -173,8 +177,16 @@ static __always_inline bool sync_local_sub(struct global_sub_params *global_subs
 
 static int budget_timer_callback(void *map, int *key, struct bpf_timer *timer) {
 	// bpf_printk("[INFO] [WRR] [TIMER] timer callback on cpu %d", bpf_get_smp_processor_id());
+	TRACE_FUNC_START("budget_timer_callback");
+	TRACE_EVENT(struct sched_trace_event_timer_cancel, SCHED_TRACE_TIMER_CANCEL,
+		e->timer_addr = (u64)timer;
+	);
 	s32 cpu = *key;
-	scx_bpf_kick_cpu(cpu, (u64)SCX_KICK_PREEMPT);
+	TRACE_EVENT(struct sched_trace_event_kick_cpu, SCHED_TRACE_KICK_CPU,
+		e->cpu = cpu;
+	);
+	scx_bpf_kick_cpu(cpu, (u64)SCX_KICK_REPICK);
+	TRACE_FUNC_END("budget_timer_callback", "");
 	return 0;
 }
 
@@ -309,6 +321,10 @@ void BPF_STRUCT_OPS(wrr_cgroup_set_weight, struct cgroup *cgrp, u32 weight)
 	u64 cgrp_id = cgrp->kn->id;
 	// bpf_printk("[INFO] [WRR] [SET_WEIGHT] Setting cgroup %llu weight to %u", cgrp_id, weight);
 	TRACE_FUNC_START("cgroup_set_weight");
+	TRACE_EVENT(struct sched_trace_event_set_weight_args, SCHED_TRACE_SET_WEIGHT_ARGS,
+		e->cgrp_id = cgrp_id;
+		e->weight = weight;
+	);
 	bpf_map_update_elem(&cgroup_weights, &cgrp_id, &weight, BPF_ANY);
 	struct global_sub_params *gsp;
 	struct global_data *global = fetch_global();
@@ -347,6 +363,10 @@ bool try_sub_dispatch(struct local_sub_params *lsp, struct cpu_sched_state *ss, 
 
 	u64 rem_time = ss->budget_depletion_time - now;
 	bpf_timer_start(&ss->budget_timer, rem_time, BPF_F_TIMER_CPU_PIN);
+	TRACE_EVENT(struct sched_trace_event_timer_start, SCHED_TRACE_TIMER_START,
+		e->timer_addr = (u64)&ss->budget_timer;
+		e->duration = rem_time;
+	);
 
 	// bpf_printk("[INFO] [WRR] [DISPATCH] dispatching cgroup %d rem_time=%llu", lsp->sp.cgrp_id, rem_time);
 	if (!scx_bpf_sub_dispatch(lsp->sp.cgrp_id)) {
@@ -361,7 +381,7 @@ bool try_sub_dispatch(struct local_sub_params *lsp, struct cpu_sched_state *ss, 
 void BPF_STRUCT_OPS(wrr_dispatch, s32 cpu, struct task_struct *prev)
 {
 	// FOR TESTING (limits CPUs to prevent freezing)
-	if (cpu >= 4) return;
+	if (cpu >= 1) return;
 
 	// bpf_printk("[INFO] [WRR] [DISPATCH] dispatching on cpu %u", cpu);
 	TRACE_FUNC_START("dispatch");
@@ -510,7 +530,7 @@ SCX_OPS_DEFINE(wrr_ops,
 	// SCX_OPS_SWITCH_PARTIAL: does not assign tasks to sched_ext by default
 	// SCX_OPS_ENQ_LAST: if no work on subscheduler, enqueues current running task rather than continuing it and calls dispatch again
 	//									 allows for skipping an idle sub and running next sub instead of continuing prev sub
-	.flags			= SCX_OPS_SWITCH_PARTIAL | SCX_OPS_ENQ_LAST,
+	.flags			= SCX_OPS_SWITCH_PARTIAL | SCX_OPS_ENQ_LAST | SCX_OPS_HAS_CGROUP_WEIGHT,
 	// .dump			= (void *)wrr_dump,
 
 	// task scheduling (should not be called)

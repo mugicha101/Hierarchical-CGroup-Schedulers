@@ -16,6 +16,7 @@ enum sched_trace_event_type {
   SCHED_TRACE_SUB_DETACH_ARGS,
   SCHED_TRACE_RUN_TASK,
   SCHED_TRACE_STOP_TASK,
+  SCHED_TRACE_KICK_CPU,
 };
 
 // note: each scheduler gets its own ring buffer, so don't need to give scheduler identification
@@ -27,12 +28,12 @@ struct sched_trace_event_header {
 
 struct sched_trace_event_func_start {
   struct sched_trace_event_header header;
-  char func_name[16]; // dispatch, init, timer_cb, etc
+  char func_name[32]; // dispatch, init, timer_cb, etc
 };
 
 struct sched_trace_event_func_end {
   struct sched_trace_event_header header;
-  char func_name[16];
+  char func_name[32];
   char reason[32];
 };
 
@@ -91,6 +92,11 @@ struct sched_trace_event_stop_task {
   uint64_t pid;
 };
 
+struct sched_trace_event_kick_cpu {
+  struct sched_trace_event_header header;
+  s32 cpu;
+};
+
 #if TRACING
 
 #define TRACE_EVENT(STRUCT_TYPE, EVENT_TYPE, ...) \
@@ -127,13 +133,13 @@ struct { \
 
 #define TRACE_FUNC_START(NAME) \
 TRACE_EVENT(struct sched_trace_event_func_start, SCHED_TRACE_FUNC_START, \
-  bpf_probe_read_kernel_str(e->func_name, sizeof(e->func_name), NAME); \
+  bpf_probe_read_kernel_str(e->func_name, 32, NAME); \
 );
 
 #define TRACE_FUNC_END(NAME, REASON) \
 TRACE_EVENT(struct sched_trace_event_func_end, SCHED_TRACE_FUNC_END, \
-  bpf_probe_read_kernel_str(e->func_name, sizeof(e->func_name), NAME); \
-  bpf_probe_read_kernel_str(e->reason, sizeof(e->reason), REASON); \
+  bpf_probe_read_kernel_str(e->func_name, 32, NAME); \
+  bpf_probe_read_kernel_str(e->reason, 32, REASON); \
 );
 
 #endif

@@ -202,6 +202,10 @@ int handle_event(void *ctx, void *data, size_t data_sz) {
 			struct sched_trace_event_stop_task *event = data;
 			fprintf(trace_fd, "STOP_TASK: pid=%lu\n", event->pid);
 		} break;
+		case SCHED_TRACE_KICK_CPU: {
+			struct sched_trace_event_kick_cpu *event = data;
+			fprintf(trace_fd, "KICK_CPU: cpu=%d\n", event->cpu);
+		} break;
 		default:
 			fprintf(trace_fd, "UNKNOWN_EVENT_TYPE\n");
 	}
@@ -323,11 +327,12 @@ restart:
 
 		// set cgroup weight
 		// note: if fails, likely need to run: echo "+cpu" | sudo tee /sys/fs/cgroup/cgroup.subtree_control
+		// note: does not trigger cgroup_set_weight if does not change weight
 		char w_path[256];
 		FILE *fp;
 		snprintf(w_path, sizeof(w_path), "%s/cpu.weight", cg_path);
 		fp = fopen(w_path, "w");
-		if (!fp || fprintf(fp, "%d\n", 25) < 0) {
+		if (!fp || fprintf(fp, "%d\n", 25 + i * 25) < 0) {
 			fprintf(stderr, "Error: could not write to file %s\n", w_path);
 			if (fp) fclose(fp);
 			goto cleanup;
