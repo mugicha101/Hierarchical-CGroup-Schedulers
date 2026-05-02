@@ -27,7 +27,7 @@ const volatile u64 cgroup_id;
 #define MAX_SUB_SCHEDS 64 // must be power of 2
 #define DEFAULT_WEIGHT 100000000ull // 100ms
 #define MAX_PENDING_UPDATES 1024
-#define NS_PER_WEIGHT 10000000 // weight 1 = 10ms
+#define NS_PER_WEIGHT 1000000 // weight 1 = 1ms
 // #define CPUSET_SIZE NR_CPUS / 64
 
 #ifndef smp_rmb
@@ -408,7 +408,7 @@ static __always_inline bool try_sub_dispatch(struct local_sub_params *lsp, struc
 void BPF_STRUCT_OPS(wrr_dispatch, s32 cpu, struct task_struct *prev)
 {
 	// FOR TESTING (limits CPUs to prevent freezing)
-	if (cpu >= 1) return;
+	if (cpu >= 4) return;
 
 	// bpf_printk("[INFO] [WRR] [DISPATCH] dispatching on cpu %u", cpu);
 	TRACE_FUNC_START("dispatch");

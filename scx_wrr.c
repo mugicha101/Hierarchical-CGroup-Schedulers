@@ -25,7 +25,8 @@
 #define SCHED_EXT 7
 #endif
 
-#define NSUB 2
+#define NSUB 6
+#define TASKS_PER_SUB 4
 
 struct seqlock_global {
 	__u64 gen_fin;
@@ -227,7 +228,7 @@ int main(int argc, char **argv)
 	struct scx_eaf *sub_skels[NSUB];
 	struct bpf_link *link;
 	struct bpf_link *sub_links[NSUB];
-	pid_t sub_tasks[NSUB];
+	pid_t sub_tasks[NSUB * TASKS_PER_SUB];
 	struct ring_buffer *rb_manager;
 	struct callback_ctx cb_ctx;
 	struct callback_ctx sub_cb_ctx[NSUB];
@@ -340,7 +341,7 @@ restart:
 		FILE *fp;
 		snprintf(w_path, sizeof(w_path), "%s/cpu.weight", cg_path);
 		fp = fopen(w_path, "w");
-		if (!fp || fprintf(fp, "%d\n", 25 + i * 25) < 0) {
+		if (!fp || fprintf(fp, "%d\n", (i+1) * 25) < 0) {
 			fprintf(stderr, "Error: could not write to file %s\n", w_path);
 			if (fp) fclose(fp);
 			goto cleanup;
@@ -348,13 +349,15 @@ restart:
 		fclose(fp);
 		fprintf(stdout, "Subscheduler %d Attached\n", i);
 
-		// add indefinite task
-		sleep(1);
-		sub_tasks[i] = add_indefinite_task_clone3(cg_path);
-		if (sub_tasks[i] < 0) {
-			fprintf(stderr, "Error: failed to create task %d\n", i);
-			goto cleanup;
-		} 
+		// add indefinite tasks
+		usleep(1000 * 500);
+		for (int j = 0; j < TASKS_PER_SUB; ++j) {
+			sub_tasks[i*TASKS_PER_SUB + j] = add_indefinite_task_clone3(cg_path);
+			if (sub_tasks[i*TASKS_PER_SUB + j] < 0) {
+				fprintf(stderr, "Error: failed to create task %d\n", i);
+				goto cleanup;
+			}
+		}
 		fprintf(stdout, "Task %d Attached\n", sub_tasks[i]);
 	}
 
@@ -372,7 +375,11 @@ cleanup:
 	for (int i = 0; i < NSUB; i++) {
 		if (sub_links[i]) bpf_link__destroy(sub_links[i]);
 		if (sub_skels[i]) scx_eaf__destroy(sub_skels[i]);
-		if (sub_tasks[i] > 0) kill(sub_tasks[i], SIGKILL);
+		for (int j = 0; j < TASKS_PER_SUB; j++) {
+			if (sub_tasks[i * TASKS_PER_SUB + j] > 0) {
+				kill(sub_tasks[i * TASKS_PER_SUB + j], SIGKILL);
+			}
+		}
 	}
 
 	if (link) bpf_link__destroy(link);
