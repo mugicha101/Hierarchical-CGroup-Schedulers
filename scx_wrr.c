@@ -206,6 +206,14 @@ int handle_event(void *ctx, void *data, size_t data_sz) {
 			struct sched_trace_event_kick_cpu *event = data;
 			fprintf(trace_fd, "KICK_CPU: cpu=%d\n", event->cpu);
 		} break;
+		case SCHED_TRACE_TRY_SUB_DISPATCH: {
+			struct sched_trace_try_sub_dispatch *event = data;
+			fprintf(trace_fd, "TRY_SUB_DISPATCH: idx=%d success=%d\n", event->idx, event->success);
+		} break;
+		case SCHED_TRACE_SUB_PARAMS_UPDATE: {
+			struct sched_trace_sub_params_update *event = data;
+			fprintf(trace_fd, "SUB_PARAMS_UPDATE: idx=%d cgrp_id=%lu weight=%lu\n", event->idx, event->cgrp_id, event->weight);
+		} break;
 		default:
 			fprintf(trace_fd, "UNKNOWN_EVENT_TYPE\n");
 	}

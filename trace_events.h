@@ -17,6 +17,8 @@ enum sched_trace_event_type {
   SCHED_TRACE_RUN_TASK,
   SCHED_TRACE_STOP_TASK,
   SCHED_TRACE_KICK_CPU,
+  SCHED_TRACE_TRY_SUB_DISPATCH,
+  SCHED_TRACE_SUB_PARAMS_UPDATE,
 };
 
 // note: each scheduler gets its own ring buffer, so don't need to give scheduler identification
@@ -95,6 +97,19 @@ struct sched_trace_event_stop_task {
 struct sched_trace_event_kick_cpu {
   struct sched_trace_event_header header;
   s32 cpu;
+};
+
+struct sched_trace_try_sub_dispatch {
+  struct sched_trace_event_header header;
+  int idx;
+  bool success;
+};
+
+struct sched_trace_sub_params_update {
+  struct sched_trace_event_header header;
+  int idx;
+  u64 cgrp_id;
+  u64 weight;
 };
 
 #if TRACING

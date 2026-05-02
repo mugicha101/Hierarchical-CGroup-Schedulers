@@ -280,6 +280,11 @@ s32 BPF_STRUCT_OPS(wrr_sub_attach, struct scx_sub_attach_args *args)
 	
 	bpf_spin_unlock(global_subs_write_lock);
 	// bpf_printk("[INFO] [WRR] [SUB_ATTACH] cgroup %llu attached with weight %llu", cgrp_id, weight);
+	TRACE_EVENT(struct sched_trace_sub_params_update, SCHED_TRACE_SUB_PARAMS_UPDATE,
+		e->idx = gsp - global_subs;
+		e->cgrp_id = cgrp_id;
+		e->weight = weight;
+	);
 	
 	TRACE_FUNC_END("sub_attach", "");
   return 0;
@@ -313,6 +318,12 @@ void BPF_STRUCT_OPS(wrr_sub_detach, struct scx_sub_detach_args *args)
 	seqlock_update_end(&gsp->lock);
 
 	bpf_spin_unlock(global_subs_write_lock);
+
+	TRACE_EVENT(struct sched_trace_sub_params_update, SCHED_TRACE_SUB_PARAMS_UPDATE,
+		e->idx = gsp - global_subs;
+		e->cgrp_id = 0;
+		e->weight = 0;
+	);
 	TRACE_FUNC_END("sub_detach", "");
 }
 
@@ -330,6 +341,8 @@ void BPF_STRUCT_OPS(wrr_cgroup_set_weight, struct cgroup *cgrp, u32 weight)
 	struct global_data *global = fetch_global();
 	if (unlikely(!global)) return; // for verifier, should not happen
 
+	u64 weight_ns = (u64)weight * NS_PER_WEIGHT;
+
 	struct global_sub_params *global_subs = global->global_subs;
 	struct bpf_spin_lock *global_subs_write_lock = &global->global_subs_write_lock;
 	bpf_spin_lock(global_subs_write_lock);
@@ -342,10 +355,15 @@ void BPF_STRUCT_OPS(wrr_cgroup_set_weight, struct cgroup *cgrp, u32 weight)
 	}
 	
 	seqlock_update_start(&gsp->lock);
-	gsp->sp.weight = (u64)weight * NS_PER_WEIGHT;
+	gsp->sp.weight = weight_ns;
 	seqlock_update_end(&gsp->lock);
 
 	bpf_spin_unlock(global_subs_write_lock);
+	TRACE_EVENT(struct sched_trace_sub_params_update, SCHED_TRACE_SUB_PARAMS_UPDATE,
+		e->idx = gsp - global_subs;
+		e->cgrp_id = cgrp_id;
+		e->weight = weight_ns;
+	);
 	TRACE_FUNC_END("cgroup_set_weight", "");
 }
 
@@ -358,22 +376,31 @@ void BPF_STRUCT_OPS(wrr_cgroup_set_bandwidth, struct cgroup *cgrp,
 }
 
 // returns true if dispatched successfully
-bool try_sub_dispatch(struct local_sub_params *lsp, struct cpu_sched_state *ss, u64 now) {
+static __always_inline bool try_sub_dispatch(struct local_sub_params *lsp, struct cpu_sched_state *ss, u64 now) {
 	if (now >= ss->budget_depletion_time) return false;
 
-	u64 rem_time = ss->budget_depletion_time - now;
+	// bpf_printk("[INFO] [WRR] [DISPATCH] dispatching cgroup %d rem_time=%llu", lsp->sp.cgrp_id, rem_time);
+	if (!scx_bpf_sub_dispatch(lsp->sp.cgrp_id)) {
+		// bpf_printk("[INFO] [WRR] [TIMER] timer cancelled: dispatch failed");
+		TRACE_EVENT(struct sched_trace_try_sub_dispatch, SCHED_TRACE_TRY_SUB_DISPATCH,
+			e->idx = ss->next_rr_idx;
+			e->success = false;
+		);
+		return false;
+	}
+
+	// start budget enforcement timer
+	u64 rem_time = ss->budget_depletion_time - now; // TODO: figure out if need to update now if dispatch takes a long time
 	bpf_timer_start(&ss->budget_timer, rem_time, BPF_F_TIMER_CPU_PIN);
 	TRACE_EVENT(struct sched_trace_event_timer_start, SCHED_TRACE_TIMER_START,
 		e->timer_addr = (u64)&ss->budget_timer;
 		e->duration = rem_time;
 	);
 
-	// bpf_printk("[INFO] [WRR] [DISPATCH] dispatching cgroup %d rem_time=%llu", lsp->sp.cgrp_id, rem_time);
-	if (!scx_bpf_sub_dispatch(lsp->sp.cgrp_id)) {
-		bpf_timer_cancel(&ss->budget_timer);
-		// bpf_printk("[INFO] [WRR] [TIMER] timer cancelled: dispatch failed");
-		return false;
-	}
+	TRACE_EVENT(struct sched_trace_try_sub_dispatch, SCHED_TRACE_TRY_SUB_DISPATCH,
+		e->idx = ss->next_rr_idx;
+		e->success = true;
+	);
 
 	return true;
 }
@@ -392,15 +419,20 @@ void BPF_STRUCT_OPS(wrr_dispatch, s32 cpu, struct task_struct *prev)
 
 	// check if sub yielded early, in which case should dispatch itself again until budget gone
 	if (bpf_timer_cancel(&ss->budget_timer)) {
+		TRACE_EVENT(struct sched_trace_event_timer_cancel, SCHED_TRACE_TIMER_CANCEL,
+			e->timer_addr = (u64)&ss->budget_timer;
+		);
 		// bpf_printk("[INFO] [WRR] [TIMER] timer cancelled: yielded early");
 		u64 now = bpf_ktime_get_ns();
 		struct local_sub_params *lsp = bpf_map_lookup_elem(&local_subs, &ss->curr_rr_idx);
 		if (unlikely(!lsp)) return; // for verifier, should not happen
 
 		if (now < ss->budget_depletion_time && try_sub_dispatch(lsp, ss, now)) {
-			TRACE_FUNC_END("dispatch", "YIELDED EARLY");
+			TRACE_FUNC_END("dispatch", "RESUME EARLY YIELD");
 			return;
 		}
+
+		// preserve budget for next attempt (TODO: figure out if need to clear here)
 	}
 	// bpf_printk("[INFO] [WRR] [DISPATCH] cpu=%d finding next cgroup to run...", cpu);
 
@@ -410,8 +442,7 @@ void BPF_STRUCT_OPS(wrr_dispatch, s32 cpu, struct task_struct *prev)
 		struct local_sub_params *lsp = bpf_map_lookup_elem(&local_subs, &ss->next_rr_idx);
 		if (unlikely(!lsp)) return; // for verifier, should not happen
 
-		if (lsp->sp.cgrp_id == 0) {
-			ss->curr_rr_idx = ss->next_rr_idx;
+		if (lsp->sp.cgrp_id == 0) { // skip empty slots
 			ss->next_rr_idx = ss->next_rr_idx + 1 == MAX_SUB_SCHEDS ? 0 : ss->next_rr_idx + 1;
 			continue;
 		}

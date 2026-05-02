@@ -52,6 +52,8 @@ void BPF_STRUCT_OPS(eaf_enqueue, struct task_struct *p, u64 enq_flags)
 		e->enq_flags = enq_flags;
 	);
 	scx_bpf_dsq_insert(p, dsq_id, 1 * 1000000000ull, enq_flags);
+	u32 cpu = bpf_get_smp_processor_id();
+	scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
 }
 
 void BPF_STRUCT_OPS(eaf_dequeue, struct task_struct *p, u64 deq_flags)
