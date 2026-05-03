@@ -561,7 +561,7 @@ SCX_OPS_DEFINE(wrr_ops,
 	// SCX_OPS_SWITCH_PARTIAL: does not assign tasks to sched_ext by default
 	// SCX_OPS_ENQ_LAST: if no work on subscheduler, enqueues current running task rather than continuing it and calls dispatch again
 	//									 allows for skipping an idle sub and running next sub instead of continuing prev sub
-	.flags			= SCX_OPS_SWITCH_PARTIAL | SCX_OPS_ENQ_LAST | SCX_OPS_HAS_CGROUP_WEIGHT,
+	.flags			= SCX_OPS_SWITCH_PARTIAL | SCX_OPS_ENQ_LAST,
 	// .dump			= (void *)wrr_dump,
 
 	// task scheduling (should not be called)
