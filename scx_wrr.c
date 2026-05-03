@@ -20,13 +20,10 @@
 #include <linux/sched.h>
 #include <time.h>
 #include "trace_events.h"
-
-#ifndef SCHED_EXT
-#define SCHED_EXT 7
-#endif
+#include "scx_cgss_helpers.h"
 
 #define NSUB 6
-#define TASKS_PER_SUB 4
+#define TASKS_PER_SUB 3
 
 struct seqlock_global {
 	__u64 gen_fin;
@@ -41,77 +38,6 @@ struct seqlock_local {
 #include "scx_eaf.bpf.skel.h"
 
 #define SUB_CG_BASE "/sys/fs/cgroup/scx_eaf"
-
-int create_cgroup(const char *path) {
-	if (mkdir(path, 0755) && errno != EEXIST) {
-		perror("Failed to create cgroup");
-		return -1;
-	}
-	return 0;
-}
-
-int prep_sub(struct scx_eaf *skel, const char *cg_path) {
-	struct stat st;
-	if (stat(cg_path, &st) < 0) {
-		perror("stat cgroup");
-		return -1;
-	}
-	skel->struct_ops.eaf_ops->sub_cgroup_id = st.st_ino;
-	skel->rodata->cgroup_id = st.st_ino;
-
-	return 0;
-}
-
-#ifndef CLONE_INTO_CGROUP
-#define CLONE_INTO_CGROUP 0x200000000ULL
-#endif
-
-pid_t add_indefinite_task_clone3(const char *cg_path) {
-	// when attempting to fork, switch child cgroup to the subscheduler cgroup, and wake up child, was enqueued onto parent instead of child (think this happens on fork)
-	// currently don't know of a way to move a process from the parent to a child (probably still WIP)
-	// clone3 syscall works though by spawning child into that cgroup directly rather than after forking
-
-	int cg_fd = open(cg_path, O_RDONLY | O_DIRECTORY);
-	if (cg_fd < 0) {
-			perror("Failed to open cgroup directory");
-			exit(1);
-	}
-	struct clone_args args = {0};
-	args.flags = CLONE_INTO_CGROUP;
-	args.cgroup = cg_fd;
-	pid_t pid = syscall(SYS_clone3, &args, sizeof(args));
-
-	if (pid < 0) {
-			perror("clone3 failed");
-			close(cg_fd);
-			return -1;
-	}
-
-	if (pid == 0) {
-		// in child
-		close(cg_fd);
-		pid = getpid();
-
-		// change policy to sched_ext
-		struct sched_param sp = {};
-    if (sched_setscheduler(0, SCHED_EXT, &sp) < 0) {
-        fprintf(stderr, "task: failed to set policy to SCHED_EXT\n");
-        exit(1);
-    }
-		fprintf(stdout, "task spawned on cgroup %s\n", cg_path);
-
-		// spin
-		volatile unsigned long long counter = 0;
-    while (1) {
-      counter++;
-    }
-		exit(0); 
-	}
-
-	// in parent
-	close(cg_fd);
-	return pid;
-}
 
 const char help_fmt[] =
 "A simple sched_ext scheduler.\n"
@@ -137,89 +63,6 @@ static int libbpf_print_fn(enum libbpf_print_level level, const char *format, va
 static void sigint_handler(int simple)
 {
 	exit_req = 1;
-}
-
-static FILE *trace_fd = NULL;
-struct callback_ctx {
-	char sched_name[16];
-};
-
-static u64 start_time = 0;
-
-int handle_event(void *ctx, void *data, size_t data_sz) {
-	struct callback_ctx *cb_ctx = ctx;
-	struct sched_trace_event_header *header = data;
-	if (start_time == 0) {
-		start_time = header->timestamp;
-		fprintf(trace_fd, "start time: %lu\n", start_time);
-	}
-	fprintf(trace_fd, "[%s] [t=%lu:cpu=%d] ", cb_ctx->sched_name, header->timestamp - start_time, header->core);
-	switch (header->type) {
-		case SCHED_TRACE_FUNC_START: {
-			struct sched_trace_event_func_start *event = data;
-			fprintf(trace_fd, "FUNC_START: %s\n", event->func_name);
-		} break;
-		case SCHED_TRACE_FUNC_END: {
-			struct sched_trace_event_func_end *event = data;
-			fprintf(trace_fd, "FUNC_END: %s %s\n", event->func_name, event->reason);
-		} break;
-		case SCHED_TRACE_TIMER_START: {
-			struct sched_trace_event_timer_start *event = data;
-			fprintf(trace_fd, "TIMER_START: timer_addr=%lx duration=%lu\n", event->timer_addr, event->duration);
-		} break;
-		case SCHED_TRACE_TIMER_CANCEL: {
-			struct sched_trace_event_timer_cancel *event = data;
-			fprintf(trace_fd, "TIMER_CANCEL: timer_addr=%lx\n", event->timer_addr);
-		} break;
-		case SCHED_TRACE_CGROUP_INIT_ARGS: {
-			struct sched_trace_event_cgroup_init_args *event = data;
-			fprintf(trace_fd, "CGROUP_INIT_ARGS: cgrp_id=%lu weight=%lu\n", event->cgrp_id, event->weight);
-		} break;
-		case SCHED_TRACE_SET_WEIGHT_ARGS: {
-			struct sched_trace_event_set_weight_args *event = data;
-			fprintf(trace_fd, "SET_WEIGHT_ARGS: cgrp_id=%lu weight=%lu\n", event->cgrp_id, event->weight);
-		} break;
-		case SCHED_TRACE_ENQUEUE_TASK: {
-			struct sched_trace_event_enqueue_task *event = data;
-			fprintf(trace_fd, "ENQUEUE_TASK: pid=%lu enq_flags=%lx\n", event->pid, event->enq_flags);
-		} break;
-		case SCHED_TRACE_DEQUEUE_TASK: {
-			struct sched_trace_event_dequeue_task *event = data;
-			fprintf(trace_fd, "DEQUEUE_TASK: pid=%lu deq_flags=%lx\n", event->pid, event->deq_flags);
-		} break;
-		case SCHED_TRACE_SUB_ATTACH_ARGS: {
-			struct sched_trace_event_sub_attach_args *event = data;
-			fprintf(trace_fd, "SUB_ATTACH_ARGS: cgrp_id=%lu\n", event->cgrp_id);
-		} break;
-		case SCHED_TRACE_SUB_DETACH_ARGS: {
-			struct sched_trace_event_sub_detach_args *event = data;
-			fprintf(trace_fd, "SUB_DETACH_ARGS: cgrp_id=%lu\n", event->cgrp_id);
-		} break;
-		case SCHED_TRACE_RUN_TASK: {
-			struct sched_trace_event_run_task *event = data;
-			fprintf(trace_fd, "RUN_TASK: pid=%lu\n", event->pid);
-		} break;
-		case SCHED_TRACE_STOP_TASK: {
-			struct sched_trace_event_stop_task *event = data;
-			fprintf(trace_fd, "STOP_TASK: pid=%lu\n", event->pid);
-		} break;
-		case SCHED_TRACE_KICK_CPU: {
-			struct sched_trace_event_kick_cpu *event = data;
-			fprintf(trace_fd, "KICK_CPU: cpu=%d\n", event->cpu);
-		} break;
-		case SCHED_TRACE_TRY_SUB_DISPATCH: {
-			struct sched_trace_try_sub_dispatch *event = data;
-			fprintf(trace_fd, "TRY_SUB_DISPATCH: idx=%d success=%d\n", event->idx, event->success);
-		} break;
-		case SCHED_TRACE_SUB_PARAMS_UPDATE: {
-			struct sched_trace_sub_params_update *event = data;
-			fprintf(trace_fd, "SUB_PARAMS_UPDATE: idx=%d cgrp_id=%lu weight=%lu\n", event->idx, event->cgrp_id, event->weight);
-		} break;
-		default:
-			fprintf(trace_fd, "UNKNOWN_EVENT_TYPE\n");
-	}
-	
-	return 0;
 }
 
 int main(int argc, char **argv)
@@ -315,10 +158,13 @@ restart:
 			fprintf(stderr, "Error: failed to open sub %d\n", i);
 			goto cleanup;
 		}
-		if (prep_sub(sub_skels[i], cg_path) < 0) {
-			fprintf(stderr, "Error: failed to prep sub %d\n", i);
+		struct stat st;
+		if (stat(cg_path, &st) < 0) {
+			fprintf(stderr, "Error: failed to stat cgroup %s\n", cg_path);
 			goto cleanup;
 		}
+		sub_skels[i]->struct_ops.eaf_ops->sub_cgroup_id = st.st_ino;
+		sub_skels[i]->rodata->cgroup_id = st.st_ino;
 		SCX_OPS_LOAD(sub_skels[i], eaf_ops, scx_eaf, uei);
 		sub_links[i] = SCX_OPS_ATTACH(sub_skels[i], eaf_ops, scx_eaf);
 		if (!sub_links[i]) {
