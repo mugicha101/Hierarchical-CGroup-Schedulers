@@ -256,6 +256,8 @@ s32 BPF_STRUCT_OPS(fp_sub_attach, struct scx_sub_attach_args *args)
 	gsp->sp.weight = weight;
 	
 	seqlock_update_end(&gsp->lock);
+
+	global->global_gen++;
 	
 	bpf_spin_unlock(global_subs_write_lock);
 	// bpf_printk("[INFO] [FP] [SUB_ATTACH] cgroup %llu attached with weight %llu", cgrp_id, weight);
@@ -296,6 +298,8 @@ void BPF_STRUCT_OPS(fp_sub_detach, struct scx_sub_detach_args *args)
 	
 	seqlock_update_end(&gsp->lock);
 
+	global->global_gen++;
+
 	bpf_spin_unlock(global_subs_write_lock);
 
 	TRACE_EVENT(struct sched_trace_sub_params_update, SCHED_TRACE_SUB_PARAMS_UPDATE,
@@ -335,6 +339,8 @@ void BPF_STRUCT_OPS(fp_cgroup_set_weight, struct cgroup *cgrp, u32 weight)
 	gsp->sp.weight = weight;
 	seqlock_update_end(&gsp->lock);
 
+	global->global_gen++;
+
 	bpf_spin_unlock(global_subs_write_lock);
 	TRACE_EVENT(struct sched_trace_sub_params_update, SCHED_TRACE_SUB_PARAMS_UPDATE,
 		e->idx = gsp - global_subs;
@@ -361,31 +367,43 @@ static __always_inline void sync_priority_order(struct global_data *global, stru
   u32 i;
   bool modified = false; // NOTE: correctness assumes this is the only place that calls sync_local_sub (otherwise can sync but not update priority)
 	bpf_for(i, 0, MAX_SUB_SCHEDS) {
-		modified = modified | sync_local_sub(global->global_subs, i);
+    modified = modified | sync_local_sub(global->global_subs, i);
 		struct local_sub_params *lsp = bpf_map_lookup_elem(&local_subs, &i);
-		if (unlikely(!lsp)) return; // for verifier, should not happen
+    if (unlikely(!lsp)) break; // for verifier, should not happen
 
-    ss->priority[i] = lsp->sp.weight;
+    u32 safe_i = i & (MAX_SUB_SCHEDS - 1);
+    ss->priority[safe_i] = lsp->sp.weight;
 	}
   if (!modified) return; // no updates after syncing, so priority order unchanged
 
   // selection sort faster than quicksort for small MAX_SUB_SCHEDS
   bpf_for(i, 0, MAX_SUB_SCHEDS) {
+    if (unlikely(i >= MAX_SUB_SCHEDS)) break; // for verifier, should not happen
+
     u32 j;
     bpf_for(j, i+1, MAX_SUB_SCHEDS) {
-      if (ss->priority[ss->porder[j]] < ss->priority[ss->porder[i]]) {
-        u32 t = ss->porder[i];
-        ss->porder[i] = ss->porder[j];
-        ss->porder[j] = t;
+      u32 safe_i = i & (MAX_SUB_SCHEDS - 1);
+      u32 safe_j = j & (MAX_SUB_SCHEDS - 1);
+      u32 safe_oi = ss->porder[safe_i] & (MAX_SUB_SCHEDS - 1);
+      u32 safe_oj = ss->porder[safe_j] & (MAX_SUB_SCHEDS - 1);
+      if (ss->priority[safe_oj] > ss->priority[safe_oi]) {
+        ss->porder[safe_i] = safe_oj;
+        ss->porder[safe_j] = safe_oi;
       }
     }
+
+		// debug print
+		// TRACE_EVENT(struct sched_trace_event_timer_start, SCHED_TRACE_TIMER_START, 
+		// 	e->timer_addr = 0;
+		// 	e->duration = ss->porder[i & (MAX_SUB_SCHEDS - 1)];
+		// );
   }
 }
 
 void BPF_STRUCT_OPS(fp_dispatch, s32 cpu, struct task_struct *prev)
 {
 	// FOR TESTING (limits CPUs to prevent freezing)
-	if (cpu >= 4) return;
+	if (cpu >= 1) return;
 
 	// bpf_printk("[INFO] [FP] [DISPATCH] dispatching on cpu %u", cpu);
 	TRACE_FUNC_START("dispatch");
@@ -398,18 +416,27 @@ void BPF_STRUCT_OPS(fp_dispatch, s32 cpu, struct task_struct *prev)
 
 	u32 i;
 	bpf_for(i, 0, MAX_SUB_SCHEDS) {
-		struct local_sub_params *lsp = bpf_map_lookup_elem(&local_subs, &ss->porder[i]);
+		u32 idx = ss->porder[i];
+		struct local_sub_params *lsp = bpf_map_lookup_elem(&local_subs, &idx);
 		if (unlikely(!lsp)) return; // for verifier, should not happen
 
 		if (lsp->sp.cgrp_id == 0) { // empty slots at lowest priority
 			break;
 		}
 
-    ss->curr_idx = ss->porder[i];
+    ss->curr_idx = idx;
 		if (scx_bpf_sub_dispatch(lsp->sp.cgrp_id)) {
+			TRACE_EVENT(struct sched_trace_try_sub_dispatch, SCHED_TRACE_TRY_SUB_DISPATCH,
+				e->idx = idx;
+				e->success = true;
+			);
       TRACE_FUNC_END("dispatch", "");
       return;
     }
+		TRACE_EVENT(struct sched_trace_try_sub_dispatch, SCHED_TRACE_TRY_SUB_DISPATCH,
+			e->idx = idx;
+			e->success = false;
+		);
 	}
 	TRACE_FUNC_END("dispatch", "NO READY SUBS");
 	return; // no sub schedulers

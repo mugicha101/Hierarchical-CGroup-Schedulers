@@ -23,7 +23,7 @@
 #include "scx_cgss_helpers.h"
 
 #define NSUB 6
-#define TASKS_PER_SUB 3
+#define TASKS_PER_SUB 4
 
 struct seqlock_global {
 	__u64 gen_fin;
@@ -63,6 +63,14 @@ static int libbpf_print_fn(enum libbpf_print_level level, const char *format, va
 static void sigint_handler(int simple)
 {
 	exit_req = 1;
+}
+
+int task_func(void *arg) {
+	volatile unsigned long long counter = 0;
+	while (1) {
+		counter++;
+	}
+	return 0;
 }
 
 int main(int argc, char **argv)
@@ -198,7 +206,7 @@ restart:
 		// add indefinite tasks
 		usleep(1000 * 500);
 		for (int j = 0; j < TASKS_PER_SUB; ++j) {
-			sub_tasks[i*TASKS_PER_SUB + j] = add_indefinite_task_clone3(cg_path);
+			sub_tasks[i*TASKS_PER_SUB + j] = add_task_clone3(cg_path, task_func, NULL);
 			if (sub_tasks[i*TASKS_PER_SUB + j] < 0) {
 				fprintf(stderr, "Error: failed to create task %d\n", i);
 				goto cleanup;

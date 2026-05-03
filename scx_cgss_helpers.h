@@ -39,7 +39,8 @@ int create_cgroup(const char *path) {
 	return 0;
 }
 
-pid_t add_indefinite_task_clone3(const char *cg_path) {
+typedef int (*child_func_t)(void *);
+pid_t add_task_clone3(const char *cg_path, child_func_t child_func, void *child_arg) {
 	// when attempting to fork, switch child cgroup to the subscheduler cgroup, and wake up child, was enqueued onto parent instead of child (think this happens on fork)
 	// currently don't know of a way to move a process from the parent to a child (probably still WIP)
 	// clone3 syscall works though by spawning child into that cgroup directly rather than after forking
@@ -74,12 +75,12 @@ pid_t add_indefinite_task_clone3(const char *cg_path) {
 		sched_yield();
 		// fprintf(stdout, "task spawned on cgroup %s\n", cg_path);
 
-		// spin
-		volatile unsigned long long counter = 0;
-    while (1) {
-      counter++;
+		// run func
+    int ret = 0;
+    if (child_func) {
+      ret = child_func(child_arg);
     }
-		exit(0); 
+		_exit(ret); 
 	}
 
 	// in parent
