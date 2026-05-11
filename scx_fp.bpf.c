@@ -515,7 +515,6 @@ void BPF_STRUCT_OPS(fp_dispatch, s32 cpu, struct task_struct *prev)
 	// bpf_printk("[INFO] [FP] [DISPATCH] dispatching on cpu %u", cpu);
 	TRACE_FUNC_START("dispatch");
 
-	// TESTING
 	u32 ucpu = cpu;
 	struct global_data *global = fetch_global();
 	struct global_task_data *global_task_data = fetch_global_task_data();
@@ -602,7 +601,6 @@ u64 __always_inline get_task_weight(struct task_struct *p) {
 
 // assumes RCU lock held
 void __always_inline update_cpu_cgroup_weight(u32 cpu, struct global_task_data *global) {
-	return; // TODO: figure out why this breaks system
 	if (cpu >= NR_CPUS) return; // for verifier, should not happen
 
 	struct cpu_task_state *cts = &global->cpu_task_states[cpu];
