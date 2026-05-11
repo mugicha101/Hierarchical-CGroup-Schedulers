@@ -129,7 +129,11 @@ do { \
   } \
 } while (0)
 
+// create buffer + define https://github.com/wagler/scx-tracer.git tracepoints
 #define CREATE_TRACE_BUFF() \
+extern void scx_custom_trace_event_begin(const char *name__str) __ksym; \
+extern void scx_custom_trace_event_end(void) __ksym; \
+extern void scx_custom_trace_event_instant(const char *name__str) __ksym; \
 struct { \
     __uint(type, BPF_MAP_TYPE_RINGBUF); \
     __uint(max_entries, 256 * 1024); \
@@ -147,15 +151,19 @@ struct { \
 #endif
 
 #define TRACE_FUNC_START(NAME) \
+scx_custom_trace_event_begin(NAME); \
 TRACE_EVENT(struct sched_trace_event_func_start, SCHED_TRACE_FUNC_START, \
   bpf_probe_read_kernel_str(e->func_name, 32, NAME); \
 );
 
 #define TRACE_FUNC_END(NAME, REASON) \
+scx_custom_trace_event_end(); \
 TRACE_EVENT(struct sched_trace_event_func_end, SCHED_TRACE_FUNC_END, \
   bpf_probe_read_kernel_str(e->func_name, 32, NAME); \
   bpf_probe_read_kernel_str(e->reason, 32, REASON); \
 );
+
+#endif
 
 // HACK FOR RESOLVING LINKER ISSUES (some macros missing)
 
@@ -182,6 +190,4 @@ TRACE_EVENT(struct sched_trace_event_func_end, SCHED_TRACE_FUNC_END, \
 #if SCX_DSQ_LOCAL_ON == 0
 #undef SCX_DSQ_LOCAL_ON
 #define SCX_DSQ_LOCAL_ON 13835058055282163712ULL
-#endif
-
 #endif

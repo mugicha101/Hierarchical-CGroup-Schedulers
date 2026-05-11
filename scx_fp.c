@@ -23,7 +23,7 @@
 #include "scx_cgss_helpers.h"
 
 #define NSUB 1
-#define TASKS_PER_SUB 3
+#define TASKS_PER_SUB 6
 
 struct seqlock_global {
 	__u64 gen_fin;
@@ -88,7 +88,7 @@ int task_func(void *arg) {
 	
 	while (1) {
 		for (volatile unsigned long long i = 0; i < 100000000ull; ++i);
-		usleep(60000); // 60ms
+		usleep(5000); // 5ms
 	}
 	return 0;
 }

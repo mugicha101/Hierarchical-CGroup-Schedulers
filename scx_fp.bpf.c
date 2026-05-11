@@ -5,7 +5,7 @@ CREATE_TRACE_BUFF();
 
 char _license[] SEC("license") = "GPL";
 
-// fixed priority scheduler
+// job-level fixed priority scheduler
 // prioritized by weight (higher weight = higher priority)
 // tie breaks handled arbitrarily
 
@@ -29,7 +29,7 @@ char _license[] SEC("license") = "GPL";
 const volatile u64 cgroup_id;
 u64 self_cgroup_weight;
 
-#define CPU_LIMIT 1 // for testing, limit CPUs to run on
+#define CPU_LIMIT 2 // for testing, limit CPUs to run on
 #define MAX_SUB_SCHEDS 64 // must be power of 2
 #define DEFAULT_WEIGHT 1
 #define MAX_PENDING_UPDATES 1024
