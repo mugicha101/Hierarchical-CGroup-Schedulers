@@ -438,19 +438,11 @@ static __always_inline bool try_task_dispatch(u32 cpu, struct global_task_data *
 	bool empty = false;
 	u32 trials;
 	bpf_for(trials, 0, NTRIALS) {
-		TRACE_EVENT(struct sched_trace_event_timer_start, SCHED_TRACE_TIMER_START,
-			e->timer_addr = trials;
-			e->duration = 111111;
-		);
     struct task_struct *t;
 		empty = true;
     bpf_for_each(scx_dsq, t, dsq_id, 0) {
 			empty = false;
 			peeked_weight = ~0ULL - t->scx.dsq_vtime;
-			TRACE_EVENT(struct sched_trace_event_timer_start, SCHED_TRACE_TIMER_START,
-				e->timer_addr = trials;
-				e->duration = peeked_weight;
-			);
 
 			if (likely(scx_bpf_dsq_move(BPF_FOR_EACH_ITER, t, SCX_DSQ_LOCAL, 0))) {
 				moved_from_global = true;
@@ -512,12 +504,6 @@ static __always_inline void sync_priority_order(struct global_data *global, stru
         ss->porder[safe_j] = safe_oi;
       }
     }
-
-		// debug print
-		// TRACE_EVENT(struct sched_trace_event_timer_start, SCHED_TRACE_TIMER_START, 
-		// 	e->timer_addr = 0;
-		// 	e->duration = ss->porder[i & (MAX_SUB_SCHEDS - 1)];
-		// );
   }
 }
 
@@ -611,10 +597,6 @@ u64 __always_inline get_task_weight(struct task_struct *p) {
 		bpf_printk("[WARN] [FP] [GET_WEIGHT] Task %d has weight 0, using weight 1 instead", p->pid);
 		weight = 1;
 	}
-	// TRACE_EVENT(struct sched_trace_event_timer_start, SCHED_TRACE_TIMER_START,
-	// 	e->timer_addr = lookup_weight != NULL;
-	// 	e->duration = weight;
-	// );
 	return weight;
 }
 
@@ -646,11 +628,6 @@ void BPF_STRUCT_OPS(fp_enqueue, struct task_struct *p, u64 enq_flags)
 	// determine weight of enqueued task
 	u64 weight = get_task_weight(p);
 	u64 vtime = ~0ULL - weight;
-	TRACE_EVENT(struct sched_trace_event_timer_start, SCHED_TRACE_TIMER_START,
-		e->timer_addr = vtime;
-		e->duration = weight;
-	);
-
 
 	// insert into global dsq
 	scx_bpf_dsq_insert_vtime(p, dsq_id, SCX_SLICE_INF, vtime, enq_flags);
@@ -679,18 +656,6 @@ void BPF_STRUCT_OPS(fp_enqueue, struct task_struct *p, u64 enq_flags)
 			update_cpu_cgroup_weight(cpu, global);
 		}
 		bpf_rcu_read_unlock();
-		TRACE_EVENT(struct sched_trace_event_timer_start, SCHED_TRACE_TIMER_START,
-			e->timer_addr = trials;
-			e->duration = global->cpu_task_states[0].cgrp_weight;
-		);
-		TRACE_EVENT(struct sched_trace_event_timer_start, SCHED_TRACE_TIMER_START,
-			e->timer_addr = trials;
-			e->duration = global->cpu_task_states[0].running_weight;
-		);
-		TRACE_EVENT(struct sched_trace_event_timer_start, SCHED_TRACE_TIMER_START,
-			e->timer_addr = trials;
-			e->duration = global->cpu_task_states[0].kicked;
-		);
 
 		u64 cached_self_cgroup_weight = self_cgroup_weight; // lock in self cgroup weight here to avoid changing mid-loop
 
