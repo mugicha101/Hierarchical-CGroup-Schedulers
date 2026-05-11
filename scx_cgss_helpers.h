@@ -39,6 +39,20 @@ int create_cgroup(const char *path) {
 	return 0;
 }
 
+// sets cgroup weight,returns true on success
+bool set_cgroup_weight(const char *cg_path, u32 weight) {
+	char w_path[256];
+	snprintf(w_path, sizeof(w_path), "%s/cpu.weight", cg_path);
+	FILE *fp = fopen(w_path, "w");
+	if (!fp) return false;
+	if (fprintf(fp, "%u\n", weight) < 0) {
+		fclose(fp);
+		return false;
+	}
+	fclose(fp);
+	return true;
+}
+
 typedef int (*child_func_t)(void *);
 pid_t add_task_clone3(const char *cg_path, child_func_t child_func, void *child_arg) {
 	// when attempting to fork, switch child cgroup to the subscheduler cgroup, and wake up child, was enqueued onto parent instead of child (think this happens on fork)
@@ -72,7 +86,6 @@ pid_t add_task_clone3(const char *cg_path, child_func_t child_func, void *child_
         fprintf(stderr, "task: failed to set policy to SCHED_EXT\n");
         exit(1);
     }
-		sched_yield();
 		// fprintf(stdout, "task spawned on cgroup %s\n", cg_path);
 
 		// run func

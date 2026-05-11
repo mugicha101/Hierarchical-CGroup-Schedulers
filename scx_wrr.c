@@ -66,6 +66,7 @@ static void sigint_handler(int simple)
 }
 
 int task_func(void *arg) {
+	sched_yield();
 	volatile unsigned long long counter = 0;
 	while (1) {
 		counter++;
@@ -211,8 +212,8 @@ restart:
 				fprintf(stderr, "Error: failed to create task %d\n", i);
 				goto cleanup;
 			}
+			fprintf(stdout, "Task %d Attached\n", sub_tasks[i*TASKS_PER_SUB + j]);
 		}
-		fprintf(stdout, "Task %d Attached\n", sub_tasks[i]);
 	}
 
 	// sleep while running

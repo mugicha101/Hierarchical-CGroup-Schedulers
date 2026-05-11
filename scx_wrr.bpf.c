@@ -20,10 +20,6 @@ char _license[] SEC("license") = "GPL";
 const bool cgroup_msgs = true;
 const volatile u64 cgroup_id;
 
-#ifndef SCX_KICK_REPICK
-#define SCX_KICK_REPICK 0b10
-#endif
-
 #define MAX_SUB_SCHEDS 64 // must be power of 2
 #define DEFAULT_WEIGHT 100000000ull // 100ms
 #define MAX_PENDING_UPDATES 1024
@@ -182,10 +178,10 @@ static int budget_timer_callback(void *map, int *key, struct bpf_timer *timer) {
 		e->timer_addr = (u64)timer;
 	);
 	s32 cpu = *key;
+	scx_bpf_kick_cpu(cpu, (u64)SCX_KICK_PREEMPT);
 	TRACE_EVENT(struct sched_trace_event_kick_cpu, SCHED_TRACE_KICK_CPU,
 		e->cpu = cpu;
 	);
-	scx_bpf_kick_cpu(cpu, (u64)SCX_KICK_REPICK);
 	TRACE_FUNC_END("budget_timer_callback", "");
 	return 0;
 }

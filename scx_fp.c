@@ -22,8 +22,8 @@
 #include "trace_events.h"
 #include "scx_cgss_helpers.h"
 
-#define NSUB 4
-#define TASKS_PER_SUB 1
+#define NSUB 1
+#define TASKS_PER_SUB 3
 
 struct seqlock_global {
 	__u64 gen_fin;
@@ -35,9 +35,9 @@ struct seqlock_local {
 };
 
 #include "scx_fp.bpf.skel.h"
-#include "scx_eaf.bpf.skel.h"
+#include "scx_fp.bpf.skel.h"
 
-#define SUB_CG_BASE "/sys/fs/cgroup/scx_eaf"
+#define SUB_CG_BASE "/sys/fs/cgroup/scx_fp"
 
 const char help_fmt[] =
 "A simple sched_ext scheduler.\n"
@@ -65,10 +65,30 @@ static void sigint_handler(int simple)
 	exit_req = 1;
 }
 
+struct task_ctx_t {
+	u64 weight;
+	struct scx_fp *skel;
+};
 int task_func(void *arg) {
+	struct task_ctx_t *ctx = (struct task_ctx_t *)arg;
+	u64 pid = getpid();
+	int pidfd	= syscall(__NR_pidfd_open, pid, 0);
+	if (pidfd < 0) {
+		fprintf(stderr, "Error: failed to get pidfd for task %lu\n", pid);
+		return -1;
+	}
+	u64 weight = ctx->weight;
+	int map_fd = bpf_map__fd(ctx->skel->maps.task_weights);
+	int err = bpf_map_update_elem(map_fd, &pidfd, &weight, BPF_ANY);
+	if (err) {
+		fprintf(stderr, "Error: failed to set weight for task %lu\n", pid);
+		return -1;
+	}
+	sched_yield();
+	
 	while (1) {
 		for (volatile unsigned long long i = 0; i < 100000000ull; ++i);
-		usleep(100000); // 100ms
+		usleep(60000); // 60ms
 	}
 	return 0;
 }
@@ -76,10 +96,11 @@ int task_func(void *arg) {
 int main(int argc, char **argv)
 {
 	struct scx_fp *skel;
-	struct scx_eaf *sub_skels[NSUB];
+	struct scx_fp *sub_skels[NSUB];
 	struct bpf_link *link;
 	struct bpf_link *sub_links[NSUB];
 	pid_t sub_tasks[NSUB * TASKS_PER_SUB];
+	struct task_ctx_t task_ctxs[NSUB * TASKS_PER_SUB];
 	struct ring_buffer *rb_manager;
 	struct callback_ctx cb_ctx;
 	struct callback_ctx sub_cb_ctx[NSUB];
@@ -161,7 +182,7 @@ restart:
 		}
 
 		// load and attach scheduler
-		sub_skels[i] = scx_eaf__open();
+		sub_skels[i] = scx_fp__open();
 		if (!sub_skels[i]) {
 			fprintf(stderr, "Error: failed to open sub %d\n", i);
 			goto cleanup;
@@ -171,10 +192,10 @@ restart:
 			fprintf(stderr, "Error: failed to stat cgroup %s\n", cg_path);
 			goto cleanup;
 		}
-		sub_skels[i]->struct_ops.eaf_ops->sub_cgroup_id = st.st_ino;
+		sub_skels[i]->struct_ops.fp_ops->sub_cgroup_id = st.st_ino;
 		sub_skels[i]->rodata->cgroup_id = st.st_ino;
-		SCX_OPS_LOAD(sub_skels[i], eaf_ops, scx_eaf, uei);
-		sub_links[i] = SCX_OPS_ATTACH(sub_skels[i], eaf_ops, scx_eaf);
+		SCX_OPS_LOAD(sub_skels[i], fp_ops, scx_fp, uei);
+		sub_links[i] = SCX_OPS_ATTACH(sub_skels[i], fp_ops, scx_fp);
 		if (!sub_links[i]) {
 			fprintf(stderr, "Error: failed to attach sub %d\n", i);
 			goto cleanup;
@@ -182,7 +203,7 @@ restart:
 
 		// get trace buffer
 		int fd = bpf_map__fd(sub_skels[i]->maps.trace_buff);
-		snprintf(sub_cb_ctx[i].sched_name, sizeof(sub_cb_ctx[i].sched_name), "sub%d_eaf", i);
+		snprintf(sub_cb_ctx[i].sched_name, sizeof(sub_cb_ctx[i].sched_name), "sub%d_fp", i);
 		if (ring_buffer__add(rb_manager, fd, handle_event, &sub_cb_ctx[i]) < 0) {
 			fprintf(stderr, "Error: failed to add ring buffer for sub %d\n", i);
 			goto cleanup;
@@ -191,28 +212,26 @@ restart:
 		// set cgroup weight
 		// note: if fails, likely need to run: echo "+cpu" | sudo tee /sys/fs/cgroup/cgroup.subtree_control
 		// note: does not trigger cgroup_set_weight if does not change weight
-		char w_path[256];
-		FILE *fp;
-		snprintf(w_path, sizeof(w_path), "%s/cpu.weight", cg_path);
-		fp = fopen(w_path, "w");
-		if (!fp || fprintf(fp, "%d\n", (i+1) * 25) < 0) {
-			fprintf(stderr, "Error: could not write to file %s\n", w_path);
-			if (fp) fclose(fp);
+		if (!set_cgroup_weight(cg_path, (i + 1) * 10)) {
+			fprintf(stderr, "Error: failed to set weight for cgroup %s\n", cg_path);
 			goto cleanup;
 		}
-		fclose(fp);
 		fprintf(stdout, "Subscheduler %d Attached\n", i);
 
-		// add indefinite tasks
+		// add tasks
 		usleep(1000 * 500);
 		for (int j = 0; j < TASKS_PER_SUB; ++j) {
-			sub_tasks[i*TASKS_PER_SUB + j] = add_task_clone3(cg_path, task_func, NULL);
+			struct task_ctx_t *ctx = &task_ctxs[i*TASKS_PER_SUB + j];
+			ctx->weight = j + 1;
+			ctx->skel = sub_skels[i];
+			sub_tasks[i*TASKS_PER_SUB + j] = add_task_clone3(cg_path, task_func, (void *)ctx);
+			usleep(1000 * 50);
 			if (sub_tasks[i*TASKS_PER_SUB + j] < 0) {
 				fprintf(stderr, "Error: failed to create task %d\n", i);
 				goto cleanup;
 			}
+			fprintf(stdout, "Task %d Attached\n", sub_tasks[i*TASKS_PER_SUB + j]);
 		}
-		fprintf(stdout, "Task %d Attached\n", sub_tasks[i]);
 	}
 
 	// sleep while running
@@ -228,7 +247,7 @@ cleanup:
 
 	for (int i = 0; i < NSUB; i++) {
 		if (sub_links[i]) bpf_link__destroy(sub_links[i]);
-		if (sub_skels[i]) scx_eaf__destroy(sub_skels[i]);
+		if (sub_skels[i]) scx_fp__destroy(sub_skels[i]);
 		for (int j = 0; j < TASKS_PER_SUB; j++) {
 			if (sub_tasks[i * TASKS_PER_SUB + j] > 0) {
 				kill(sub_tasks[i * TASKS_PER_SUB + j], SIGKILL);

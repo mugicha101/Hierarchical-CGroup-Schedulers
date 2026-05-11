@@ -157,4 +157,31 @@ TRACE_EVENT(struct sched_trace_event_func_end, SCHED_TRACE_FUNC_END, \
   bpf_probe_read_kernel_str(e->reason, 32, REASON); \
 );
 
+// HACK FOR RESOLVING LINKER ISSUES (some macros missing)
+
+#if SCX_KICK_IDLE == 0
+#undef SCX_KICK_IDLE
+#define SCX_KICK_IDLE 0b01
+#endif
+
+#if SCX_KICK_PREEMPT == 0
+#undef SCX_KICK_PREEMPT
+#define SCX_KICK_PREEMPT 0b10
+#endif
+
+#if SCX_SLICE_INF == 0
+#undef SCX_SLICE_INF
+#define SCX_SLICE_INF ~0ULL
+#endif
+
+#if SCX_DSQ_LOCAL == 0
+#undef SCX_DSQ_LOCAL
+#define SCX_DSQ_LOCAL 9223372036854775810ULL
+#endif
+
+#if SCX_DSQ_LOCAL_ON == 0
+#undef SCX_DSQ_LOCAL_ON
+#define SCX_DSQ_LOCAL_ON 13835058055282163712ULL
+#endif
+
 #endif

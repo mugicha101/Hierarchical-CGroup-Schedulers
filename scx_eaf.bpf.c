@@ -51,7 +51,7 @@ void BPF_STRUCT_OPS(eaf_enqueue, struct task_struct *p, u64 enq_flags)
 		e->pid = p->pid;
 		e->enq_flags = enq_flags;
 	);
-	scx_bpf_dsq_insert(p, dsq_id, 1 * 1000000000ull, enq_flags);
+	scx_bpf_dsq_insert(p, dsq_id, SCX_SLICE_INF, enq_flags);
 	u32 cpu = bpf_get_smp_processor_id();
 	scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
 }
@@ -118,10 +118,10 @@ void BPF_STRUCT_OPS(eaf_cgroup_move, struct task_struct *p,
     u64 to_id = BPF_CORE_READ(to, kn, id);
 
     if (to_id == cgroup_id) {
-        // bpf_printk("[INFO] [EAF] [CGROUP_MOVE] Task %d MOVED INTO sub-scheduler cgroup %llu\n", 
-        //            p->pid, cgroup_id);
+        bpf_printk("[INFO] [EAF] [CGROUP_MOVE] Task %d MOVED INTO sub-scheduler cgroup %llu\n", 
+                   p->pid, cgroup_id);
     } else {
-        // bpf_printk("[INFO] [EAF] [CGROUP_MOVE] Task %d MOVED OUT OF sub-scheduler cgroup\n", p->pid);
+        bpf_printk("[INFO] [EAF] [CGROUP_MOVE] Task %d MOVED OUT OF sub-scheduler cgroup\n", p->pid);
     }
 }
 
