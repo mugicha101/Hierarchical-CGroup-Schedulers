@@ -2,6 +2,7 @@
 #define __TRACE_EVENTS_H
 
 #define TRACING 1
+#define SCX_TRACER 0
 
 enum sched_trace_event_type {
   SCHED_TRACE_FUNC_START,
@@ -130,6 +131,9 @@ do { \
 } while (0)
 
 // create buffer + define https://github.com/wagler/scx-tracer.git tracepoints
+
+#if SCX_TRACER
+
 #define CREATE_TRACE_BUFF() \
 extern void scx_custom_trace_event_begin(const char *name__str) __ksym; \
 extern void scx_custom_trace_event_end(void) __ksym; \
@@ -141,6 +145,16 @@ struct { \
 
 #else
 
+#define CREATE_TRACE_BUFF() \
+struct { \
+    __uint(type, BPF_MAP_TYPE_RINGBUF); \
+    __uint(max_entries, 256 * 1024); \
+} trace_buff SEC(".maps");
+
+#endif
+
+#else
+
 #define TRACE_EVENT(STRUCT_TYPE, EVENT_TYPE, ...)
 #define CREATE_TRACE_BUFF() \
 struct { \
@@ -149,6 +163,8 @@ struct { \
 } trace_buff SEC(".maps");
 
 #endif
+
+#if SCX_TRACER
 
 #define TRACE_FUNC_START(NAME) \
 scx_custom_trace_event_begin(NAME); \
@@ -162,6 +178,21 @@ TRACE_EVENT(struct sched_trace_event_func_end, SCHED_TRACE_FUNC_END, \
   bpf_probe_read_kernel_str(e->func_name, 32, NAME); \
   bpf_probe_read_kernel_str(e->reason, 32, REASON); \
 );
+
+#else
+
+#define TRACE_FUNC_START(NAME) \
+TRACE_EVENT(struct sched_trace_event_func_start, SCHED_TRACE_FUNC_START, \
+  bpf_probe_read_kernel_str(e->func_name, 32, NAME); \
+);
+
+#define TRACE_FUNC_END(NAME, REASON) \
+TRACE_EVENT(struct sched_trace_event_func_end, SCHED_TRACE_FUNC_END, \
+  bpf_probe_read_kernel_str(e->func_name, 32, NAME); \
+  bpf_probe_read_kernel_str(e->reason, 32, REASON); \
+);
+
+#endif
 
 #endif
 
