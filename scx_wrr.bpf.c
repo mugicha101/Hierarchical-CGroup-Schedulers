@@ -190,7 +190,7 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(wrr_init)
 {
 	// bpf_printk("[INFO] [WRR] [INIT] Initializing SCX WRR Scheduler");
 	TRACE_FUNC_START("init");
-	u32 err = 0;
+	s32 err = 0;
 	u32 cpu;
 	bpf_for(cpu, 0, scx_bpf_nr_cpu_ids()) {
 		struct cpu_sched_state *ss = bpf_map_lookup_elem(&sched_state, &cpu);
