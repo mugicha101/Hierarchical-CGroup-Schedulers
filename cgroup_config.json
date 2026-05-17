@@ -1,0 +1,26 @@
+{
+  "trace_dir": "/home/alexy/tj_sched_ext_kernel/tools/sched_ext/traces",
+  "policy": "scx_fp",
+  "trace": false,
+  "subs": {
+    "foo": {
+      "policy": "scx_fp",
+      "weight": 4,
+      "trace": false,
+      "subs": {
+        "bar": {
+          "policy": "scx_wrr",
+          "weight": 2,
+          "trace": false,
+          "subs": {
+            "baz": {
+              "policy": "scx_eaf",
+              "weight": 1,
+              "trace": false
+            }
+          }
+        }
+      }
+    }
+  }
+}

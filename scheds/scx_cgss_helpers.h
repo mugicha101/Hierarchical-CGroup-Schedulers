@@ -108,6 +108,8 @@ struct callback_ctx {
 static FILE *trace_fd = NULL;
 static u64 start_time = 0;
 int handle_event(void *ctx, void *data, size_t data_sz) {
+	if (!trace_fd) return 0;
+
 	struct callback_ctx *cb_ctx = ctx;
 	struct sched_trace_event_header *header = data;
 	if (start_time == 0) {

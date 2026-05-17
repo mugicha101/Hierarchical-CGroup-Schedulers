@@ -8,6 +8,7 @@ char _license[] SEC("license") = "GPL";
 // job-level fixed priority scheduler
 // prioritized by weight (higher weight = higher priority)
 // tie breaks handled arbitrarily
+// weights can be modified at runtime via the cgroup fs interface (/sys/fs/bpf/task_weights) but tasks must be reenqueued for their weight to update
 
 // prioritize tasks over cgroups
 
