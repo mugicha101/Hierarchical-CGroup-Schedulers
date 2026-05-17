@@ -31,10 +31,10 @@ struct seqlock_local {
 	__u64 gen;
 };
 
-#include "scx_eaf.bpf.skel.h"
-#include "scx_eaf.bpf.skel.h"
+#include "scx_wrr.bpf.skel.h"
+#include "scx_wrr.bpf.skel.h"
 
-#define SUB_CG_BASE "/sys/fs/cgroup/scx_eaf"
+#define SUB_CG_BASE "/sys/fs/cgroup/scx_wrr"
 
 const char help_fmt[] =
 "A fixed priority sched_ext hierarchical scheduler.\n"
@@ -65,7 +65,7 @@ static void sigint_handler(int simple)
 
 int main(int argc, char **argv)
 {
-	struct scx_eaf *skel;
+	struct scx_wrr *skel;
 	struct bpf_link *link;
 	struct ring_buffer *rb_manager;
 
@@ -117,7 +117,7 @@ restart:
 	}
 
 	// open skel
-	skel = scx_eaf__open();
+	skel = scx_wrr__open();
 	if (!skel) {
 		fprintf(stderr, "Error: failed to open skel\n");
 		goto cleanup;
@@ -130,13 +130,13 @@ restart:
 			fprintf(stderr, "Error: failed to stat cgroup %s\n", cg_path);
 			goto cleanup;
 		}
-		skel->struct_ops.eaf_ops->sub_cgroup_id = st.st_ino;
+		skel->struct_ops.wrr_ops->sub_cgroup_id = st.st_ino;
 		skel->rodata->cgroup_id = st.st_ino;
 	}
 
 	// load scheduler
-	SCX_OPS_LOAD(skel, eaf_ops, scx_eaf, uei);
-	link = SCX_OPS_ATTACH(skel, eaf_ops, scx_eaf);
+	SCX_OPS_LOAD(skel, wrr_ops, scx_wrr, uei);
+	link = SCX_OPS_ATTACH(skel, wrr_ops, scx_wrr);
 	if (!link) {
 		fprintf(stderr, "Error: failed to attach scheduler\n");
 		goto cleanup;
@@ -173,7 +173,7 @@ cleanup:
 
 	if (link) bpf_link__destroy(link);
 	ecode = UEI_REPORT(skel, uei);
-	if (skel) scx_eaf__destroy(skel);
+	if (skel) scx_wrr__destroy(skel);
 
 	if (trace_fd && trace_path) {
 		fclose(trace_fd);
