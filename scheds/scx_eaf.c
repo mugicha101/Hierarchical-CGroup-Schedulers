@@ -101,6 +101,7 @@ restart:
 			return opt != 'h';
 		}
 	}
+	fprintf(stdout, "Initializing %s\n", sched_name);
 
 	// open trace fd
 	trace_fd = NULL;
@@ -133,6 +134,7 @@ restart:
 		skel->struct_ops.eaf_ops->sub_cgroup_id = st.st_ino;
 		skel->rodata->cgroup_id = st.st_ino;
 	}
+	skel->rodata->trace_enabled = trace_path != NULL;
 
 	// load scheduler
 	SCX_OPS_LOAD(skel, eaf_ops, scx_eaf, uei);

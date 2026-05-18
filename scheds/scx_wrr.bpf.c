@@ -17,7 +17,6 @@ char _license[] SEC("license") = "GPL";
 // if subscheduler yields the cpu before budget depleted, that subscheduler is handed back the cpu to run a different task until its budget depletes
 // if subscheduler's dispatch schedules nothing, moves on to the next subscheduler
 
-const bool cgroup_msgs = true;
 const volatile u64 cgroup_id;
 
 #define MAX_SUB_SCHEDS 64 // must be power of 2
@@ -403,8 +402,7 @@ static __always_inline bool try_sub_dispatch(struct local_sub_params *lsp, struc
 
 void BPF_STRUCT_OPS(wrr_dispatch, s32 cpu, struct task_struct *prev)
 {
-	// FOR TESTING (limits CPUs to prevent freezing)
-	if (cpu >= 4) return;
+	if (unlikely(cpu >= NR_CPUS)) return; // for testing limited CPUs
 
 	// bpf_printk("[INFO] [WRR] [DISPATCH] dispatching on cpu %u", cpu);
 	TRACE_FUNC_START("dispatch");

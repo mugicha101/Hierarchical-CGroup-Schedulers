@@ -67,4 +67,6 @@ Run `load_config -h` for more details from within `sched_manager`.
 
 `trace`: boolean, specifies whether to record traces or not. If schedulers were built without tracing, will not trace. Likewise, if schedulers were built with tracing, will incur trace overehads but will not store the trace output anywhere.
 
-`weight`: int, cgroup weight (1 to 50000), can also be set externally using the cgroup fs interface.
+`weight`: int, cgroup weight (1 to 10000), can also be set externally using the cgroup fs interface.
+
+`cpus`: string, cpus assigned to this cgroup. For format, see https://docs.kernel.org/admin-guide/cgroup-v2.html#cpuset-interface-files, specifically cpuset.cpus.

@@ -103,7 +103,7 @@ pid_t add_task_clone3(const char *cg_path, child_func_t child_func, void *child_
 
 // handle tracing events
 struct callback_ctx {
-	char sched_name[16];
+	char sched_name[32];
 };
 static FILE *trace_fd = NULL;
 static u64 start_time = 0;

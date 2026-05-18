@@ -117,16 +117,18 @@ struct sched_trace_sub_params_update {
 
 #define TRACE_EVENT(STRUCT_TYPE, EVENT_TYPE, ...) \
 do { \
-  u64 timestamp = bpf_ktime_get_ns(); \
-  STRUCT_TYPE *e; \
-  e = bpf_ringbuf_reserve(&trace_buff, sizeof(*e), 0); \
-  if (!e) bpf_printk("ERROR: trace ring buffer full\n"); \
-  else { \
-    e->header.timestamp = timestamp; \
-    e->header.type = EVENT_TYPE; \
-    e->header.core = bpf_get_smp_processor_id(); \
-    __VA_ARGS__ \
-    bpf_ringbuf_submit(e, 0); \
+  if (trace_enabled) { \
+    u64 timestamp = bpf_ktime_get_ns(); \
+    STRUCT_TYPE *e; \
+    e = bpf_ringbuf_reserve(&trace_buff, sizeof(*e), 0); \
+    if (!e) bpf_printk("ERROR: trace ring buffer full\n"); \
+    else { \
+      e->header.timestamp = timestamp; \
+      e->header.type = EVENT_TYPE; \
+      e->header.core = bpf_get_smp_processor_id(); \
+      __VA_ARGS__ \
+      bpf_ringbuf_submit(e, 0); \
+    } \
   } \
 } while (0)
 
@@ -135,6 +137,7 @@ do { \
 #if SCX_TRACER
 
 #define CREATE_TRACE_BUFF() \
+const volatile bool trace_enabled = false; \
 extern void scx_custom_trace_event_begin(const char *name__str) __ksym; \
 extern void scx_custom_trace_event_end(void) __ksym; \
 extern void scx_custom_trace_event_instant(const char *name__str) __ksym; \
@@ -146,6 +149,7 @@ struct { \
 #else
 
 #define CREATE_TRACE_BUFF() \
+const volatile bool trace_enabled = false; \
 struct { \
     __uint(type, BPF_MAP_TYPE_RINGBUF); \
     __uint(max_entries, 256 * 1024); \
@@ -157,6 +161,7 @@ struct { \
 
 #define TRACE_EVENT(STRUCT_TYPE, EVENT_TYPE, ...)
 #define CREATE_TRACE_BUFF() \
+const volatile bool trace_enabled = false; \
 struct { \
     __uint(type, BPF_MAP_TYPE_RINGBUF); \
     __uint(max_entries, 1); \
@@ -222,3 +227,6 @@ TRACE_EVENT(struct sched_trace_event_func_end, SCHED_TRACE_FUNC_END, \
 #undef SCX_DSQ_LOCAL_ON
 #define SCX_DSQ_LOCAL_ON 13835058055282163712ULL
 #endif
+
+#undef NR_CPUS
+#define NR_CPUS 4

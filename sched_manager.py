@@ -156,8 +156,6 @@ class CgroupManager:
   # check if exists
   # if is root, check if any attached cgroups exist
   def exists(self):
-    if self.path == CGROUP_PATH:
-      return any(sub.exists() for sub in self.subs.values())
     return self.path.exists()
 
   # create cgroup for self
@@ -165,7 +163,7 @@ class CgroupManager:
   def create(self, subtree=True):
     self.path.mkdir(exist_ok=True)
     with open(self.path / "cgroup.subtree_control", "w") as f:
-      f.write("+cpu")
+      f.write("+cpu +cpuset")
     if subtree:
       for sub in self.subs.values():
         sub.create(subtree=True)
@@ -241,14 +239,23 @@ class CgroupManager:
       return int(f.read().strip())
 
   def set_weight(self, weight: int):
-    if not self.exists():
+    if not self.path.exists():
       raise ValueError(f"Cgroup {self.path} does not exist.")
     weight_file = self.path / "cpu.weight"
     if not weight_file.exists():
       raise ValueError(f"Cgroup {self.path} does not support cpu.weight.")
     with open(weight_file, "w") as f:
       f.write(str(weight))
-    
+
+  def set_cpus(self, cpus):
+    if not self.path.exists():
+      raise ValueError(f"Cgroup {self.path} does not exist.")
+    cpuset_file = self.path / "cpuset.cpus"
+    if not cpuset_file.exists():
+      raise ValueError(f"Cgroup {self.path} does not support cpuset.cpus.")
+    with open(cpuset_file, "w") as f:
+      f.write(cpus)
+
   def subtree_status(self, indent=0):
     sched_str = self.sched.status() if self.sched else "<No Scheduler>"
     weight = self.get_weight()
@@ -380,8 +387,12 @@ class SchedManager(cmd.Cmd):
     success = False
     try:
       if not force:
-        if base_cgroup.exists():
-          raise ValueError(f"Cgroup {basepath} already exists. Use --force to overwrite.")
+        if base_cgroup == self.root_cgroup:
+          if any(sub.exists() for sub in base_cgroup.subs.values()):
+            raise ValueError(f"Root cgroup already has attached sub-cgroups. Use --force to overwrite.")
+        else:
+          if base_cgroup.exists():
+            raise ValueError(f"Cgroup {basepath} already exists. Use --force to overwrite.")
 
       for config, rel_path in configs:
         cgroup_path = basepath / rel_path
@@ -389,7 +400,8 @@ class SchedManager(cmd.Cmd):
         if cgroup.sched is not None:
           raise ValueError(f"Cgroup {cgroup_path} already has a scheduler attached.")
           
-        config["cgroup"] = str(cgroup.path)
+        if cgroup != self.root_cgroup:
+          config["cgroup"] = str(cgroup.path)
         policy = config.get("policy", None)
         sched = None
         match policy:
@@ -405,6 +417,12 @@ class SchedManager(cmd.Cmd):
         weight = config.get("weight", None)
         if weight is not None:
           cgroup.set_weight(weight)
+        cpus = config.get("cpus", "")
+        if cgroup == self.root_cgroup:
+          if len(cpus) > 0:
+            raise ValueError(f"Cannot set cpus for root cgroup.")
+        else:
+          cgroup.set_cpus(cpus)
         cgroup.attach_sched(sched)
         sched.start()
         os.set_blocking(sched.process.stdout.fileno(), False)
@@ -694,7 +712,7 @@ class SchedManager(cmd.Cmd):
         # add subs
         subs = config.get("subs", {})
         for name, sub_config in subs.items():
-          if trace_dir is not None and trace and "trace_dir" not in sub_config:
+          if trace_dir is not None and "trace_dir" not in sub_config:
             sub_config["trace_dir"] = str(trace_dir)
           configs.append((sub_config, cgroup_path / name))
 

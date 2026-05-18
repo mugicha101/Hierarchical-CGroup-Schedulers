@@ -37,7 +37,6 @@ char _license[] SEC("license") = "GPL";
 const volatile u64 cgroup_id;
 u64 self_cgroup_weight;
 
-#define CPU_LIMIT 2 // for testing, limit CPUs to run on
 #define MAX_SUB_SCHEDS 64 // must be power of 2
 #define DEFAULT_WEIGHT 1
 #define MAX_PENDING_UPDATES 1024
@@ -342,7 +341,7 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(fp_init)
 	self_cgroup_weight = DEFAULT_WEIGHT;
 	s32 err = 0;
 	u32 cpu;
-	bpf_for(cpu, 0, CPU_LIMIT) {
+	bpf_for(cpu, 0, NR_CPUS) {
 		struct cpu_sched_state *ss = bpf_map_lookup_elem(&sched_state, &cpu);
 		if (unlikely(!ss)) return -EINVAL; // for verifier, should not happen
 		
@@ -662,8 +661,7 @@ static __always_inline void sync_priority_order(struct global_data *global, stru
 
 void BPF_STRUCT_OPS(fp_dispatch, s32 cpu, struct task_struct *prev)
 {
-	// FOR TESTING (limits CPUs to prevent freezing)
-	if (cpu >= CPU_LIMIT) return;
+	if (unlikely(cpu >= NR_CPUS)) return; // for testing limited CPUs
 
 	// bpf_printk("[INFO] [FP] [DISPATCH] dispatching on cpu %u", cpu);
 	TRACE_FUNC_START("dispatch");
@@ -820,7 +818,7 @@ void BPF_STRUCT_OPS(fp_enqueue, struct task_struct *p, u64 enq_flags)
 		// also figure out which CPU this task can run (TODO: probably some race conditions involved with this since it can be stale)
 		bpf_rcu_read_lock();
 		u32 cpu;
-		bpf_for(cpu, 0, CPU_LIMIT) {
+		bpf_for(cpu, 0, NR_CPUS) {
 			ss->can_run[cpu] = bpf_cpumask_test_cpu(cpu, p->cpus_ptr);
 			if (ss->can_run[cpu]) {
 				struct cpu_task_state *cts = &gtd->cpu_task_states[cpu];
@@ -834,7 +832,7 @@ void BPF_STRUCT_OPS(fp_enqueue, struct task_struct *p, u64 enq_flags)
 		bpf_spin_lock(&gtd->global_task_lock); // prevent other enqueues from claiming same CPU
 		u32 target_cpu = NR_CPUS;
 		u64 target_cpu_weight = ~0ULL;
-		bpf_for(cpu, 0, CPU_LIMIT) {
+		bpf_for(cpu, 0, NR_CPUS) {
 			struct cpu_task_state *cts = &gtd->cpu_task_states[cpu];
 
 			// must check kicked first since is unset last in dispatch, otherwise may read stale running weight
