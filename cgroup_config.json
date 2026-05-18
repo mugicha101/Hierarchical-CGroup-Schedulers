@@ -7,6 +7,7 @@
       "policy": "scx_fp",
       "weight": 4,
       "trace": false,
+      "cpus": "0-3",
       "subs": {
         "bar": {
           "policy": "scx_wrr",
