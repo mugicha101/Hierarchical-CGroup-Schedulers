@@ -26,7 +26,7 @@ To limit CPUs, uncomment out the NR_CPU redefine in `trace_events.h`.
 ### Build Schedulers
 
 ```
-sudo bear -- make CC="clang-21 -Wno-unused-command-line-argument" CLANG=clang-21 LLVM_STRIP=llvm-strip-21 VMLINUX_BTF=/sys/kernel/btf/vmlinux BPFTOOL=/<path to tj_sched_ext_kernel>/tools/bpf/bpftool/bpftool
+sudo bear -- make CC="clang-21 -Wno-unused-command-line-argument" CLANG=clang-21 LLVM_STRIP=llvm-strip-21 VMLINUX_BTF=/sys/kernel/btf/vmlinux
 ```
 
 ## Scheduler Manager Setup
