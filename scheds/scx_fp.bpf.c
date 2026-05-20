@@ -970,32 +970,35 @@ void BPF_STRUCT_OPS(fp_disable, struct task_struct *p)
 // on enqueue it'll realize the task is non-migrateable and reacquire the CPU immediately
 // while this has a redundant kick, we save on overhead by not having to check the migration status of every CPU during enqueue's search for a CPU to kick
 // however, for migrate_enable, its priority decreases so need to check if we should kick it to allow a job from the global dsq to run
-// SEC("kretprobe/migrate_enable")
-// int BPF_PROG(trace_migrate_enable) {
-// 	const u32 idx = 0;
-// 	struct global_task_data *gtd = bpf_map_lookup_elem(&global_task_data, &idx);
-// 	// if (unlikely(!gtd)) return 0; // for verifier, should not happen
+SEC("fentry/__set_cpus_allowed_ptr")
+#define MIGRATE_ENABLE 0x04
+#define MIGRATE_DISABLE 0x02
+int BPF_PROG(trace_migrate_enable, struct task_struct *p, struct affinity_context *ac) {
+	bpf_printk("[INFO] [FP] [SET_CPUS_ALLOWED_PTR] %x\n", ac->flags);
+	// const u32 idx = 0;
+	// struct global_task_data *gtd = bpf_map_lookup_elem(&global_task_data, &idx);
+	// if (unlikely(!gtd)) return 0; // for verifier, should not happen
 	
-// 	// // unset running_nmig flag, no need to lock since flag only modified by this cpu
-// 	// u32 cpu = bpf_get_smp_processor_id();
-// 	// if (unlikely(cpu >= NR_CPUS)) return 0; // for verifier, should not happen
+	// // unset running_nmig flag, no need to lock since flag only modified by this cpu
+	// u32 cpu = bpf_get_smp_processor_id();
+	// if (unlikely(cpu >= NR_CPUS)) return 0; // for verifier, should not happen
 	
-// 	// struct cpu_task_state *cts = &gtd->cpu_task_states[cpu];
-// 	// if (!cts->running_nmig) return false;
-// 	// cts->running_nmig = false;
+	// struct cpu_task_state *cts = &gtd->cpu_task_states[cpu];
+	// if (!cts->running_nmig) return false;
+	// cts->running_nmig = false;
 
-// 	// // now that priority is back to migrateable, check if need to preempt by peeking global dsq
-// 	// struct task_struct *top = scx_bpf_dsq_peek(dsq_id);
-// 	// if (top && top->pid != 0 && (~0ULL - top->scx.dsq_vtime) > cts->running_weight) {
-// 	// 	// since cannot use spinlocks, just preempt always regardless of kick
-// 	// 	scx_bpf_kick_cpu(cpu, (u64)SCX_KICK_PREEMPT);
-// 	// 	TRACE_EVENT(struct sched_trace_event_kick_cpu, SCHED_TRACE_KICK_CPU,
-// 	// 		e->cpu = cpu;
-// 	// 	);
-// 	// }
-// 	// scx_bpf_kick_cpu(bpf_get_smp_processor_id(), (u64)SCX_KICK_PREEMPT);
-// 	return 0;
-// }
+	// // now that priority is back to migrateable, check if need to preempt by peeking global dsq
+	// struct task_struct *top = scx_bpf_dsq_peek(dsq_id);
+	// if (top && top->pid != 0 && (~0ULL - top->scx.dsq_vtime) > cts->running_weight) {
+	// 	// since cannot use spinlocks, just preempt always regardless of kick
+	// 	scx_bpf_kick_cpu(cpu, (u64)SCX_KICK_PREEMPT);
+	// 	TRACE_EVENT(struct sched_trace_event_kick_cpu, SCHED_TRACE_KICK_CPU,
+	// 		e->cpu = cpu;
+	// 	);
+	// }
+	// scx_bpf_kick_cpu(bpf_get_smp_processor_id(), (u64)SCX_KICK_PREEMPT);
+	return 0;
+}
 
 // ops
 
