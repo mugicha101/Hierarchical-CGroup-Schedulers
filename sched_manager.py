@@ -17,9 +17,20 @@ import selectors
 import time
 from typing import Dict, Any
 from pathlib import Path
+import pwd
 
 SCX_BUILD_PATH = None
+USER = None
 CGROUP_PATH = Path("/sys/fs/cgroup").resolve(strict=True)
+
+# recursive chown to USERchown
+def chown(path):
+  os.chown(path, USER.pw_uid, USER.pw_gid)
+  for root, dirs, files in os.walk(path):
+    for d in dirs:
+      os.chown(os.path.join(root, d), USER.pw_uid, USER.pw_gid)
+    for f in files:
+      os.chown(os.path.join(root, f), USER.pw_uid, USER.pw_gid)
 
 def cgname(cgroup):
   return cgroup if cgroup is not None else "<root>"
@@ -55,7 +66,10 @@ class Scheduler:
       raise ValueError(f"Scheduler for cgroup {cgname(self.cgroup)} is already running.")
 
     if self.trace_path:
-      Path(self.trace_path).parent.mkdir(parents=True, exist_ok=True)
+      dir_path = Path(self.trace_path).parent
+      dir_path.mkdir(parents=True, exist_ok=True)
+      chown(dir_path)
+
     self.popen()
     if not self.is_running():
       raise RuntimeError(f"Failed to start scheduler for cgroup {cgname(self.cgroup)}")
@@ -165,6 +179,7 @@ class CgroupManager:
   # if subtree, also creates cgroup for all in subtree
   def create(self, subtree=True):
     self.path.mkdir(exist_ok=True)
+    chown(self.path)
     with open(self.path / "cgroup.subtree_control", "w") as f:
       f.write("+cpu +cpuset")
     if subtree:
@@ -779,10 +794,12 @@ def main():
     sys.exit(1)
   parser = argparse.ArgumentParser(description="Manage sched_ext schedulers attached to cgroups.")
   parser.add_argument("scx_build_path", help="Path to the sched_ext build directory containing the scheduler binaries.")
+  parser.add_argument("user", help="User to chown created trace files to (default is current user).", nargs="?", default=os.getenv("SUDO_USER", os.getenv("USER")))
   args = parser.parse_args()
 
-  global SCX_BUILD_PATH
+  global SCX_BUILD_PATH, USER
   SCX_BUILD_PATH = args.scx_build_path
+  USER = pwd.getpwnam(args.user)
 
   global manager
   manager = SchedManager()
