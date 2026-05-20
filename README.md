@@ -15,25 +15,23 @@ copy everything in `scheds` into `tools/sched_ext`
 modify in Makefile:
 ```
 c-sched-targets = scx_simple scx_cpu0 scx_qmap scx_central scx_flatcg scx_userland scx_pair scx_sdt scx_eaf scx_wrr scx_fp
-$(BINDIR)/scx_wrr: $(INCLUDE_DIR)/scx_eaf.bpf.skel.h
-$(BINDIR)/scx_fp: $(INCLUDE_DIR)/scx_fp.bpf.skel.h
 ```
 
 Built schedulers can be run like so: `./build/bin/scx_wrr`
 
 To enable/disable tracing, modify `trace_events.h` to define `TRACING` to 1 or 0 respectively.
 
+To limit CPUs, uncomment out the NR_CPU redefine in `trace_events.h`.
+
 ### Build WRR scheduler
 
 ```
-echo "+cpu" | sudo tee /sys/fs/cgroup/cgroup.subtree_control
 sudo bear -- make CC="clang-21 -Wno-unused-command-line-argument" CLANG=clang-21 LLVM_STRIP=llvm-strip-21 VMLINUX_BTF=/sys/kernel/btf/vmlinux BPFTOOL=/<path to tj_sched_ext_kernel>/tools/bpf/bpftool/bpftool
 ```
 
 ### Build FP scheduler
 
 ```
-echo "+cpu" | sudo tee /sys/fs/cgroup/cgroup.subtree_control
 sudo bear -- make CC="clang-21 -Wno-unused-command-line-argument" CLANG=clang-21 LLVM_STRIP=llvm-strip-21 VMLINUX_BTF=/sys/kernel/btf/vmlinux BPFTOOL=/<path to tj_sched_ext_kernel>/tools/bpf/bpftool/bpftool
 ```
 
@@ -63,7 +61,7 @@ Run `load_config -h` for more details from within `sched_manager`.
 
 `trace_dir`: string, path to the directory to dump the trace output to. file name created by replacing `/` with `__`. If not provided, no trace is written to. Takes precedence over ancestor `trace_dir` fields. Creates if doesn't exist.
 
-`policy`: string, which sched_ext policy to use, currently supports scx_fp, scx_wrr, scx_eaf.
+`policy`: string, which sched_ext policy to use, currently supports scx_fp, scx_wrr, scx_eaf, none.
 
 `trace`: boolean, specifies whether to record traces or not. If schedulers were built without tracing, will not trace. Likewise, if schedulers were built with tracing, will incur trace overehads but will not store the trace output anywhere.
 
