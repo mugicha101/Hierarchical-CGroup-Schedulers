@@ -20,6 +20,8 @@ enum sched_trace_event_type {
   SCHED_TRACE_KICK_CPU,
   SCHED_TRACE_TRY_SUB_DISPATCH,
   SCHED_TRACE_SUB_PARAMS_UPDATE,
+  SCHED_TRACE_ENABLE_TASK,
+  SCHED_TRACE_DISABLE_TASK,
 };
 
 // note: each scheduler gets its own ring buffer, so don't need to give scheduler identification
@@ -111,6 +113,16 @@ struct sched_trace_sub_params_update {
   int idx;
   u64 cgrp_id;
   u64 weight;
+};
+
+struct sched_trace_event_enable_task {
+  struct sched_trace_event_header header;
+  uint64_t pid;
+};
+
+struct sched_trace_event_disable_task {
+  struct sched_trace_event_header header;
+  uint64_t pid;
 };
 
 #if TRACING
@@ -228,5 +240,5 @@ TRACE_EVENT(struct sched_trace_event_func_end, SCHED_TRACE_FUNC_END, \
 #define SCX_DSQ_LOCAL_ON 13835058055282163712ULL
 #endif
 
-#undef NR_CPUS
-#define NR_CPUS 4
+// #undef NR_CPUS
+// #define NR_CPUS 4

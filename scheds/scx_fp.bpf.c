@@ -224,7 +224,7 @@ static __always_inline bool sync_local_sub(struct global_sub_params *global_subs
 
 	lsp->sp.cgrp_id = tmp_data.cgrp_id;
 	lsp->sp.weight = tmp_data.weight;
-	u64 old_gen = lsp->lock.gen;
+	// u64 old_gen = lsp->lock.gen;
 	lsp->lock.gen = gen_fin;
 	// bpf_printk("[INFO] [FP] [SYNC] cpu %d: Synced index %u: gen %llu -> gen %llu (new weight: %llu)", bpf_get_smp_processor_id(), idx, old_gen, gen_fin, lsp->sp.weight);
 
@@ -334,8 +334,8 @@ static int nmig_timer_callback(void *map, int *key, struct bpf_timer *timer) {
 
 s32 BPF_STRUCT_OPS_SLEEPABLE(fp_init)
 {
-	// bpf_printk("[INFO] [FP] [INIT] Initializing SCX FP Scheduler");
 	TRACE_FUNC_START("init");
+	bpf_printk("[INFO] [FP] [INIT] cgroup=%d", cgroup_id);
 	
 	// init cgroup data structs
 	self_cgroup_weight = DEFAULT_WEIGHT;
@@ -372,9 +372,10 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(fp_init)
 	return err;
 }
 
-void BPF_STRUCT_OPS(fp_exit)
+void BPF_STRUCT_OPS(fp_exit, struct scx_exit_info *ei)
 {
-	bpf_printk("[INFO] [FP] [EXIT] Exiting SCX FP Scheduler\n");
+	bpf_printk("[INFO] [FP] [EXIT] cgroup=%d\n", cgroup_id);
+	UEI_RECORD(uei, ei);
 }
 
 // looks for cgroup in global_subs
@@ -753,6 +754,11 @@ u64 __always_inline get_task_weight(struct task_struct *p) {
 void BPF_STRUCT_OPS(fp_enqueue, struct task_struct *p, u64 enq_flags)
 {
 	TRACE_FUNC_START("enqueue");
+	bpf_printk("[INFO] [FP] [ENQUEUE] cgroup=%d pid=%d comm=%s flags=%llu", cgroup_id, p->pid, p->comm, enq_flags);
+	TRACE_EVENT(struct sched_trace_event_enqueue_task, SCHED_TRACE_ENQUEUE_TASK,
+		e->pid = p->pid;
+		e->enq_flags = enq_flags;
+	);
 
 	// setup struct pointers
 	u32 cpu = bpf_get_smp_processor_id();
@@ -875,7 +881,11 @@ void BPF_STRUCT_OPS(fp_enqueue, struct task_struct *p, u64 enq_flags)
 
 void BPF_STRUCT_OPS(fp_dequeue, struct task_struct *p, u64 deq_flags)
 {
-	// bpf_printk("[INFO] [FP] [DEQUEUE] dequeuing pid=%d", p->pid);
+	bpf_printk("[INFO] [FP] [DEQUEUE] cgroup=%d pid=%d comm=%s flags=%llu", cgroup_id, p->pid, p->comm, deq_flags);
+	TRACE_EVENT(struct sched_trace_event_dequeue_task, SCHED_TRACE_DEQUEUE_TASK,
+		e->pid = p->pid;
+		e->deq_flags = deq_flags;
+	);
   // scx_bpf_error("fp_dequeue called unexpectedly");
 }
 
@@ -894,13 +904,15 @@ void BPF_STRUCT_OPS(fp_cpu_release, s32 cpu, struct scx_cpu_release_args *args)
 void BPF_STRUCT_OPS(fp_running, struct task_struct *p)
 {
 	TRACE_FUNC_START("running");
-  TRACE_EVENT(struct sched_trace_event_run_task, SCHED_TRACE_RUN_TASK,
+  // bpf_printk("[INFO] [FP] [RUNNING] cgroup=%d pid=%d comm=%s", cgroup_id, p->pid, p->comm);
+	TRACE_EVENT(struct sched_trace_event_run_task, SCHED_TRACE_RUN_TASK,
 		e->pid = p->pid;
 	);
 }
 
 void BPF_STRUCT_OPS(fp_stopping, struct task_struct *p, bool runnable)
 {
+	// bpf_printk("[INFO] [FP] [STOPPING] cgroup=%d pid=%d comm=%s runnable=%d", cgroup_id, p->pid, p->comm, runnable);
 	TRACE_EVENT(struct sched_trace_event_stop_task, SCHED_TRACE_STOP_TASK,
 		e->pid = p->pid;
 	);
@@ -929,6 +941,29 @@ void BPF_STRUCT_OPS(fp_exit_task, struct task_struct *p, struct scx_exit_task_ar
 	// bpf_printk("[INFO] [FP] fp_exit_task called unexpectedly");
   // scx_bpf_error("fp_exit_task called unexpectedly");
 }
+
+void BPF_STRUCT_OPS(fp_enable, struct task_struct *p)
+{
+	TRACE_EVENT(struct sched_trace_event_enable_task, SCHED_TRACE_ENABLE_TASK,
+		e->pid = p->pid;
+	);
+}
+
+void BPF_STRUCT_OPS(fp_disable, struct task_struct *p)
+{
+	TRACE_EVENT(struct sched_trace_event_disable_task, SCHED_TRACE_DISABLE_TASK,
+		e->pid = p->pid;
+	);
+}
+
+// void BPF_STRUCT_OPS(fp_cgroup_move, struct task_struct *p, 
+//                     struct cgroup *from, struct cgroup *to)
+// {
+//     u64 to_id = BPF_CORE_READ(to, kn, id);
+// 		bpf_printk("[INFO] [FP] [CGROUP_MOVE] Task %d MOVING from cgroup %llu to cgroup %llu\n", 
+// 							 p->pid, BPF_CORE_READ(from, kn, id), to_id);
+// }
+
 
 // in PREEMPT_RT some locks are replaced by nonmigrateable sections
 // on migrate_disable, we can continue running this task until enable kicks it and it becomes enqueued again since its priority is increased
@@ -989,8 +1024,8 @@ SCX_OPS_DEFINE(fp_ops,
 	.quiescent		= (void *)fp_quiescent,
 	.init_task		= (void *)fp_init_task,
 	.exit_task		= (void *)fp_exit_task,
-	// .enable			= (void *)fp_enable,
-	// .disable		= (void *)fp_disable,
+	.enable			= (void *)fp_enable,
+	.disable		= (void *)fp_disable,
 	// .dump_task		= (void *)fp_dump_task,
 
 	// subscheduling support
@@ -1000,6 +1035,7 @@ SCX_OPS_DEFINE(fp_ops,
 	// user cgroup interface
 	.cgroup_set_weight	= (void *)fp_cgroup_set_weight,
 	.cgroup_set_bandwidth	= (void *)fp_cgroup_set_bandwidth,
+	// .cgroup_move		= (void *)fp_cgroup_move,
 	.sub_attach		= (void *)fp_sub_attach,
 	.sub_detach		= (void *)fp_sub_detach
 );

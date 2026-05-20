@@ -147,7 +147,10 @@ class CgroupManager:
     if name not in self.subs:
       raise ValueError(f"Cgroup {name} is not a sub-cgroup of {self.path}.")
     if name in self.subs:
-      del self.subs[name]
+      if self.subs[name].delete():
+        del self.subs[name]
+      else:
+        raise RuntimeError(f"Failed to delete sub-cgroup {name} of {self.path}. It may still exist with some threads or sub-cgroups.")
 
   # get sub, returns None if doesn't exist
   def get_sub(self, name: str):
@@ -203,6 +206,7 @@ class CgroupManager:
         self.path.rmdir()
       except Exception as e:
         print(f"ERROR: Failed to delete cgroup {self.path}: {e}")
+        traceback.print_exc()
         succ = False
     return succ
 
@@ -407,12 +411,14 @@ class SchedManager(cmd.Cmd):
         match policy:
           case None:
             sched = None
+          case "none":
+            sched = None
           case _ if policy in POLICIES:
             sched = POLICIES[policy](config)
           case _:
             raise ValueError(f"Unsupported scheduler type: {policy}")
         if sched is None:
-          return
+          continue
         
         weight = config.get("weight", None)
         if weight is not None:
@@ -539,10 +545,12 @@ class SchedManager(cmd.Cmd):
       traceback.print_exc()
 
   def do_move(self, arg):
+    # NOTE: in 7.2 patchset, since enqueue path not implemented, doesn't actually enqueue into the cgroup subscheduler
+    # should use clone3 until feature fully implemented
     'Move a thread or process to a cgroup.'
     parser = argparse.ArgumentParser(
       prog="move",
-      description="Move a thread to a cgroup.",
+      description="Move a thread or process to a cgroup.",
       add_help=True
     )
     parser.add_argument("tid", help="TID of the thread to move.")
@@ -620,7 +628,7 @@ class SchedManager(cmd.Cmd):
       description="Attach a scheduler to a cgroup.",
       add_help=True
     )
-    parser.add_argument("policy", help=f"Type of scheduler to add ({', '.join(POLICIES.keys())}).")
+    parser.add_argument("policy", help=f"Type of scheduler to add ({', '.join(POLICIES.keys())}) or none to create a blank cgroup.")
     parser.add_argument("cgroup_path", help="Path to the cgroup relative to the root cgroup (default is root).", nargs="?", default="")
     parser.add_argument("-t", "--trace_dir", help="Directory to write scheduler trace output to (default is no tracing).", default=None)
     parser.add_argument("-f", "--force", action="store_true", help="If cgroup already exists, overwrite it.")
@@ -642,7 +650,7 @@ class SchedManager(cmd.Cmd):
   def complete_attach(self, text, line, begidx, endidx):
     args = shlex.split(line[:begidx])
     if len(args) == 1:
-      return [p for p in POLICIES.keys() if p.startswith(text)]
+      return [p for p in [*POLICIES.keys(), "none"] if p.startswith(text)]
     if len(args) == 2:
       return self.find_cgroup_completions(text)
     return []
@@ -707,7 +715,7 @@ class SchedManager(cmd.Cmd):
         if "trace_path" in config:
           del config["trace_path"]
         if trace and trace_dir is not None:
-          config["trace_path"] = str((Path(trace_dir) / ("__".join(cgroup_path.parts))).with_suffix(".trace"))
+          config["trace_path"] = str((Path(trace_dir) / ("trace_" + "__".join(cgroup_path.parts))).with_suffix(".trace"))
         
         # add subs
         subs = config.get("subs", {})
@@ -766,6 +774,9 @@ def signal_handler(sig, frame):
   sys.exit(0)
 
 def main():
+  if os.geteuid() != 0:
+    print("ERROR: Run with sudo.")
+    sys.exit(1)
   parser = argparse.ArgumentParser(description="Manage sched_ext schedulers attached to cgroups.")
   parser.add_argument("scx_build_path", help="Path to the sched_ext build directory containing the scheduler binaries.")
   args = parser.parse_args()

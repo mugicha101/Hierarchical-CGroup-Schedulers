@@ -178,6 +178,14 @@ int handle_event(void *ctx, void *data, size_t data_sz) {
 			struct sched_trace_sub_params_update *event = data;
 			fprintf(trace_fd, "SUB_PARAMS_UPDATE: idx=%d cgrp_id=%lu weight=%lu\n", event->idx, event->cgrp_id, event->weight);
 		} break;
+		case SCHED_TRACE_ENABLE_TASK: {
+			struct sched_trace_event_enable_task *event = data;
+			fprintf(trace_fd, "ENABLE_TASK: pid=%lu\n", event->pid);
+		} break;
+		case SCHED_TRACE_DISABLE_TASK: {
+			struct sched_trace_event_disable_task *event = data;
+			fprintf(trace_fd, "DISABLE_TASK: pid=%lu\n", event->pid);
+		} break;
 		default:
 			fprintf(trace_fd, "UNKNOWN_EVENT_TYPE\n");
 	}

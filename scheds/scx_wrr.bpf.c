@@ -163,7 +163,7 @@ static __always_inline bool sync_local_sub(struct global_sub_params *global_subs
 
 	lsp->sp.cgrp_id = tmp_data.cgrp_id;
 	lsp->sp.weight = tmp_data.weight;
-	u64 old_gen = lsp->lock.gen;
+	// u64 old_gen = lsp->lock.gen;
 	lsp->lock.gen = gen_fin;
 	// bpf_printk("[INFO] [WRR] [SYNC] cpu %d: Synced index %u: gen %llu -> gen %llu (new weight: %llu)", bpf_get_smp_processor_id(), idx, old_gen, gen_fin, lsp->sp.weight);
 
@@ -187,8 +187,8 @@ static int budget_timer_callback(void *map, int *key, struct bpf_timer *timer) {
 
 s32 BPF_STRUCT_OPS_SLEEPABLE(wrr_init)
 {
-	// bpf_printk("[INFO] [WRR] [INIT] Initializing SCX WRR Scheduler");
 	TRACE_FUNC_START("init");
+	bpf_printk("[INFO] [WRR] [INIT] cgroup=%d", cgroup_id);
 	s32 err = 0;
 	u32 cpu;
 	bpf_for(cpu, 0, scx_bpf_nr_cpu_ids()) {
@@ -202,9 +202,10 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(wrr_init)
 	return err;
 }
 
-void BPF_STRUCT_OPS(wrr_exit)
+void BPF_STRUCT_OPS(wrr_exit, struct scx_exit_info *ei)
 {
-	// bpf_printk("[INFO] [WRR] [EXIT] Exiting SCX WRR Scheduler\n");
+	bpf_printk("[INFO] [WRR] [EXIT] cgroup=%d\n", cgroup_id);
+	UEI_RECORD(uei, ei);
 }
 
 // looks for cgroup in global_subs
@@ -543,6 +544,30 @@ void BPF_STRUCT_OPS(wrr_exit_task, struct task_struct *p, struct scx_exit_task_a
   // scx_bpf_error("wrr_exit_task called unexpectedly");
 }
 
+
+void BPF_STRUCT_OPS(wrr_enable, struct task_struct *p)
+{
+	TRACE_EVENT(struct sched_trace_event_enable_task, SCHED_TRACE_ENABLE_TASK,
+		e->pid = p->pid;
+	);
+}
+
+void BPF_STRUCT_OPS(wrr_disable, struct task_struct *p)
+{
+	TRACE_EVENT(struct sched_trace_event_disable_task, SCHED_TRACE_DISABLE_TASK,
+		e->pid = p->pid;
+	);
+}
+
+// void BPF_STRUCT_OPS(wrr_cgroup_move, struct task_struct *p, 
+//                     struct cgroup *from, struct cgroup *to)
+// {
+//     u64 to_id = BPF_CORE_READ(to, kn, id);
+// 		bpf_printk("[INFO] [WRR] [CGROUP_MOVE] Task %d MOVING from cgroup %llu to cgroup %llu\n", 
+// 							 p->pid, BPF_CORE_READ(from, kn, id), to_id);
+// }
+
+
 // ops
 
 SCX_OPS_DEFINE(wrr_ops,
@@ -570,8 +595,8 @@ SCX_OPS_DEFINE(wrr_ops,
 	.quiescent		= (void *)wrr_quiescent,
 	.init_task		= (void *)wrr_init_task,
 	.exit_task		= (void *)wrr_exit_task,
-	// .enable			= (void *)wrr_enable,
-	// .disable		= (void *)wrr_disable,
+	.enable			= (void *)wrr_enable,
+	.disable		= (void *)wrr_disable,
 	// .dump_task		= (void *)wrr_dump_task,
 
 	// subscheduling support
@@ -581,6 +606,7 @@ SCX_OPS_DEFINE(wrr_ops,
 	// user cgroup interface
 	.cgroup_set_weight	= (void *)wrr_cgroup_set_weight,
 	.cgroup_set_bandwidth	= (void *)wrr_cgroup_set_bandwidth,
+	// .cgroup_move = (void *)wrr_cgroup_move,
 	.sub_attach		= (void *)wrr_sub_attach,
 	.sub_detach		= (void *)wrr_sub_detach
 );
