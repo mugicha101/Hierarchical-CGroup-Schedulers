@@ -582,11 +582,14 @@ static __always_inline bool try_task_dispatch(u32 cpu, struct global_task_data *
 		bpf_for(trials, 0, NTRIALS) { // also gives time for another process to claim first in case cannot run on this CPU
 			empty = true;
 			bpf_for_each(scx_dsq, t, dsq_id, 0) {
+				if (!bpf_cpumask_test_cpu(cpu, t->cpus_ptr)) {
+					continue;
+				}
+				
 				empty = false;
 				peeked_weight = ~0ULL - t->scx.dsq_vtime;
 
-				bool can_run;
-				if (bpf_cpumask_test_cpu(cpu, t->cpus_ptr) && likely(scx_bpf_dsq_move(BPF_FOR_EACH_ITER, t, SCX_DSQ_LOCAL, 0))) {
+				if (likely(scx_bpf_dsq_move(BPF_FOR_EACH_ITER, t, SCX_DSQ_LOCAL, 0))) {
 					moved = true;
 				}
 				break;
