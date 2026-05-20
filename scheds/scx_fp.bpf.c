@@ -32,7 +32,7 @@ char _license[] SEC("license") = "GPL";
 //   while this causes issues, will have issues anyways with PREEMPT_RT since no priority inheritence support yet
 // NOTE: for correctness, tasks must all share the same CPU set, otherwise cannot greedily choose highest priority from the global set
 // NOTE: assumes cgroup weights are unique, treats lower priority cgroups as idle and higher priority cgroups as max priority
-// TODO: test nmig handling (need a way to disable migrations)
+// TODO: fix nmig to check on migrate enable whether to keep running nonmigrateable task
 
 const volatile u64 cgroup_id;
 u64 self_cgroup_weight;
@@ -40,7 +40,7 @@ u64 self_cgroup_weight;
 #define MAX_SUB_SCHEDS 64 // must be power of 2
 #define DEFAULT_WEIGHT 1
 #define MAX_PENDING_UPDATES 1024
-#define NMIG_TIMER_PERIOD_NS (1 * 1000000ULL) // 1ms
+// #define NMIG_TIMER_PERIOD_NS (1 * 1000000ULL) // 1ms
 #define NTRIALS 10000 // enough trials to be functionally infinite for rare race-conditioned events
 // #define CPUSET_SIZE NR_CPUS / 64
 
@@ -113,7 +113,7 @@ struct cpu_sched_state {
   u64 priority[MAX_SUB_SCHEDS]; // cached priorities of subs
   int porder[MAX_SUB_SCHEDS]; // cached indices of subs in decreasing priority order
 	int can_run[NR_CPUS]; // whether current enqueued task can run on each CPU
-	struct bpf_timer nmig_timer; // timer to periodically check if non-migrateable tasks become migrateable
+	// struct bpf_timer nmig_timer; // timer to periodically check if non-migrateable tasks become migrateable
 };
 
 // data used for global task scheduling decisions, locked by global_task_lock
@@ -251,86 +251,86 @@ void __always_inline update_cpu_cgroup_weight(u32 cpu, struct cpu_task_state *ct
 }
 
 // periodically checks if task is still non-migrateable
-static int nmig_timer_callback(void *map, int *key, struct bpf_timer *timer) {
-	TRACE_FUNC_START("nmig_timer_callback");
-	TRACE_EVENT(struct sched_trace_event_timer_cancel, SCHED_TRACE_TIMER_CANCEL,
-		e->timer_addr = (u64)timer;
-	);
-	u32 cpu = (u32)(*key) & (NR_CPUS-1);
+// static int nmig_timer_callback(void *map, int *key, struct bpf_timer *timer) {
+// 	TRACE_FUNC_START("nmig_timer_callback");
+// 	TRACE_EVENT(struct sched_trace_event_timer_cancel, SCHED_TRACE_TIMER_CANCEL,
+// 		e->timer_addr = (u64)timer;
+// 	);
+// 	u32 cpu = (u32)(*key) & (NR_CPUS-1);
 
-	// check if running this cgroup still
-	struct global_task_data *gtd = fetch_global_task_data();
-	struct cpu_sched_state *ss = bpf_map_lookup_elem(&sched_state, &cpu);
-	if (unlikely(!gtd || !ss)) return 0; // for verifier, should not happen
+// 	// check if running this cgroup still
+// 	struct global_task_data *gtd = fetch_global_task_data();
+// 	struct cpu_sched_state *ss = bpf_map_lookup_elem(&sched_state, &cpu);
+// 	if (unlikely(!gtd || !ss)) return 0; // for verifier, should not happen
 	
-	// check running cgroup
-	// if not running this cgroup, no need to update nmig as dispatch will handle and enqueue will use cgroup weight instead
-	struct cpu_task_state *cts = &gtd->cpu_task_states[cpu & (NR_CPUS-1)];
-	if (!cts) return 0; // for verifier, should not happen
+// 	// check running cgroup
+// 	// if not running this cgroup, no need to update nmig as dispatch will handle and enqueue will use cgroup weight instead
+// 	struct cpu_task_state *cts = &gtd->cpu_task_states[cpu & (NR_CPUS-1)];
+// 	if (!cts) return 0; // for verifier, should not happen
 
-	bpf_rcu_read_lock();
-	update_cpu_cgroup_weight(cpu, cts);
-	if (cts->cgrp_weight != self_cgroup_weight) {
-		bpf_rcu_read_unlock();
-		TRACE_FUNC_END("nmig_timer_callback", "DIFF CGROUP");
-		return 0;
-	}
+// 	bpf_rcu_read_lock();
+// 	update_cpu_cgroup_weight(cpu, cts);
+// 	if (cts->cgrp_weight != self_cgroup_weight) {
+// 		bpf_rcu_read_unlock();
+// 		TRACE_FUNC_END("nmig_timer_callback", "DIFF CGROUP");
+// 		return 0;
+// 	}
 
-	// check current task
-	struct task_struct *cpu_task = scx_bpf_cpu_curr(cpu);
-	pid_t pid = cpu_task ? BPF_CORE_READ(cpu_task, pid) : 0;
-	bpf_rcu_read_unlock();
+// 	// check current task
+// 	struct task_struct *cpu_task = scx_bpf_cpu_curr(cpu);
+// 	pid_t pid = cpu_task ? BPF_CORE_READ(cpu_task, pid) : 0;
+// 	bpf_rcu_read_unlock();
 	
-	// if idle, no need to nmig as dispatch will handle and enqueue will use cgroup weight instead
-	if (pid == 0) {
-		TRACE_FUNC_END("nmig_timer_callback", "IDLE");
-		return 0;
-	}
+// 	// if idle, no need to nmig as dispatch will handle and enqueue will use cgroup weight instead
+// 	if (pid == 0) {
+// 		TRACE_FUNC_END("nmig_timer_callback", "IDLE");
+// 		return 0;
+// 	}
 	
-	// if task still non-migrateable, start next timer period
-	if (is_migration_disabled(cpu_task)) {
-		bpf_timer_start(&ss->nmig_timer, NMIG_TIMER_PERIOD_NS, BPF_F_TIMER_CPU_PIN);
-		TRACE_EVENT(struct sched_trace_event_timer_start, SCHED_TRACE_TIMER_START,
-			e->timer_addr = (u64)(&ss->nmig_timer);
-			e->duration = NMIG_TIMER_PERIOD_NS;
-		);
-		TRACE_FUNC_END("nmig_timer_callback", "STILL NMIG");
-		return 0;
-	}
+// 	// if task still non-migrateable, start next timer period
+// 	if (is_migration_disabled(cpu_task)) {
+// 		bpf_timer_start(&ss->nmig_timer, NMIG_TIMER_PERIOD_NS, BPF_F_TIMER_CPU_PIN);
+// 		TRACE_EVENT(struct sched_trace_event_timer_start, SCHED_TRACE_TIMER_START,
+// 			e->timer_addr = (u64)(&ss->nmig_timer);
+// 			e->duration = NMIG_TIMER_PERIOD_NS;
+// 		);
+// 		TRACE_FUNC_END("nmig_timer_callback", "STILL NMIG");
+// 		return 0;
+// 	}
 
-	// update non-migrateable flag
-	// NOTE: since dispatch cancels this timer and runs on same CPU, this should refer to the same task that started this timer
-	//       unless a different scheduler's dispatch runs, in which case cgroup weight will be used until this schedulers dispatch runs again, which updates the nmig flag
-	cts->running_nmig = false;
+// 	// update non-migrateable flag
+// 	// NOTE: since dispatch cancels this timer and runs on same CPU, this should refer to the same task that started this timer
+// 	//       unless a different scheduler's dispatch runs, in which case cgroup weight will be used until this schedulers dispatch runs again, which updates the nmig flag
+// 	cts->running_nmig = false;
 
-	// check if we should preempt this task
-	// if tasks on nmig queue, preempt
-	// if global dsq has a higher priority task, preempt
-	bool preempt = !scx_bpf_dsq_peek(dsq_id + 1 + cpu);
-	if (!preempt) {
-		struct task_struct *top = scx_bpf_dsq_peek(dsq_id);
-		preempt = top && (~0ULL - top->scx.dsq_vtime) > cts->running_weight;
-	}
-	if (!preempt) {
-		TRACE_FUNC_END("nmig_timer_callback", "NO KICK");
-		return 0;
-	}
+// 	// check if we should preempt this task
+// 	// if tasks on nmig queue, preempt
+// 	// if global dsq has a higher priority task, preempt
+// 	bool preempt = !scx_bpf_dsq_peek(dsq_id + 1 + cpu);
+// 	if (!preempt) {
+// 		struct task_struct *top = scx_bpf_dsq_peek(dsq_id);
+// 		preempt = top && (~0ULL - top->scx.dsq_vtime) > cts->running_weight;
+// 	}
+// 	if (!preempt) {
+// 		TRACE_FUNC_END("nmig_timer_callback", "NO KICK");
+// 		return 0;
+// 	}
 
-	// kick cpu
-	bpf_spin_lock(&gtd->global_task_lock);
-	bool do_kick = !cts->kicked;
-	cts->kicked = true;
-	bpf_spin_unlock(&gtd->global_task_lock);
-	if (do_kick) {
-		scx_bpf_kick_cpu(cpu, (u64)SCX_KICK_PREEMPT);
-		TRACE_EVENT(struct sched_trace_event_kick_cpu, SCHED_TRACE_KICK_CPU,
-			e->cpu = cpu;
-		);
-	}
+// 	// kick cpu
+// 	bpf_spin_lock(&gtd->global_task_lock);
+// 	bool do_kick = !cts->kicked;
+// 	cts->kicked = true;
+// 	bpf_spin_unlock(&gtd->global_task_lock);
+// 	if (do_kick) {
+// 		scx_bpf_kick_cpu(cpu, (u64)SCX_KICK_PREEMPT);
+// 		TRACE_EVENT(struct sched_trace_event_kick_cpu, SCHED_TRACE_KICK_CPU,
+// 			e->cpu = cpu;
+// 		);
+// 	}
 
-	TRACE_FUNC_END("nmig_timer_callback", "KICK");
-	return 0;
-}
+// 	TRACE_FUNC_END("nmig_timer_callback", "KICK");
+// 	return 0;
+// }
 
 s32 BPF_STRUCT_OPS_SLEEPABLE(fp_init)
 {
@@ -364,9 +364,9 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(fp_init)
 		scx_bpf_create_dsq(dsq_id + 1 + cpu, cpu);
 		struct cpu_sched_state *ss = bpf_map_lookup_elem(&sched_state, &cpu);
 		if (unlikely(!ss)) return -EINVAL; // for verifier, should not happen
-		bpf_timer_init(&ss->nmig_timer, &sched_state, CLOCK_MONOTONIC);
-		err = bpf_timer_set_callback(&ss->nmig_timer, nmig_timer_callback);
-		if (err) break;
+		// bpf_timer_init(&ss->nmig_timer, &sched_state, CLOCK_MONOTONIC);
+		// err = bpf_timer_set_callback(&ss->nmig_timer, nmig_timer_callback);
+		// if (err) break;
 	}
 	TRACE_FUNC_END("init", "");
 	return err;
@@ -555,11 +555,11 @@ static __always_inline bool try_task_dispatch(u32 cpu, struct global_task_data *
 	if (unlikely(cpu >= NR_CPUS || !ss)) return false; // for verifier, should not happen
 
 	// unset nmig timer
-	if (ss && bpf_timer_cancel(&ss->nmig_timer)) {
-		TRACE_EVENT(struct sched_trace_event_timer_cancel, SCHED_TRACE_TIMER_CANCEL,
-			e->timer_addr = (u64)&ss->nmig_timer;
-		);
-	}
+	// if (ss && bpf_timer_cancel(&ss->nmig_timer)) {
+	// 	TRACE_EVENT(struct sched_trace_event_timer_cancel, SCHED_TRACE_TIMER_CANCEL,
+	// 		e->timer_addr = (u64)&ss->nmig_timer;
+	// 	);
+	// }
 
 	// first try fetching from the non-migrateable per-cpu dsq
 	struct task_struct *t;
@@ -585,7 +585,8 @@ static __always_inline bool try_task_dispatch(u32 cpu, struct global_task_data *
 				empty = false;
 				peeked_weight = ~0ULL - t->scx.dsq_vtime;
 
-				if (likely(scx_bpf_dsq_move(BPF_FOR_EACH_ITER, t, SCX_DSQ_LOCAL, 0))) {
+				bool can_run;
+				if (bpf_cpumask_test_cpu(cpu, t->cpus_ptr) && likely(scx_bpf_dsq_move(BPF_FOR_EACH_ITER, t, SCX_DSQ_LOCAL, 0))) {
 					moved = true;
 				}
 				break;
@@ -606,13 +607,13 @@ static __always_inline bool try_task_dispatch(u32 cpu, struct global_task_data *
 	cts->kicked = false;
 
 	// start nmig timer
-	if (from_nmig && ss) {
-		bpf_timer_start(&ss->nmig_timer, NMIG_TIMER_PERIOD_NS, BPF_F_TIMER_CPU_PIN);
-		TRACE_EVENT(struct sched_trace_event_timer_start, SCHED_TRACE_TIMER_START,
-			e->timer_addr = (u64)(&ss->nmig_timer);
-			e->duration = NMIG_TIMER_PERIOD_NS;
-		);
-	}
+	// if (from_nmig && ss) {
+	// 	bpf_timer_start(&ss->nmig_timer, NMIG_TIMER_PERIOD_NS, BPF_F_TIMER_CPU_PIN);
+	// 	TRACE_EVENT(struct sched_trace_event_timer_start, SCHED_TRACE_TIMER_START,
+	// 		e->timer_addr = (u64)(&ss->nmig_timer);
+	// 		e->duration = NMIG_TIMER_PERIOD_NS;
+	// 	);
+	// }
 
 	if (empty) {
 		TRACE_FUNC_END("try_task_dispatch", "EMPTY");
@@ -970,9 +971,9 @@ void BPF_STRUCT_OPS(fp_disable, struct task_struct *p)
 // on enqueue it'll realize the task is non-migrateable and reacquire the CPU immediately
 // while this has a redundant kick, we save on overhead by not having to check the migration status of every CPU during enqueue's search for a CPU to kick
 // however, for migrate_enable, its priority decreases so need to check if we should kick it to allow a job from the global dsq to run
-SEC("fentry/__set_cpus_allowed_ptr")
 #define MIGRATE_ENABLE 0x04
 #define MIGRATE_DISABLE 0x02
+SEC("fentry/__set_cpus_allowed_ptr")
 int BPF_PROG(trace_migrate_enable, struct task_struct *p, struct affinity_context *ac) {
 	bpf_printk("[INFO] [FP] [SET_CPUS_ALLOWED_PTR] %x\n", ac->flags);
 	// const u32 idx = 0;
