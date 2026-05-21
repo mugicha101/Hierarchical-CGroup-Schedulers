@@ -22,15 +22,24 @@ import pwd
 SCX_BUILD_PATH = None
 USER = None
 CGROUP_PATH = Path("/sys/fs/cgroup").resolve(strict=True)
+BPF_PATH = Path("/sys/fs/bpf").resolve(strict=True)
 
-# recursive chown to USERchown
-def chown(path):
-  os.chown(path, USER.pw_uid, USER.pw_gid)
-  for root, dirs, files in os.walk(path):
-    for d in dirs:
-      os.chown(os.path.join(root, d), USER.pw_uid, USER.pw_gid)
-    for f in files:
-      os.chown(os.path.join(root, f), USER.pw_uid, USER.pw_gid)
+# validate permissions for /sys/fs/cgroup and /sys/fs/bpf
+def validate_perms():
+  def validate_dir(path):
+    if not os.access(path, os.R_OK | os.W_OK | os.X_OK):
+      print(f"ERROR: Current user does not have read/write/execute permissions for {path}. Please run with sudo or adjust permissions.")
+      sys.exit(1)
+  def validate_file(path):
+    if not os.access(path, os.R_OK | os.W_OK):
+      print(f"ERROR: Current user does not have read/write permissions for {path}. Please run with sudo or adjust permissions.")
+      sys.exit(1)
+    
+  validate_dir(CGROUP_PATH)
+  validate_dir(BPF_PATH)
+  validate_file(CGROUP_PATH / "cgroup.subtree_control")
+  validate_file(CGROUP_PATH / "cgroup.procs")
+  validate_file(CGROUP_PATH / "cgroup.threads")
 
 def cgname(cgroup):
   return cgroup if cgroup is not None else "<root>"
@@ -68,7 +77,6 @@ class Scheduler:
     if self.trace_path:
       dir_path = Path(self.trace_path).parent
       dir_path.mkdir(parents=True, exist_ok=True)
-      chown(dir_path)
 
     self.popen()
     if not self.is_running():
@@ -179,7 +187,6 @@ class CgroupManager:
   # if subtree, also creates cgroup for all in subtree
   def create(self, subtree=True):
     self.path.mkdir(exist_ok=True)
-    chown(self.path)
     with open(self.path / "cgroup.subtree_control", "w") as f:
       f.write("+cpu +cpuset")
     if subtree:
@@ -789,9 +796,7 @@ def signal_handler(sig, frame):
   sys.exit(0)
 
 def main():
-  if os.geteuid() != 0:
-    print("ERROR: Run with sudo.")
-    sys.exit(1)
+  validate_perms()
   parser = argparse.ArgumentParser(description="Manage sched_ext schedulers attached to cgroups.")
   parser.add_argument("scx_build_path", help="Path to the sched_ext build directory containing the scheduler binaries.")
   parser.add_argument("user", help="User to chown created trace files to (default is current user).", nargs="?", default=os.getenv("SUDO_USER", os.getenv("USER")))

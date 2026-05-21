@@ -1,8 +1,8 @@
-## Schedulers Setup
+## Linux Schedulers Setup
 
 ### Setup Environment
 
-clone git://git.kernel.org/pub/scm/linux/kernel/git/tj/sched_ext.git and select branch with cgroup sub-scheduling (anything 7.1 should have cgroup sub scheduling v3+)
+clone https://github.com/torvalds/linux.git or git://git.kernel.org/pub/scm/linux/kernel/git/tj/sched_ext.git and select branch with cgroup sub-scheduling (linux 7.1 has cgroup subscheduling v3)
 
 install clang-21
 make sure pahole is 1.31+ since uses KF_IMPLICIT_ARGS
@@ -39,9 +39,11 @@ Python libraries: `pip install -r requirements.txt`
 
 ### Use Scheduler Manager
 
+Run `sudo sh perm_setup.sh` to set permissions for `/sys/fs/bpf` and `/sys/fs/cgroup` to allow the current user to create/manage cgroups and access bpf maps. Allows you to run `sched_manager` without sudo.
+
 Run `sched_manager.py <scx build dir>` as a Python 3 program, which acts as an CLI for managing the scheduler hierarchy.
 
-`<scx build dir>` should look something like `/home/.../tj_sched_ext_kernel/tools/sched_ext/` if using tj_sched_ext_kernel repo.
+`<scx build dir>` should look something like `/home/.../linux/tools/sched_ext/` if using mainline kernel.
 
 ### Configuration Files
 
@@ -62,3 +64,7 @@ Run `load_config -h` for more details from within `sched_manager`.
 `weight`: int, cgroup weight (1 to 10000), can also be set externally using the cgroup fs interface.
 
 `cpus`: string, cpus assigned to this cgroup. For format, see https://docs.kernel.org/admin-guide/cgroup-v2.html#cpuset-interface-files, specifically cpuset.cpus.
+
+## ROS 2 Component Scheduling Setup
+
+TODO
