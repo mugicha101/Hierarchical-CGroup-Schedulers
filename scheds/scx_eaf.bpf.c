@@ -49,7 +49,7 @@ s32 BPF_STRUCT_OPS(eaf_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake
 
 void BPF_STRUCT_OPS(eaf_enqueue, struct task_struct *p, u64 enq_flags)
 {
-	bpf_printk("[INFO] [EAF] [ENQUEUE] cgroup=%d pid=%d comm=%s flags=%llu", cgroup_id, p->pid, p->comm, enq_flags);
+	// bpf_printk("[INFO] [EAF] [ENQUEUE] cgroup=%d pid=%d comm=%s flags=%llu", cgroup_id, p->pid, p->comm, enq_flags);
 	TRACE_EVENT(struct sched_trace_event_enqueue_task, SCHED_TRACE_ENQUEUE_TASK,
 		e->pid = p->pid;
 		e->enq_flags = enq_flags;
@@ -61,7 +61,7 @@ void BPF_STRUCT_OPS(eaf_enqueue, struct task_struct *p, u64 enq_flags)
 
 void BPF_STRUCT_OPS(eaf_dequeue, struct task_struct *p, u64 deq_flags)
 {
-	bpf_printk("[INFO] [EAF] [DEQUEUE] cgroup=%d pid=%d comm=%s flags=%llu", cgroup_id, p->pid, p->comm, deq_flags);
+	// bpf_printk("[INFO] [EAF] [DEQUEUE] cgroup=%d pid=%d comm=%s flags=%llu", cgroup_id, p->pid, p->comm, deq_flags);
 	TRACE_EVENT(struct sched_trace_event_dequeue_task, SCHED_TRACE_DEQUEUE_TASK,
 		e->pid = p->pid;
 		e->deq_flags = deq_flags;

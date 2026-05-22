@@ -758,7 +758,7 @@ u64 __always_inline get_task_weight(struct task_struct *p) {
 void BPF_STRUCT_OPS(fp_enqueue, struct task_struct *p, u64 enq_flags)
 {
 	TRACE_FUNC_START("enqueue");
-	bpf_printk("[INFO] [FP] [ENQUEUE] cgroup=%d pid=%d comm=%s flags=%llu", cgroup_id, p->pid, p->comm, enq_flags);
+	// bpf_printk("[INFO] [FP] [ENQUEUE] cgroup=%d pid=%d comm=%s flags=%llu", cgroup_id, p->pid, p->comm, enq_flags);
 	TRACE_EVENT(struct sched_trace_event_enqueue_task, SCHED_TRACE_ENQUEUE_TASK,
 		e->pid = p->pid;
 		e->enq_flags = enq_flags;
@@ -885,7 +885,7 @@ void BPF_STRUCT_OPS(fp_enqueue, struct task_struct *p, u64 enq_flags)
 
 void BPF_STRUCT_OPS(fp_dequeue, struct task_struct *p, u64 deq_flags)
 {
-	bpf_printk("[INFO] [FP] [DEQUEUE] cgroup=%d pid=%d comm=%s flags=%llu", cgroup_id, p->pid, p->comm, deq_flags);
+	// bpf_printk("[INFO] [FP] [DEQUEUE] cgroup=%d pid=%d comm=%s flags=%llu", cgroup_id, p->pid, p->comm, deq_flags);
 	TRACE_EVENT(struct sched_trace_event_dequeue_task, SCHED_TRACE_DEQUEUE_TASK,
 		e->pid = p->pid;
 		e->deq_flags = deq_flags;
@@ -1001,6 +1001,39 @@ int BPF_PROG(trace_migrate_enable, struct task_struct *p, struct affinity_contex
 	// 	);
 	// }
 	// scx_bpf_kick_cpu(bpf_get_smp_processor_id(), (u64)SCX_KICK_PREEMPT);
+	return 0;
+}
+
+// update weight of current running task
+// since this only runs in the first attached FP scheduler (typically root), doesn't know the running weight of the tasks in lower cgroups
+// thus just blindly kick
+// can probably improve this by loading a new instance per FP scheduler
+SEC("syscall")
+int BPF_PROG(update_weight, u64 pid, u64 weight) {
+	bpf_printk("[INFO] [FP] [UPDATE_WEIGHT] Updating weight of task %d to %llu\n", pid, weight);
+	// update weight in map
+	struct task_struct *p = bpf_task_from_pid(pid);
+	if (unlikely(!p)) {
+		return 0; // for verifier, should not happen
+	}
+
+	u64 *task_weight_ptr = bpf_task_storage_get(&task_weights, p, 0, BPF_LOCAL_STORAGE_GET_F_CREATE);
+	if (unlikely(!task_weight_ptr)) {
+		bpf_task_release(p);
+		return 0; // for verifier, should not happen
+	}
+
+	*task_weight_ptr = weight;
+
+	bpf_task_release(p);
+
+	// kick cpu
+	u32 cpu = bpf_get_smp_processor_id();
+	scx_bpf_kick_cpu(cpu, (u64)SCX_KICK_PREEMPT);
+	TRACE_EVENT(struct sched_trace_event_kick_cpu, SCHED_TRACE_KICK_CPU,
+		e->cpu = cpu;
+	);
+
 	return 0;
 }
 
