@@ -323,6 +323,7 @@ class SchedManager(cmd.Cmd):
     self.root_cgroup.create(subtree=False)
     self.selector = selectors.DefaultSelector()
     self.print_monitor = False
+    self.print_ack = False
     self.monitor_thread = threading.Thread(target=self.monitor_thread_func, daemon=True)
     self.monitor_thread.start()
 
@@ -463,7 +464,6 @@ class SchedManager(cmd.Cmd):
 
     finally:
       if not success:
-        print("FAILED")
         base_cgroup.delete() # undo any created cgroups on failure
 
   def find_cgroup_completions(self, path: str):
@@ -478,6 +478,21 @@ class SchedManager(cmd.Cmd):
       print(e)
       return []
 
+  # override default to print ERR: <error>
+  def default(self, line):
+    print(f"ERR: Unknown command '{line}'. Type 'help' to see available commands.")
+
+  # override onecmd to catch exceptions and print status
+  def onecmd(self, line):
+    try:
+      res = super().onecmd(line)
+      if self.print_ack:
+        print("ACK")
+      return res
+    except Exception as e:
+      # traceback.print_exc()
+      print(f"ERR: {e}")
+
   # CLI Commands
 
   def do_status(self, arg):
@@ -491,11 +506,7 @@ class SchedManager(cmd.Cmd):
     if args is None:
       return
 
-    try:
-      self.root_cgroup.subtree_status()
-    except Exception as e:
-      print(f"ERROR: {e}")
-      traceback.print_exc()
+    self.root_cgroup.subtree_status()
 
   def do_monitor(self, arg):
     'Toggle live output from scheduler programs.'
@@ -517,6 +528,26 @@ class SchedManager(cmd.Cmd):
       self.print_monitor = not self.print_monitor
     print(f"Scheduler Output: {'ON' if self.print_monitor else 'OFF'}")
 
+  def do_ack(self, arg):
+    'Toggle printing ACK on success (ERR: <reason> will occur if fails regardless).'
+    parser = argparse.ArgumentParser(
+      prog="monitor",
+      description="Print ACK on success",
+      add_help=True
+    )
+    parser.add_argument("value", help="1 to turn on, 0 to turn off, -1 to toggle", nargs="?", default=-1)
+    args = self.args = self.parse_args(parser, arg)
+    if args is None:
+      return
+
+    if args.value == "1":
+      self.print_ack = True
+    elif args.value == "0":
+      self.print_ack = False
+    else:
+      self.print_ack = not self.print_ack
+    print(f"ACK Response: {'ON' if self.print_ack else 'OFF'}")
+
   def do_tasks(self, arg):
     'List tasks (sched_ext threads) in a cgroup.'
     parser = argparse.ArgumentParser(
@@ -531,40 +562,36 @@ class SchedManager(cmd.Cmd):
     if args is None:
       return
 
-    try:
-      cgroup = self.get_cgroup(args.cgroup_path)
-      if cgroup is None:
-        print(f"ERROR: Cgroup {args.cgroup_path} does not exist.")
-        return
-      threads = cgroup.get_tasks(scx_only=not args.all, is_process=False)
-      
-      thread_info = [{} for _ in threads]
-      for tid, tinfo in zip(threads, thread_info):
-        tinfo['alive'] = True
-        try:
-          with open(f"/proc/{str(tid)}/status", 'r') as f:
-            for line in f:
-              # Split only on the first colon
-              parts = line.split(":", 1)
-              if len(parts) == 2:
-                  key = parts[0].strip()
-                  value = parts[1].strip()
-                  tinfo[key] = value
-          tinfo['Policy'] = os.sched_getscheduler(tid)
-        except (FileNotFoundError, ProcessLookupError):
-          tinfo["alive"] = False
-          continue # thread exited
-      thread_info = [tinfo for tinfo in thread_info if tinfo.get("alive", False)]
-      thread_info.sort(key=lambda t: t.get("Pid", -1))
-      print(f"num tasks: {len(thread_info)}")
-      for tinfo in thread_info:
-        if args.raw:
-          print(tinfo)
-        else:
-          print(f"pid={tinfo.get('Tgid', -1)} tid={tinfo['Pid']} name={tinfo.get('Name', '???')} state={tinfo.get('State', '???')} policy={tinfo.get('Policy', '???')}")
-    except Exception as e:
-      print(f"ERROR: {e}")
-      traceback.print_exc()
+    cgroup = self.get_cgroup(args.cgroup_path)
+    if cgroup is None:
+      print(f"ERROR: Cgroup {args.cgroup_path} does not exist.")
+      return
+    threads = cgroup.get_tasks(scx_only=not args.all, is_process=False)
+    
+    thread_info = [{} for _ in threads]
+    for tid, tinfo in zip(threads, thread_info):
+      tinfo['alive'] = True
+      try:
+        with open(f"/proc/{str(tid)}/status", 'r') as f:
+          for line in f:
+            # Split only on the first colon
+            parts = line.split(":", 1)
+            if len(parts) == 2:
+                key = parts[0].strip()
+                value = parts[1].strip()
+                tinfo[key] = value
+        tinfo['Policy'] = os.sched_getscheduler(tid)
+      except (FileNotFoundError, ProcessLookupError):
+        tinfo["alive"] = False
+        continue # thread exited
+    thread_info = [tinfo for tinfo in thread_info if tinfo.get("alive", False)]
+    thread_info.sort(key=lambda t: t.get("Pid", -1))
+    print(f"num tasks: {len(thread_info)}")
+    for tinfo in thread_info:
+      if args.raw:
+        print(tinfo)
+      else:
+        print(f"pid={tinfo.get('Tgid', -1)} tid={tinfo['Pid']} name={tinfo.get('Name', '???')} state={tinfo.get('State', '???')} policy={tinfo.get('Policy', '???')}")
 
   def do_move(self, arg):
     # NOTE: in 7.2 patchset, since enqueue path not implemented, doesn't actually enqueue into the cgroup subscheduler
@@ -582,16 +609,12 @@ class SchedManager(cmd.Cmd):
     if args is None:
       return
 
-    try:
-      tid = int(args.tid)
-      cgroup = self.get_cgroup(args.cgroup_path)
-      if cgroup is None:
-        print(f"ERROR: Cgroup {args.cgroup_path} does not exist.")
-        return
-      cgroup.add_task(tid, is_process=args.process)
-    except Exception as e:
-      print(f"ERROR: {e}")
-      traceback.print_exc()
+    tid = int(args.tid)
+    cgroup = self.get_cgroup(args.cgroup_path)
+    if cgroup is None:
+      print(f"ERROR: Cgroup {args.cgroup_path} does not exist.")
+      return
+    cgroup.add_task(tid, is_process=args.process)
 
   def complete_move(self, text, line, begidx, endidx):
     args = shlex.split(line[:begidx])
@@ -614,15 +637,11 @@ class SchedManager(cmd.Cmd):
     if args is None:
       return
 
-    try:
-      cgroup = self.get_cgroup(args.cgroup_path)
-      if cgroup is None:
-        print(f"ERROR: Cgroup {args.cgroup_path} does not exist.")
-        return
-      cgroup.detach_sched(recursive=args.recursive)
-    except Exception as e:
-      print(f"ERROR: {e}")
-      traceback.print_exc()
+    cgroup = self.get_cgroup(args.cgroup_path)
+    if cgroup is None:
+      print(f"ERROR: Cgroup {args.cgroup_path} does not exist.")
+      return
+    cgroup.detach_sched(recursive=args.recursive)
 
   def do_delete(self, arg):
     'Delete a cgroup, its scheduler, and all sub-cgroups.'
@@ -636,12 +655,8 @@ class SchedManager(cmd.Cmd):
     if args is None:
       return
 
-    try:
-      if not self.delete_cgroup(args.cgroup_path):
-        print(f"ERROR: Failed to fully delete cgroup {args.cgroup_path}. It may still exist with some threads or sub-cgroups.")
-    except Exception as e:
-      print(f"ERROR: {e}")
-      traceback.print_exc()
+    if not self.delete_cgroup(args.cgroup_path):
+      print(f"ERROR: Failed to fully delete cgroup {args.cgroup_path}. It may still exist with some threads or sub-cgroups.")
 
   def do_attach(self, arg):
     'Attach a sched_ext scheduler to a cgroup or as root.'
@@ -658,16 +673,12 @@ class SchedManager(cmd.Cmd):
     if args is None:
       return
     
-    try:
-      config = {
-        "policy": args.policy
-      }
-      if args.trace_dir is not None:
-        config["trace_dir"] = args.trace_dir
-      self.load_configs([(config, Path())], basepath=Path(args.cgroup_path), force=args.force)
-    except Exception as e:
-      print(f"ERROR: {e}")
-      traceback.print_exc()
+    config = {
+      "policy": args.policy
+    }
+    if args.trace_dir is not None:
+      config["trace_dir"] = args.trace_dir
+    self.load_configs([(config, Path())], basepath=Path(args.cgroup_path), force=args.force)
 
   def complete_attach(self, text, line, begidx, endidx):
     args = shlex.split(line[:begidx])
@@ -709,49 +720,44 @@ class SchedManager(cmd.Cmd):
     if args is None:
       return
 
-    try:
-      basepath = Path(args.relative_to)
+    basepath = Path(args.relative_to)
 
-      args.config_path = Path(args.config_path).resolve(strict=True)
-      if not args.config_path.is_file():
-        print(f"ERROR: Config file {args.config_path} does not exist.")
-        return
+    args.config_path = Path(args.config_path).resolve(strict=True)
+    if not args.config_path.is_file():
+      print(f"ERROR: Config file {args.config_path} does not exist.")
+      return
+    
+    with open(args.config_path, "r") as f:
+      root_config = json.load(f)
+    
+    # get list of configs
+    configs = [(root_config, Path())]
+    i = 0
+    while i < len(configs):
+      config, rel_path = configs[i]
+      i += 1
+      cgroup_path = rel_path / config.get("cgroup", "")
+      cgroup = self.add_cgroup(cgroup_path, create=False)
+      trace = config.get("trace", False)
+
+      # add trace path
+      trace_dir = None
+      if "trace_dir" in config:
+        trace_dir = Path(config["trace_dir"]).expanduser().resolve(strict=False)
+      if "trace_path" in config:
+        del config["trace_path"]
+      if trace and trace_dir is not None:
+        config["trace_path"] = str((Path(trace_dir) / ("trace_" + "__".join(cgroup_path.parts))).with_suffix(".trace"))
       
-      with open(args.config_path, "r") as f:
-        root_config = json.load(f)
-      
-      # get list of configs
-      configs = [(root_config, Path())]
-      i = 0
-      while i < len(configs):
-        config, rel_path = configs[i]
-        i += 1
-        cgroup_path = rel_path / config.get("cgroup", "")
-        cgroup = self.add_cgroup(cgroup_path, create=False)
-        trace = config.get("trace", False)
+      # add subs
+      subs = config.get("subs", {})
+      for name, sub_config in subs.items():
+        if trace_dir is not None and "trace_dir" not in sub_config:
+          sub_config["trace_dir"] = str(trace_dir)
+        configs.append((sub_config, cgroup_path / name))
 
-        # add trace path
-        trace_dir = None
-        if "trace_dir" in config:
-          trace_dir = Path(config["trace_dir"]).expanduser().resolve(strict=False)
-        if "trace_path" in config:
-          del config["trace_path"]
-        if trace and trace_dir is not None:
-          config["trace_path"] = str((Path(trace_dir) / ("trace_" + "__".join(cgroup_path.parts))).with_suffix(".trace"))
-        
-        # add subs
-        subs = config.get("subs", {})
-        for name, sub_config in subs.items():
-          if trace_dir is not None and "trace_dir" not in sub_config:
-            sub_config["trace_dir"] = str(trace_dir)
-          configs.append((sub_config, cgroup_path / name))
-
-      # load configs
+    # load configs
       self.load_configs(configs, basepath, force=args.force)
-
-    except Exception as e:
-      print(f"ERROR: {e}")
-      traceback.print_exc()
 
   def complete_load_config(self, text, line, begidx, endidx):
     os.path.expanduser(text)
