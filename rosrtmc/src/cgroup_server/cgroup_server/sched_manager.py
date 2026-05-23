@@ -19,8 +19,6 @@ from typing import Dict, Any
 from pathlib import Path
 import pwd
 
-SCX_BUILD_PATH = None
-USER = None
 CGROUP_PATH = Path("/sys/fs/cgroup").resolve(strict=True)
 BPF_PATH = Path("/sys/fs/bpf").resolve(strict=True)
 
@@ -41,6 +39,26 @@ def validate_perms():
   validate_file(CGROUP_PATH / "cgroup.procs")
   validate_file(CGROUP_PATH / "cgroup.threads")
 
+# validate capabilities of scheduler binaries
+def check_sched_capabilities(bin_path):
+  try:
+    result = subprocess.run(["getcap", bin_path], capture_output=True, text=True)
+    if result.returncode != 0:
+      print(f"WARNING: Failed to get capabilities for {bin_path}: {result.stderr.strip()}")
+      return False
+    if "cap_bpf" not in result.stdout:
+      print(f"WARNING: {bin_path} does not have cap_bpf capability. Scheduler may fail to attach due to permission issues.")
+      return False
+    if "cap_perfmon" not in result.stdout:
+      print(f"WARNING: {bin_path} does not have cap_perfmon capability. Scheduler may fail to attach due to permission issues.")
+      return False
+    if "=ep" not in result.stdout:
+      print(f"WARNING: {bin_path} does not have effective capabilities. Scheduler may fail to attach due to permission issues.")
+      return False
+  except FileNotFoundError:
+    print(f"WARNING: 'getcap' command not found. Cannot check capabilities for {bin_path}.")
+    return False
+
 def cgname(cgroup):
   return cgroup if cgroup is not None else "<root>"
 
@@ -52,7 +70,7 @@ class Scheduler:
     self.process: subprocess.Popen = None
     self.attached = False # set to true once monitor reads ack_output
 
-  def popen(self):
+  def popen(self, scx_build_path):
     # runs command to launch scheduler process for this cgroup, using the provided config
     # after returning, stdout is handled by a separate thread within SchedManager
     # dont need to block until thread starts, just need to ensure the process is launched with piped output
@@ -70,7 +88,7 @@ class Scheduler:
   def is_attached(self) -> bool:
     return self.attached and self.is_running()
 
-  def start(self):
+  def start(self, scx_build_path):
     if self.is_running():
       raise ValueError(f"Scheduler for cgroup {cgname(self.cgroup)} is already running.")
 
@@ -78,7 +96,7 @@ class Scheduler:
       dir_path = Path(self.trace_path).parent
       dir_path.mkdir(parents=True, exist_ok=True)
 
-    self.popen()
+    self.popen(scx_build_path)
     if not self.is_running():
       raise RuntimeError(f"Failed to start scheduler for cgroup {cgname(self.cgroup)}")
 
@@ -108,8 +126,10 @@ class Scheduler:
     return s
 
 class ScxFP(Scheduler):
-  def popen(self):
-    cmd = [f"{SCX_BUILD_PATH}/bin/scx_fp"]
+  def popen(self, scx_build_path):
+    bin_path = f"{scx_build_path}/bin/scx_fp"
+    check_sched_capabilities(bin_path)
+    cmd = [bin_path]
     if self.cgroup:
       cmd += ["-c", self.cgroup]
     if self.trace_path:
@@ -120,8 +140,10 @@ class ScxFP(Scheduler):
     return "Scheduler Attached"
 
 class ScxWRR(Scheduler):
-  def popen(self):
-    cmd = [f"{SCX_BUILD_PATH}/bin/scx_wrr"]
+  def popen(self, scx_build_path):
+    bin_path = f"{scx_build_path}/bin/scx_wrr"
+    check_sched_capabilities(bin_path)
+    cmd = [bin_path]
     if self.cgroup:
       cmd += ["-c", self.cgroup]
     if self.trace_path:
@@ -132,8 +154,10 @@ class ScxWRR(Scheduler):
     return "Scheduler Attached"
 
 class ScxEAF(Scheduler):
-  def popen(self):
-    cmd = [f"{SCX_BUILD_PATH}/bin/scx_eaf"]
+  def popen(self, scx_build_path):
+    bin_path = f"{scx_build_path}/bin/scx_eaf"
+    check_sched_capabilities(bin_path)
+    cmd = [bin_path]
     if self.cgroup:
       cmd += ["-c", self.cgroup]
     if self.trace_path:
@@ -287,10 +311,10 @@ class CgroupManager:
     weight = self.get_weight()
     weight = f" (weight: {weight}) " if weight is not None else ""
     cgroup = self.path.relative_to(CGROUP_PATH) if self.path != CGROUP_PATH else "<root>"
-    print(f"{' ' * indent}{cgroup}{weight}: {sched_str} num tasks: {len(self.get_tasks(scx_only=False, is_process=False))}")
-    
+    s = f"{' ' * indent}{cgroup}{weight}: {sched_str} num tasks: {len(self.get_tasks(scx_only=False, is_process=False))}\n"
     for sub in self.subs.values():
-      sub.subtree_status(indent=indent+2)
+      s += sub.subtree_status(indent=indent+2)
+    return s
 
   # attach scheduler to this cgroup, raises error if already attached
   def attach_sched(self, sched: Scheduler):
@@ -312,9 +336,16 @@ class CgroupManager:
 class SchedManager(cmd.Cmd):
   intro = "Hierarchical Cgroup sched_ext Scheduler Manager. Type help or ? to list commands.\n"
   prompt = f"{Path.cwd()} (sched_manager) "
+
+  def output(self, msg, end="\n", flush=False):
+    if self.output_queue:
+      self.output_queue.put(msg)
+    else:
+      print(msg, end=end, flush=flush)
   
-  def __init__(self):
+  def __init__(self, scx_build_path, output_queue=None):
     super().__init__()
+    self.scx_build_path = scx_build_path
     delims = readline.get_completer_delims()
     delims = delims.replace('/', '')
     delims = delims.replace('-', '')
@@ -324,6 +355,7 @@ class SchedManager(cmd.Cmd):
     self.selector = selectors.DefaultSelector()
     self.print_monitor = False
     self.print_ack = False
+    self.output_queue = output_queue
     self.monitor_thread = threading.Thread(target=self.monitor_thread_func, daemon=True)
     self.monitor_thread.start()
 
@@ -403,10 +435,6 @@ class SchedManager(cmd.Cmd):
       print()
       parser.print_help()
       return None
-    except Exception as e:
-      print(f"ERROR: {e}")
-      traceback.print_exc()
-      return None
 
   # helper to load list of (scheduler config, relative cgroup path)
   def load_configs(self, configs, basepath: Path = Path(), force=False):
@@ -453,7 +481,7 @@ class SchedManager(cmd.Cmd):
         else:
           cgroup.set_cpus(cpus)
         cgroup.attach_sched(sched)
-        sched.start()
+        sched.start(self.scx_build_path)
         os.set_blocking(sched.process.stdout.fileno(), False)
         self.selector.register(sched.process.stdout, selectors.EVENT_READ, data=sched)
         while sched.is_running() and not sched.is_attached():
@@ -475,23 +503,23 @@ class SchedManager(cmd.Cmd):
         return []
       return [str(parent_path / name).removeprefix("./") for name in cgroup.subs.keys() if name.startswith(prefix)]
     except Exception as e:
-      print(e)
+      self.output(e)
       return []
 
   # override default to print ERR: <error>
   def default(self, line):
-    print(f"ERR: Unknown command '{line}'. Type 'help' to see available commands.")
+    self.output(f"ERR: Unknown command '{line}'. Type 'help' to see available commands.")
 
   # override onecmd to catch exceptions and print status
   def onecmd(self, line):
     try:
       res = super().onecmd(line)
       if self.print_ack:
-        print("ACK")
+        self.output(f"ACK")
       return res
     except Exception as e:
       # traceback.print_exc()
-      print(f"ERR: {e}")
+      self.output(f"ERR: {e}")
 
   # CLI Commands
 
@@ -506,7 +534,29 @@ class SchedManager(cmd.Cmd):
     if args is None:
       return
 
-    self.root_cgroup.subtree_status()
+    lines = self.root_cgroup.subtree_status().strip().split("\n")
+    for line in lines:
+      self.output(line)
+
+  def do_sched(self, arg):
+    'Print the scheduler attached to a cgroup.'
+    parser = argparse.ArgumentParser(
+      prog="sched",
+      description="Print the scheduler attached to a cgroup.",
+      add_help=True
+    )
+    parser.add_argument("cgroup_path", help="Path to the cgroup relative to the root cgroup (default is root).", nargs="?", default="")
+    args = self.parse_args(parser, arg)
+    if args is None:
+      return
+
+    cgroup = self.get_cgroup(args.cgroup_path)
+    if cgroup is None:
+      self.output("no cgroup")
+    elif cgroup.sched is None:
+      self.output("none")
+    else:
+      self.output(f"{cgroup.sched.policy}")
 
   def do_monitor(self, arg):
     'Toggle live output from scheduler programs.'
@@ -526,7 +576,7 @@ class SchedManager(cmd.Cmd):
       self.print_monitor = False
     else:
       self.print_monitor = not self.print_monitor
-    print(f"Scheduler Output: {'ON' if self.print_monitor else 'OFF'}")
+    self.output(f"Scheduler Output: {'ON' if self.print_monitor else 'OFF'}")
 
   def do_ack(self, arg):
     'Toggle printing ACK on success (ERR: <reason> will occur if fails regardless).'
@@ -655,7 +705,7 @@ class SchedManager(cmd.Cmd):
     if args is None:
       return
 
-    if not self.delete_cgroup(args.cgroup_path):
+    if not self.delete_cgroup(Path(args.cgroup_path)):
       print(f"ERROR: Failed to fully delete cgroup {args.cgroup_path}. It may still exist with some threads or sub-cgroups.")
 
   def do_attach(self, arg):
@@ -799,21 +849,17 @@ def signal_handler(sig, frame):
   except Exception as e:
     print(f"ERROR during cleanup: {e}")
     traceback.print_exc()
-  sys.exit(0)
+  if sig == signal.SIGINT:
+    sys.exit(0)
 
 def main():
   validate_perms()
   parser = argparse.ArgumentParser(description="Manage sched_ext schedulers attached to cgroups.")
   parser.add_argument("scx_build_path", help="Path to the sched_ext build directory containing the scheduler binaries.")
-  parser.add_argument("user", help="User to chown created trace files to (default is current user).", nargs="?", default=os.getenv("SUDO_USER", os.getenv("USER")))
   args = parser.parse_args()
 
-  global SCX_BUILD_PATH, USER
-  SCX_BUILD_PATH = args.scx_build_path
-  USER = pwd.getpwnam(args.user)
-
   global manager
-  manager = SchedManager()
+  manager = SchedManager(scx_build_path=args.scx_build_path)
   signal.signal(signal.SIGINT, signal_handler)
 
   try:
