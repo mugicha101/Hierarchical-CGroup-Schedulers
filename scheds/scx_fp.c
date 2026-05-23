@@ -68,10 +68,12 @@ int main(int argc, char **argv)
 	struct scx_fp *skel;
 	struct bpf_link *link;
 	struct ring_buffer *rb_manager;
+	struct bpf_program *syscall_prog = NULL;
 
   const char *cg_path = NULL;
 	const char *sched_name = "<root>";
 	const char *trace_path = NULL;
+	const char *pin_path = "/sys/fs/bpf/update_weight";
 
 	__u32 opt;
 	__u64 ecode;
@@ -143,6 +145,21 @@ restart:
 		fprintf(stderr, "Error: failed to attach scheduler\n");
 		goto cleanup;
 	}
+
+	// pin syscall program if no prior instances of it exist
+	if (access(pin_path, F_OK)) {
+		syscall_prog = bpf_object__find_program_by_name(skel->obj, "update_weight");
+		if (!syscall_prog) {
+			fprintf(stderr, "Error: failed to find update_weight program\n");
+			goto cleanup;
+		}
+		if (bpf_program__pin(syscall_prog, pin_path) < 0) {
+			fprintf(stderr, "Error: failed to pin update_weight program\n");
+			goto cleanup;
+		}
+		fprintf(stdout, "Pinned update_weight program to %s\n", pin_path);
+	}
+	
 	fprintf(stdout, "Scheduler Attached\n");
 	fflush(stdout);
 
@@ -172,6 +189,10 @@ restart:
 	}
 
 cleanup:
+
+	if (syscall_prog) {
+		bpf_program__unpin(syscall_prog, pin_path);
+	}
 
 	if (link) bpf_link__destroy(link);
 	ecode = UEI_REPORT(skel, uei);
