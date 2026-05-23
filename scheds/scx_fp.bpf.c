@@ -38,7 +38,8 @@ const volatile u64 cgroup_id;
 u64 self_cgroup_weight;
 
 #define MAX_SUB_SCHEDS 64 // must be power of 2
-#define DEFAULT_WEIGHT 1
+#define DEFAULT_CGROUP_WEIGHT 1
+#define DEFAULT_TASK_WEIGHT (~0ULL)
 #define MAX_PENDING_UPDATES 1024
 // #define NMIG_TIMER_PERIOD_NS (1 * 1000000ULL) // 1ms
 #define NTRIALS 10000 // enough trials to be functionally infinite for rare race-conditioned events
@@ -247,7 +248,7 @@ void __always_inline update_cpu_cgroup_weight(u32 cpu, struct cpu_task_state *ct
 	// running task, fetch cgroup
 	u64 cgrp_id = BPF_CORE_READ(cpu_task, cgroups, dfl_cgrp, kn, id);
 	u32 *cgrp_weight = bpf_map_lookup_elem(&cgroup_weights, &cgrp_id);
-	cts->cgrp_weight = cgrp_weight ? *cgrp_weight : DEFAULT_WEIGHT;
+	cts->cgrp_weight = cgrp_weight ? *cgrp_weight : DEFAULT_CGROUP_WEIGHT;
 }
 
 // periodically checks if task is still non-migrateable
@@ -338,7 +339,7 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(fp_init)
 	bpf_printk("[INFO] [FP] [INIT] cgroup=%d", cgroup_id);
 	
 	// init cgroup data structs
-	self_cgroup_weight = DEFAULT_WEIGHT;
+	self_cgroup_weight = DEFAULT_CGROUP_WEIGHT;
 	s32 err = 0;
 	u32 cpu;
 	bpf_for(cpu, 0, NR_CPUS) {
@@ -418,7 +419,7 @@ s32 BPF_STRUCT_OPS(fp_sub_attach, struct scx_sub_attach_args *args)
 	if (unlikely(!global)) return -EINVAL; // for verifier, should not happen
 
 	u32 *cached_weight = bpf_map_lookup_elem(&cgroup_weights, &cgrp_id);
-	u64 weight = cached_weight ? *cached_weight : DEFAULT_WEIGHT;
+	u64 weight = cached_weight ? *cached_weight : DEFAULT_CGROUP_WEIGHT;
 	
 	struct global_sub_params *global_subs = global->global_subs;
 	struct bpf_spin_lock *global_subs_write_lock = &global->global_subs_write_lock;
@@ -743,7 +744,7 @@ s32 BPF_STRUCT_OPS(fp_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake_
 }
 
 u64 __always_inline get_task_weight(struct task_struct *p) {
-	u64 weight = DEFAULT_WEIGHT;
+	u64 weight = DEFAULT_TASK_WEIGHT;
 	u64 *lookup_weight = bpf_task_storage_get(&task_weights, p, 0, 0);
 	if (lookup_weight) {
 		weight = *lookup_weight;
