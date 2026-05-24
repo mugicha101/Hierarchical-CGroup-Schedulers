@@ -58,7 +58,7 @@ int err = bpf_map_update_elem(file_fd, &pid_fd, &weight, BPF_ANY);
 sched_yield(); // task weight only updated on enqueue
 ```
 
-Example of calling `set_weight` from a C program:
+Example of calling `/sys/fs/bpf/update_weight` from a C program:
 ```c
 #include <bpf/bpf.h>
 
