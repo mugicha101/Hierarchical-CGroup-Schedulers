@@ -3,6 +3,7 @@
 
 #define TRACING 1
 #define SCX_TRACER 0
+#define TRACE_FUNCS 0
 
 enum sched_trace_event_type {
   SCHED_TRACE_FUNC_START,
@@ -22,6 +23,8 @@ enum sched_trace_event_type {
   SCHED_TRACE_SUB_PARAMS_UPDATE,
   SCHED_TRACE_ENABLE_TASK,
   SCHED_TRACE_DISABLE_TASK,
+  SCHED_TRACE_SET_TASK_WEIGHT,
+  SCHED_TRACE_SELF,
 };
 
 // note: each scheduler gets its own ring buffer, so don't need to give scheduler identification
@@ -125,6 +128,18 @@ struct sched_trace_event_disable_task {
   uint64_t pid;
 };
 
+struct sched_trace_event_set_task_weight {
+  struct sched_trace_event_header header;
+  uint64_t pid;
+  uint64_t weight;
+};
+
+struct sched_trace_event_self {
+  struct sched_trace_event_header header;
+  uint64_t cgrp_id;
+  uint64_t weight;
+};
+
 #if TRACING
 
 #define TRACE_EVENT(STRUCT_TYPE, EVENT_TYPE, ...) \
@@ -181,7 +196,7 @@ struct { \
 
 #endif
 
-#if SCX_TRACER
+#if SCX_TRACER && TRACE_FUNCS
 
 #define TRACE_FUNC_START(NAME) \
 scx_custom_trace_event_begin(NAME); \
@@ -196,7 +211,7 @@ TRACE_EVENT(struct sched_trace_event_func_end, SCHED_TRACE_FUNC_END, \
   bpf_probe_read_kernel_str(e->reason, 32, REASON); \
 );
 
-#else
+#elif TRACE_FUNCS
 
 #define TRACE_FUNC_START(NAME) \
 TRACE_EVENT(struct sched_trace_event_func_start, SCHED_TRACE_FUNC_START, \
@@ -208,6 +223,11 @@ TRACE_EVENT(struct sched_trace_event_func_end, SCHED_TRACE_FUNC_END, \
   bpf_probe_read_kernel_str(e->func_name, 32, NAME); \
   bpf_probe_read_kernel_str(e->reason, 32, REASON); \
 );
+
+#else
+
+#define TRACE_FUNC_START(NAME)
+#define TRACE_FUNC_END(NAME, REASON)
 
 #endif
 

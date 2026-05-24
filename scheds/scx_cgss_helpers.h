@@ -186,6 +186,14 @@ int handle_event(void *ctx, void *data, size_t data_sz) {
 			struct sched_trace_event_disable_task *event = data;
 			fprintf(trace_fd, "DISABLE_TASK: pid=%lu\n", event->pid);
 		} break;
+		case SCHED_TRACE_SET_TASK_WEIGHT: {
+			struct sched_trace_event_set_task_weight *event = data;
+			fprintf(trace_fd, "SET_TASK_WEIGHT: pid=%lu weight=%lu\n", event->pid, event->weight);
+		} break;
+		case SCHED_TRACE_SELF: {
+			struct sched_trace_event_self *event = data;
+			fprintf(trace_fd, "SELF: cgrp_id=%lu weight=%lu\n", event->cgrp_id, event->weight);
+		} break;
 		default:
 			fprintf(trace_fd, "UNKNOWN_EVENT_TYPE\n");
 	}

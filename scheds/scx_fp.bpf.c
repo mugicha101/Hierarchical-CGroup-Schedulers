@@ -177,6 +177,8 @@ struct {
 	__type(value, struct cpu_sched_state);
 } sched_state SEC(".maps");
 
+// per-cpu runtime data
+
 inline struct global_data *fetch_global() {
 	const u32 idx = 0;
 	return bpf_map_lookup_elem(&global, &idx);
@@ -337,6 +339,10 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(fp_init)
 {
 	TRACE_FUNC_START("init");
 	bpf_printk("[INFO] [FP] [INIT] cgroup=%d", cgroup_id);
+	TRACE_EVENT(struct sched_trace_event_self, SCHED_TRACE_SELF,
+		e->cgrp_id = cgroup_id;
+		e->weight = DEFAULT_CGROUP_WEIGHT;
+	);
 	
 	// init cgroup data structs
 	self_cgroup_weight = DEFAULT_CGROUP_WEIGHT;
@@ -503,6 +509,10 @@ void BPF_STRUCT_OPS(fp_cgroup_set_weight, struct cgroup *cgrp, u32 weight)
 	u64 cgrp_id = cgrp->kn->id;
 	if (cgrp_id == cgroup_id) {
 		self_cgroup_weight = weight;
+		TRACE_EVENT(struct sched_trace_event_self, SCHED_TRACE_SELF,
+			e->cgrp_id = cgroup_id;
+			e->weight = weight;
+		);
 	}
 	// bpf_printk("[INFO] [FP] [SET_WEIGHT] Setting cgroup %llu weight to %u", cgrp_id, weight);
 	TRACE_FUNC_START("cgroup_set_weight");
@@ -725,6 +735,10 @@ s32 BPF_STRUCT_OPS(fp_cgroup_init, struct cgroup *cgrp, struct scx_cgroup_init_a
 	u32 weight = args->weight;
 	if (cgrp_id == cgroup_id) {
 		self_cgroup_weight = weight;
+		TRACE_EVENT(struct sched_trace_event_self, SCHED_TRACE_SELF,
+			e->cgrp_id = cgroup_id;
+			e->weight = weight;
+		);
 	}
 	TRACE_EVENT(struct sched_trace_event_cgroup_init_args, SCHED_TRACE_CGROUP_INIT_ARGS,
 		e->cgrp_id = cgrp_id;
@@ -766,7 +780,7 @@ void BPF_STRUCT_OPS(fp_enqueue, struct task_struct *p, u64 enq_flags)
 	);
 
 	// setup struct pointers
-	u32 cpu = bpf_get_smp_processor_id();
+	u32 cpu = bpf_get_smp_processor_id() & (NR_CPUS - 1); // if NR_CPUS redefined, this prevents enqueue failures
 	struct global_task_data *gtd = fetch_global_task_data();
 	struct cpu_sched_state *ss = bpf_map_lookup_elem(&sched_state, &cpu);
 	if (unlikely(!gtd || !ss)) return; // for verifier, should not happen
@@ -775,6 +789,10 @@ void BPF_STRUCT_OPS(fp_enqueue, struct task_struct *p, u64 enq_flags)
 	u64 weight = get_task_weight(p);
 	u64 vtime = ~0ULL - weight;
 	u32 task_cpu = scx_bpf_task_cpu(p) & (NR_CPUS - 1);
+	TRACE_EVENT(struct sched_trace_event_set_task_weight, SCHED_TRACE_SET_TASK_WEIGHT,
+		e->pid = p->pid;
+		e->weight = weight;
+	);
 
 	// check if must run on local CPU due to migration disabled (bypasses priority system)
 	if (is_migration_disabled(p)) {
@@ -908,7 +926,6 @@ void BPF_STRUCT_OPS(fp_cpu_release, s32 cpu, struct scx_cpu_release_args *args)
 
 void BPF_STRUCT_OPS(fp_running, struct task_struct *p)
 {
-	TRACE_FUNC_START("running");
   // bpf_printk("[INFO] [FP] [RUNNING] cgroup=%d pid=%d comm=%s", cgroup_id, p->pid, p->comm);
 	TRACE_EVENT(struct sched_trace_event_run_task, SCHED_TRACE_RUN_TASK,
 		e->pid = p->pid;
@@ -1011,7 +1028,7 @@ int BPF_PROG(trace_migrate_enable, struct task_struct *p, struct affinity_contex
 // can probably improve this by loading a new instance per FP scheduler
 SEC("syscall")
 int BPF_PROG(update_weight, u64 pid, u64 weight) {
-	bpf_printk("[INFO] [FP] [UPDATE_WEIGHT] Updating weight of task %d to %llu\n", pid, weight);
+	// bpf_printk("[INFO] [FP] [UPDATE_WEIGHT] Updating weight of task %d to %llu\n", pid, weight);
 	// update weight in map
 	struct task_struct *p = bpf_task_from_pid(pid);
 	if (unlikely(!p)) {
@@ -1027,6 +1044,11 @@ int BPF_PROG(update_weight, u64 pid, u64 weight) {
 	*task_weight_ptr = weight;
 
 	bpf_task_release(p);
+
+	TRACE_EVENT(struct sched_trace_event_set_task_weight, SCHED_TRACE_SET_TASK_WEIGHT,
+		e->pid = pid;
+		e->weight = weight;
+	);
 
 	// kick cpu
 	u32 cpu = bpf_get_smp_processor_id();

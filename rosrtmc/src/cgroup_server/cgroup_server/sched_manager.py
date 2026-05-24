@@ -443,8 +443,9 @@ class SchedManager(cmd.Cmd):
     try:
       if not force:
         if base_cgroup == self.root_cgroup:
-          if any(sub.exists() for sub in base_cgroup.subs.values()):
-            raise ValueError(f"Root cgroup already has attached sub-cgroups. Use --force to overwrite.")
+          for sub in base_cgroup.subs.values():
+            if sub.exists():
+              raise ValueError(f"Root cgroup already has attached sub-cgroup {sub.path}. Use --force to overwrite.")
         else:
           if base_cgroup.exists():
             raise ValueError(f"Cgroup {basepath} already exists. Use --force to overwrite.")
@@ -726,9 +727,10 @@ class SchedManager(cmd.Cmd):
     config = {
       "policy": args.policy
     }
+    cgroup_path = Path(args.cgroup_path)
     if args.trace_dir is not None:
-      config["trace_dir"] = args.trace_dir
-    self.load_configs([(config, Path())], basepath=Path(args.cgroup_path), force=args.force)
+      config["trace_path"] = str((Path(args.trace_dir) / ("trace_" + "__".join(cgroup_path.parts))).with_suffix(".trace"))
+    self.load_configs([(config, Path())], basepath=cgroup_path, force=args.force)
 
   def complete_attach(self, text, line, begidx, endidx):
     args = shlex.split(line[:begidx])
@@ -807,7 +809,7 @@ class SchedManager(cmd.Cmd):
         configs.append((sub_config, cgroup_path / name))
 
     # load configs
-      self.load_configs(configs, basepath, force=args.force)
+    self.load_configs(configs, basepath, force=args.force)
 
   def complete_load_config(self, text, line, begidx, endidx):
     os.path.expanduser(text)
