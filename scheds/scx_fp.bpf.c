@@ -839,6 +839,19 @@ void BPF_STRUCT_OPS(fp_enqueue, struct task_struct *p, u64 enq_flags)
 	// worst case just an extra enqueue to sort out
 	// should be rare since time between kick and dispatch is small
 	// if all CPUs are kicked (extremely unlikely) try again
+
+	// optimization: first check if any idle and kick that one
+	s32 idle_cpu = scx_bpf_pick_idle_cpu(p->cpus_ptr, 0);
+	if (idle_cpu >= 0 && idle_cpu < NR_CPUS) {
+		scx_bpf_kick_cpu(idle_cpu, (u64)SCX_KICK_IDLE);
+		TRACE_EVENT(struct sched_trace_event_kick_cpu, SCHED_TRACE_KICK_CPU,
+			e->cpu = idle_cpu;
+		);
+		TRACE_FUNC_END("enqueue", "kicked idle");
+    return;
+	}
+
+	// then do the slow search
 	u32 trials;
 	bpf_for(trials, 0, NTRIALS) {
 		// first fetch a snapshot of what cgroups each cpu is running to avoid preempting ones with higher weight
@@ -1040,9 +1053,8 @@ int BPF_PROG(update_weight, u64 pid, u64 weight) {
 		bpf_task_release(p);
 		return 0; // for verifier, should not happen
 	}
-
+	u32 cpu = scx_bpf_task_cpu(p);
 	*task_weight_ptr = weight;
-
 	bpf_task_release(p);
 
 	TRACE_EVENT(struct sched_trace_event_set_task_weight, SCHED_TRACE_SET_TASK_WEIGHT,
@@ -1051,7 +1063,6 @@ int BPF_PROG(update_weight, u64 pid, u64 weight) {
 	);
 
 	// kick cpu
-	u32 cpu = bpf_get_smp_processor_id();
 	scx_bpf_kick_cpu(cpu, (u64)SCX_KICK_PREEMPT);
 	TRACE_EVENT(struct sched_trace_event_kick_cpu, SCHED_TRACE_KICK_CPU,
 		e->cpu = cpu;

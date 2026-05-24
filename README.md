@@ -37,7 +37,7 @@ Built schedulers can be run like so: `./build/bin/scx_wrr`.
 
 Brief description of schedulers (see their bpf code for more details)
 
-- scx_fp: Fixed Priority Scheduler. Supports both sub cgroups and tasks. Supports job-level fixed priority by calling the `set_weight` bpf program pinned to `/sys/fs/bpf/set_weight` (one syscall) or by writing to `/sys/fs/bpf/task_weights` and then `sched_yield()` (two syscalls).
+- scx_fp: Fixed Priority Scheduler. Supports both sub cgroups and tasks. Supports job-level fixed priority by calling the `set_weight` bpf program pinned to `/sys/fs/bpf/set_weight` (~0.5s) or by writing to `/sys/fs/bpf/task_weights` and then `sched_yield()` (~50us).
 
 - scx_wrr: Weighted Round Robin Scheduler (per-cpu round robin queues). Only supports sub cgroups, not tasks.
 
@@ -72,6 +72,19 @@ Due to limitations with the current v3 patchset, `clone3` with flag `CLONE_INTO_
 When a scheduler exits (either by crash or gracefully), its tasks are enqueued into the nearest ancestor scheduler.
 
 With PREEMPT_RT enabled, `struct bpf_timer` cannot be used. This breaks `scx_wrr`.
+
+### Measuring Overhead
+
+Enable bpf runtime and run count tracking
+```
+sudo sysctl -w kernel.bpf_stats_enabled=1
+```
+
+Then listing bpf programs will show both runtime in ns and number of calls
+```
+sudo bpftool prog show
+```
+
 
 ## Scheduler Manager Setup (Outside of ROS 2)
 
