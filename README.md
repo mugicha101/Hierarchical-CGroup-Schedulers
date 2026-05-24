@@ -46,6 +46,8 @@ Brief description of schedulers (see their bpf code for more details)
 Example of setting weight via `/sys/fs/bpf/task_weights`
 ```c
 int file_fd = bpf_obj_get("/sys/fs/bpf/task_weights");
+int pid_fd = syscall(SYS_pidfd_open, tid, PIDFD_THREAD);
+uint64_t weight = rand() % 100 + 1;
 int err = bpf_map_update_elem(file_fd, &pid_fd, &weight, BPF_ANY);
 sched_yield(); // task weight only updated on enqueue
 ```
