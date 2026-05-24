@@ -841,14 +841,25 @@ void BPF_STRUCT_OPS(fp_enqueue, struct task_struct *p, u64 enq_flags)
 	// if all CPUs are kicked (extremely unlikely) try again
 
 	// optimization: first check if any idle and kick that one
-	s32 idle_cpu = scx_bpf_pick_idle_cpu(p->cpus_ptr, 0);
+	// check prev CPU first to avoid migrations
+	s32 idle_cpu = scx_bpf_test_and_clear_cpu_idle(task_cpu) ? task_cpu : scx_bpf_pick_idle_cpu(p->cpus_ptr, 0);
 	if (idle_cpu >= 0 && idle_cpu < NR_CPUS) {
-		scx_bpf_kick_cpu(idle_cpu, (u64)SCX_KICK_IDLE);
-		TRACE_EVENT(struct sched_trace_event_kick_cpu, SCHED_TRACE_KICK_CPU,
-			e->cpu = idle_cpu;
-		);
-		TRACE_FUNC_END("enqueue", "kicked idle");
-    return;
+		struct cpu_task_state *cts = &gtd->cpu_task_states[idle_cpu & (NR_CPUS - 1)];
+
+		// kick cpu
+		bpf_spin_lock(&gtd->global_task_lock); // prevent other enqueues from claiming same CPU
+		bool do_kick = !cts->kicked;
+		cts->kicked = true;
+		bpf_spin_unlock(&gtd->global_task_lock);
+		
+		if (do_kick) {
+			scx_bpf_kick_cpu(idle_cpu, (u64)SCX_KICK_PREEMPT);
+			TRACE_EVENT(struct sched_trace_event_kick_cpu, SCHED_TRACE_KICK_CPU,
+				e->cpu = idle_cpu;
+			);
+			TRACE_FUNC_END("enqueue", "kicked idle");
+			return;
+		}
 	}
 
 	// then do the slow search
