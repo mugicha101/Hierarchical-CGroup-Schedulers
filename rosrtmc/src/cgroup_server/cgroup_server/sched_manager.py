@@ -353,7 +353,7 @@ class SchedManager(cmd.Cmd):
     self.root_cgroup = CgroupManager(CGROUP_PATH)
     self.root_cgroup.create(subtree=False)
     self.selector = selectors.DefaultSelector()
-    self.print_monitor = False
+    self.print_monitor = True
     self.print_ack = False
     self.output_queue = output_queue
     self.monitor_thread = threading.Thread(target=self.monitor_thread_func, daemon=True)
@@ -519,7 +519,7 @@ class SchedManager(cmd.Cmd):
         self.output(f"ACK")
       return res
     except Exception as e:
-      # traceback.print_exc()
+      traceback.print_exc()
       self.output(f"ERR: {e}")
 
   # CLI Commands
