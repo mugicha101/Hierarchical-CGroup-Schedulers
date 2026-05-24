@@ -3,6 +3,7 @@ from rclpy.node import Node
 from rclpy.parameter import Parameter
 import threading
 import queue
+import sys
 
 from cgroup_server_interfaces.srv import RequestCgroup
 from cgroup_server.sched_manager import SchedManager
@@ -39,7 +40,7 @@ class CgroupServer(Node):
       )
       self.sched_manager_thread.start()
       
-      succ, _ = self.shed_manager_cmd("ack 1")
+      succ, _ = self.sched_manager_cmd("ack 1")
       assert succ, "Failed to communicate set ACK mode for sched_manager"
       self.get_logger().info('Cgroup Server is ready.')
 
@@ -58,7 +59,7 @@ class CgroupServer(Node):
         if sched_manager.onecmd(cmd):
           return
 
-    def shed_manager_cmd(self, cmd, topic_output=False):
+    def sched_manager_cmd(self, cmd, topic_output=False):
       with self.sched_manager_lock:
         assert self.sched_manager_thread.is_alive(), "Sched Manager thread has stopped unexpectedly"
         assert self.res_queue.empty(), "Result queue should be empty before sending a new command"
@@ -79,11 +80,11 @@ class CgroupServer(Node):
     def sched_manager_input_handler(self, msg):
       cmd = msg.data
       self.get_logger().info(f"Received command for sched_manager: {cmd}")
-      self.shed_manager_cmd(cmd, topic_output=True)
+      self.sched_manager_cmd(cmd, topic_output=True)
 
     def handle_request_cgroup(self, request, response):
       # check if already exists
-      succ, res = self.shed_manager_cmd(f"sched {request.cgroup_path}")
+      succ, res = self.sched_manager_cmd(f"sched {request.cgroup_path}")
       if not succ:
         response.success = False
         return
@@ -92,13 +93,13 @@ class CgroupServer(Node):
         return
 
       # attach
-      succ, res = self.shed_manager_cmd(f"attach none {request.cgroup_path}")
+      succ, res = self.sched_manager_cmd(f"attach none {request.cgroup_path}")
       response.success = succ
 
       return response
 
     def exit(self):
-      self.shed_manager_cmd("exit")
+      self.sched_manager_cmd("exit")
 
 def main(args=None):
   rclpy.init(args=args)
