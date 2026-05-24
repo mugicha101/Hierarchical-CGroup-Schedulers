@@ -134,6 +134,10 @@ Run `sched_manager.py <scx build dir>` as a Python 3 program, which acts as an C
 
 `<scx build dir>` should look something like `/home/.../linux/tools/sched_ext/` if using the mainline kernel.
 
+NOTE: if you get `ERR: Root cgroup already has attached sub-cgroup /sys/fs/cgroup/<cgroup>. Use --force to overwrite.`
+
+run `echo S | sudo tee /proc/sysrq-trigger` to detach SCHED_EXT schedulers.
+
 ### Loading Configuration Files
 
 Example hierarchy defined in `example_cgroup_config.json`.
