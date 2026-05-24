@@ -68,7 +68,7 @@ int err = bpf_prog_test_run_opts(prog_fd, &opts);
 
 TODO: implement weight change + conditional yielding by using mmaped arrays
 - array mapping cpu -> running cgroup weight + pid (to determine which cgroup weight + cpu a pid is mapped to)
-- array mapping cgroup weight -> max weight in system + cpu set
+- array mapping cgroup weight -> max pending weight (in global dsq) + cpu set
 - ringbuffer to handle weight update requests on enqueue in any FP scheduler
 
 ### Cgroup Hierarchical Scheduler Limitations and Behavior
