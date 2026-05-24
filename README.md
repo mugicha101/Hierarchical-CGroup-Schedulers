@@ -46,6 +46,11 @@ Brief description of schedulers (see their bpf code for more details)
 Example of setting weight via `/sys/fs/bpf/task_weights`
 ```c
 #include <bpf/bpf.h>
+#include <fcntl.h>
+
+#ifndef PIDFD_THREAD
+#define PIDFD_THREAD O_EXCL
+#endif
 
 // on thread init
 int file_fd = bpf_obj_get("/sys/fs/bpf/task_weights");
