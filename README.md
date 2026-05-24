@@ -43,6 +43,13 @@ Brief description of schedulers (see their bpf code for more details)
 
 - scx_eaf: FIFO Scheduler (Earliest Arrival First). Only supports tasks.
 
+Example of setting weight via `/sys/fs/bpf/task_weights`
+```c
+int file_fd = bpf_obj_get("/sys/fs/bpf/task_weights");
+int err = bpf_map_update_elem(file_fd, &pid_fd, &weight, BPF_ANY);
+sched_yield(); // task weight only updated on enqueue
+```
+
 Example of calling `set_weight` from a C program:
 ```c
 #include <bpf/bpf.h>
@@ -58,6 +65,11 @@ DECLARE_LIBBPF_OPTS(bpf_test_run_opts, opts,
 );
 int err = bpf_prog_test_run_opts(prog_fd, &opts);
 ```
+
+TODO: implement weight change + conditional yielding by using mmaped arrays
+- array mapping cpu -> running cgroup weight + pid (to determine which cgroup weight + cpu a pid is mapped to)
+- array mapping cgroup weight -> max weight in system + cpu set
+- ringbuffer to handle weight update requests on enqueue in any FP scheduler
 
 ### Cgroup Hierarchical Scheduler Limitations and Behavior
 
