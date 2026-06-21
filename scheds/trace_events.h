@@ -260,5 +260,10 @@ TRACE_EVENT(struct sched_trace_event_func_end, SCHED_TRACE_FUNC_END, \
 #define SCX_DSQ_LOCAL_ON 13835058055282163712ULL
 #endif
 
+#if SCX_ENQ_WAKEUP == 0
+#undef SCX_ENQ_WAKEUP
+#define SCX_ENQ_WAKEUP 1ULL
+#endif
+
 // #undef NR_CPUS
 // #define NR_CPUS 4
