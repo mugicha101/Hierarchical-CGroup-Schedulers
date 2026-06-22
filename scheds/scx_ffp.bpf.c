@@ -711,7 +711,7 @@ s32 BPF_STRUCT_OPS(ffp_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake
 
 void BPF_STRUCT_OPS(ffp_enqueue, struct task_struct *p, u64 enq_flags) {
   TRACE_FUNC_START("enqueue");
-  if(unlikely((enq_flags & SCX_ENQ_WAKEUP) == 0)) { // wakeup should be handled in select_cpu, not enqueue
+  if (unlikely((enq_flags & SCX_ENQ_WAKEUP))) { // wakeup should be handled in select_cpu, not enqueue
 		scx_bpf_exit(1, "Wakeup flags present in enqueue path");
 		return;
 	}
@@ -863,7 +863,7 @@ SCX_OPS_DEFINE(ffp_ops,
 	// SCX_OPS_SWITCH_PARTIAL: does not assign tasks to sched_ext by default
 	// SCX_OPS_ENQ_LAST: if no work on subscheduler, enqueues current running task rather than continuing it and calls dispatch again
 	//									 allows for skipping an idle sub and running next sub instead of continuing prev sub
-	.flags			= SCX_OPS_SWITCH_PARTIAL | SCX_OPS_ENQ_LAST,
+	.flags			= SCX_OPS_SWITCH_PARTIAL | SCX_OPS_ENQ_LAST | SCX_OPS_KEEP_BUILTIN_IDLE | SCX_OPS_BUILTIN_IDLE_PER_NODE | SCX_OPS_ENQ_MIGRATION_DISABLED,
 	// .dump			= (void *)ffp_dump,
 
 	// task scheduling (should not be called)

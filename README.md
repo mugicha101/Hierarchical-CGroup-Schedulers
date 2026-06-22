@@ -33,6 +33,8 @@ To ensure scheduler binaries can load schedulers without sudo, change the capabi
 find ./build/bin/ -type f -name "scx_*" -executable -exec setcap 'cap_bpf,cap_perfmon=ep' {} \;
 ```
 
+Additionally, if running without the cgroup_server node, you need to chown /sys/fs/bpf so that the scheduler binaries can access them without root.
+
 Built schedulers can be run like so: `./build/bin/scx_wrr`.
 
 Brief description of schedulers (see their bpf code for more details)
