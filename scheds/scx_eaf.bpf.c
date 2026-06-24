@@ -38,7 +38,7 @@ void BPF_STRUCT_OPS(eaf_dispatch, s32 cpu, struct task_struct *prev)
 
 	// bpf_printk("[INFO] [EAF] [DISPATCH] cgroup=%d cpu=%d", cgroup_id, cpu);
 	TRACE_FUNC_START("dispatch");
-	scx_bpf_dsq_move_to_local(dsq_id);
+	scx_bpf_dsq_move_to_local(dsq_id, 0);
 	TRACE_FUNC_END("dispatch", "");
 }
 
