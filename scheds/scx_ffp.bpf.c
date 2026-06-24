@@ -37,7 +37,9 @@ char _license[] SEC("license") = "GPL";
 // TODO: update kernel and use SCX_ENQ_IMMED to resolve race condition where both dispatch and enqueue move to local dsq, causing multiple tasks in local dsq
 
 const volatile u64 cgroup_id;
+const volatile bool preemptive; // use kicks instead of slices
 u64 self_cgroup_weight;
+u64 slice = 1000000ULL; // 1ms
 
 #define MAX_SUB_SCHEDS 64 // must be power of 2
 #define DEFAULT_CGROUP_WEIGHT 1
@@ -213,6 +215,29 @@ inline struct global_running_data *fetch_running() {
 	return bpf_map_lookup_elem(&global_running, &idx);
 }
 
+// per-cpu stats
+struct cpu_stats {
+	u64 n_select_cpu_calls;
+	u64 n_dispatch_calls;
+	u64 n_enqueue_calls;
+	u64 n_pick_cpu_calls;
+	u64 n_ldsq_insertions;
+	u64 n_gdsq_insertions;
+	u64 n_kicks;
+	u64 kick_wcet;
+	u64 pick_cpu_wcet;
+	u64 dispatch_wcet;
+	u64 search_wcet;
+	u64 task_dispatch_wcet;
+};
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, NR_CPUS);
+	__type(key, u32);
+	__type(value, struct cpu_stats);
+	__uint(pinning, LIBBPF_PIN_BY_NAME);
+} ffp_cpu_stats SEC(".maps");
+
 // global weight of each task (should not change after enqueue due to fixed priority, re-enqueue if does change)
 struct {
 	__uint(type, BPF_MAP_TYPE_TASK_STORAGE);
@@ -262,6 +287,7 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(ffp_init)
 {
 	TRACE_FUNC_START("init");
 	bpf_printk("[INFO] [FP] [INIT] cgroup=%d", cgroup_id);
+	bpf_printk("SCX_OPS_ENQ_MIGRATION_DISABLED: %d", SCX_OPS_ENQ_MIGRATION_DISABLED);
 	TRACE_EVENT(struct sched_trace_event_self, SCHED_TRACE_SELF,
 		e->cgrp_id = cgroup_id;
 		e->weight = DEFAULT_CGROUP_WEIGHT;
@@ -475,9 +501,11 @@ void BPF_STRUCT_OPS(ffp_cgroup_set_bandwidth, struct cgroup *cgrp,
 }
 
 // attempt to dispatch a task from global dsq to local dsq
-static __always_inline bool try_task_dispatch(u32 cpu, struct global_running_data *grd, struct cpu_sched_state *ss) {
+static __always_inline bool try_task_dispatch(u32 cpu, struct global_running_data *grd, struct cpu_sched_state *ss, struct cpu_stats *stats) {
 	TRACE_FUNC_START("try_task_dispatch")
-	if (unlikely(cpu >= NR_CPUS || !ss)) return false; // for verifier, should not happen
+	if (unlikely(cpu >= NR_CPUS || !ss || !stats)) return false; // for verifier, should not happen
+
+	u64 start = bpf_ktime_get_ns();
 
 	// move highest weight in global dsq that can run on this cpu to local dsq
 	struct task_struct *t;
@@ -493,6 +521,9 @@ static __always_inline bool try_task_dispatch(u32 cpu, struct global_running_dat
 			break;
 		}
 	}
+	
+	u64 delay = bpf_ktime_get_ns() - start;
+	if (unlikely(delay > stats->task_dispatch_wcet)) stats->task_dispatch_wcet = delay;
 
 	TRACE_FUNC_END("try_task_dispatch", moved ? "MOVED" : "NOT MOVED");
 	return moved;
@@ -537,18 +568,25 @@ static __always_inline void sync_priority_order(struct global_data *global, stru
 void BPF_STRUCT_OPS(ffp_dispatch, s32 cpu, struct task_struct *prev)
 {
 	if (unlikely(cpu >= NR_CPUS)) return; // for testing limited CPUs
-
+	
 	// bpf_printk("[INFO] [FP] [DISPATCH] dispatching on cpu %u", cpu);
 	TRACE_FUNC_START("dispatch");
+	u64 start = bpf_ktime_get_ns();
 
 	u32 ucpu = cpu;
 	struct global_data *global = fetch_global();
 	struct global_running_data *grd = fetch_running();
 	struct cpu_sched_state *ss = bpf_map_lookup_elem(&sched_state, &ucpu);
-	if (unlikely(!global) || unlikely(!ss) || unlikely(!grd)) return; // for verifier, should not happen
+	const u32 zero = 0;
+	struct cpu_stats *stats = bpf_map_lookup_elem(&ffp_cpu_stats, &zero);
+	if (unlikely(!global || !ss || !grd || !stats)) return; // for verifier, should not happen
+
+	++stats->n_dispatch_calls;
 
 	// dispatch task
-	if (try_task_dispatch(cpu, grd, ss)) {
+	if (try_task_dispatch(cpu, grd, ss, stats)) {
+		u64 delay = bpf_ktime_get_ns() - start;
+		if (unlikely(delay > stats->dispatch_wcet)) stats->dispatch_wcet = delay;
 		TRACE_FUNC_END("dispatch", "DISPATCHED TASK");
 		return;
 	}
@@ -571,6 +609,8 @@ void BPF_STRUCT_OPS(ffp_dispatch, s32 cpu, struct task_struct *prev)
 				e->idx = idx;
 				e->success = true;
 			);
+			u64 delay = bpf_ktime_get_ns() - start;
+			if (unlikely(delay > stats->dispatch_wcet)) stats->dispatch_wcet = delay;
       TRACE_FUNC_END("dispatch", "DISPATCHED CGROUP");
       return;
     }
@@ -579,6 +619,9 @@ void BPF_STRUCT_OPS(ffp_dispatch, s32 cpu, struct task_struct *prev)
 			e->success = false;
 		);
 	}
+	
+	u64 delay = bpf_ktime_get_ns() - start;
+	if (unlikely(delay > stats->dispatch_wcet)) stats->dispatch_wcet = delay;
 	TRACE_FUNC_END("dispatch", "NO READY SUBS");
 	return; // no sub schedulers
 }
@@ -605,6 +648,7 @@ s32 BPF_STRUCT_OPS(ffp_cgroup_init, struct cgroup *cgrp, struct scx_cgroup_init_
 	);
 	bpf_map_update_elem(&cgroup_weights, &cgrp_id, &weight, BPF_ANY);
 	TRACE_FUNC_END("cgroup_init", "");
+	if (preemptive) slice = SCX_SLICE_INF;
 	return 0;
 }
 
@@ -624,12 +668,14 @@ u64 __always_inline get_task_weight(struct task_struct *p) {
 // called from either select_cpu or enqueue
 // moves directly into dsq (either local cpu dsq if high enough priority or global otherwise)
 // if ran in select_cpu, will skip enqueue
-void __always_inline pick_cpu(struct task_struct *p, s32 prev_cpu, u64 enq_flags) {
+void __always_inline pick_cpu(struct task_struct *p, s32 prev_cpu, u64 enq_flags, struct cpu_stats *stats) {
   TRACE_FUNC_START("pick_cpu");
   prev_cpu = prev_cpu & (NR_CPUS - 1); // for verifier
   struct global_data *global = fetch_global();
   struct global_running_data *grd = fetch_running();
-  if (unlikely(!global || !grd)) return; // for verifier, should not happen
+  if (unlikely(!global || !grd || !stats)) return; // for verifier, should not happen
+
+	++stats->n_pick_cpu_calls;
 
   // setup
   int target_cpu = -1;
@@ -643,8 +689,7 @@ void __always_inline pick_cpu(struct task_struct *p, s32 prev_cpu, u64 enq_flags
 		target_cpu = prev_cpu;
 		if (scx_bpf_test_and_clear_cpu_idle(prev_cpu)) goto dispatch_idle;
 
-		weight_tuple_t running_weight = grd->cpu_running_weight[prev_cpu];
-		if (task_weight <= running_weight) goto dispatch_fail;
+		if (!preemptive || task_weight <= grd->cpu_running_weight[prev_cpu]) goto dispatch_fail;
 		
 		goto dispatch_preempt;
 	}
@@ -663,8 +708,11 @@ void __always_inline pick_cpu(struct task_struct *p, s32 prev_cpu, u64 enq_flags
   if (target_cpu >= 0) goto dispatch_idle;
 
   // MIN WEIGHT SEARCH
+
+	if (!preemptive) goto dispatch_fail;
   
   // tie break: prev cpu (misc 2) > cpu on prev numa node (misc 1) > any cpu (misc 0)
+	u64 search_start = bpf_ktime_get_ns();
   target_cpu = -1;
   weight_tuple_t target_weight = U128_MAX;
 	u32 cpu;
@@ -679,14 +727,21 @@ void __always_inline pick_cpu(struct task_struct *p, s32 prev_cpu, u64 enq_flags
     }
   }
   target_weight &= ~(U128_MAX << WT_MISC_SHIFT); // remove misc data (only used for tie breaks)
+	u64 search_delay = bpf_ktime_get_ns() - search_start;
+	if (unlikely(search_delay > stats->search_wcet)) stats->search_wcet = search_delay;
   if (task_weight <= target_weight) goto dispatch_fail;
 
   // DISPATCH
 	dispatch_preempt:
-  scx_bpf_kick_cpu(target_cpu & (NR_CPUS - 1), (u64)SCX_KICK_PREEMPT);
+	u64 kick_start = bpf_ktime_get_ns();
+	scx_bpf_kick_cpu(target_cpu & (NR_CPUS - 1), (u64)SCX_KICK_PREEMPT);
+	u64 kick_delay = bpf_ktime_get_ns() - kick_start;
+	if (unlikely(kick_delay > stats->kick_wcet)) stats->kick_wcet = kick_delay;
+	++stats->n_kicks;
 
   dispatch_idle:
-  scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | (target_cpu & (NR_CPUS - 1)), SCX_SLICE_INF, 0);
+  scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | (target_cpu & (NR_CPUS - 1)), slice, 0);
+	++stats->n_ldsq_insertions;
 
 	TRACE_FUNC_END("pick_cpu", "");
 	return;
@@ -696,7 +751,8 @@ void __always_inline pick_cpu(struct task_struct *p, s32 prev_cpu, u64 enq_flags
 
 	// enqueue to global dsq instead
 	u64 vtime = WT_VTIME_FROM_LOWER(WT_LOWER(task_weight));
-	scx_bpf_dsq_insert_vtime(p, dsq_id, SCX_SLICE_INF, vtime, enq_flags);
+	scx_bpf_dsq_insert_vtime(p, dsq_id, slice, vtime, enq_flags);
+	++stats->n_gdsq_insertions;
 	TRACE_FUNC_END("pick_cpu", "GLOBAL DSQ");
 }
 
@@ -704,18 +760,28 @@ void __always_inline pick_cpu(struct task_struct *p, s32 prev_cpu, u64 enq_flags
 s32 BPF_STRUCT_OPS(ffp_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake_flags)
 {
   TRACE_FUNC_START("select_cpu");
-  pick_cpu(p, prev_cpu, SCX_ENQ_WAKEUP | wake_flags);
+	const u32 zero = 0;
+	struct cpu_stats *stats = bpf_map_lookup_elem(&ffp_cpu_stats, &zero);
+	if (unlikely(!stats)) return prev_cpu; // for verifier, should not happen
+	++stats->n_select_cpu_calls;
+	u64 start = bpf_ktime_get_ns();
+  pick_cpu(p, prev_cpu, SCX_ENQ_WAKEUP | wake_flags, stats);
+	u64 delay = bpf_ktime_get_ns() - start;
+	if (unlikely(delay > stats->pick_cpu_wcet)) stats->pick_cpu_wcet = delay;
   TRACE_FUNC_END("select_cpu", "");
   return prev_cpu; // should be ignored since enqueue shouldn't run
 }
 
 void BPF_STRUCT_OPS(ffp_enqueue, struct task_struct *p, u64 enq_flags) {
   TRACE_FUNC_START("enqueue");
-  if (unlikely((enq_flags & SCX_ENQ_WAKEUP))) { // wakeup should be handled in select_cpu, not enqueue
-		scx_bpf_exit(1, "Wakeup flags present in enqueue path");
-		return;
-	}
-  pick_cpu(p, scx_bpf_task_cpu(p), enq_flags);
+	const u32 zero = 0;
+	struct cpu_stats *stats = bpf_map_lookup_elem(&ffp_cpu_stats, &zero);
+	if (unlikely(!stats)) return; // for verifier, should not happen
+	++stats->n_enqueue_calls;
+	u64 start = bpf_ktime_get_ns();
+  pick_cpu(p, scx_bpf_task_cpu(p), enq_flags, stats);
+	u64 delay = bpf_ktime_get_ns() - start;
+	if (unlikely(delay > stats->pick_cpu_wcet)) stats->pick_cpu_wcet = delay;
   TRACE_FUNC_END("enqueue", "");
 }
 
@@ -866,7 +932,7 @@ SCX_OPS_DEFINE(ffp_ops,
 	.flags			= SCX_OPS_SWITCH_PARTIAL | SCX_OPS_ENQ_LAST | SCX_OPS_KEEP_BUILTIN_IDLE | SCX_OPS_BUILTIN_IDLE_PER_NODE | SCX_OPS_ENQ_MIGRATION_DISABLED,
 	// .dump			= (void *)ffp_dump,
 
-	// task scheduling (should not be called)
+	// task scheduling
 	.select_cpu		= (void *)ffp_select_cpu,
 	.enqueue		= (void *)ffp_enqueue,
 	.dequeue		= (void *)ffp_dequeue,
@@ -880,6 +946,7 @@ SCX_OPS_DEFINE(ffp_ops,
 	.exit_task		= (void *)ffp_exit_task,
 	.enable			= (void *)ffp_enable,
 	.disable		= (void *)ffp_disable,
+	// .tick 			= (void *)ffp_tick,
 	// .dump_task		= (void *)ffp_dump_task,
 
 	// subscheduling support

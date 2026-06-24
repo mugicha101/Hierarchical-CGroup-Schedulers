@@ -1094,7 +1094,7 @@ SCX_OPS_DEFINE(fp_ops,
 	// SCX_OPS_SWITCH_PARTIAL: does not assign tasks to sched_ext by default
 	// SCX_OPS_ENQ_LAST: if no work on subscheduler, enqueues current running task rather than continuing it and calls dispatch again
 	//									 allows for skipping an idle sub and running next sub instead of continuing prev sub
-	.flags			= SCX_OPS_SWITCH_PARTIAL | SCX_OPS_ENQ_LAST,
+	.flags			= SCX_OPS_SWITCH_PARTIAL | SCX_OPS_ENQ_LAST | SCX_OPS_ENQ_MIGRATION_DISABLED,
 	// .dump			= (void *)fp_dump,
 
 	// task scheduling (should not be called)

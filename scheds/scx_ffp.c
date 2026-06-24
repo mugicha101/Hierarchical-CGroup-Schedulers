@@ -136,6 +136,7 @@ restart:
 		}
 		skel->struct_ops.ffp_ops->sub_cgroup_id = st.st_ino;
 		skel->rodata->cgroup_id = st.st_ino;
+		skel->rodata->preemptive = true;
 	}
 	skel->rodata->trace_enabled = trace_path != NULL;
 
