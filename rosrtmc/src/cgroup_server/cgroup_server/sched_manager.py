@@ -139,6 +139,20 @@ class ScxFP(Scheduler):
   def ack_output(self):
     return "Scheduler Attached"
 
+class ScxFFP(Scheduler):
+  def popen(self, scx_build_path):
+    bin_path = f"{scx_build_path}/bin/scx_ffp"
+    check_sched_capabilities(bin_path)
+    cmd = [bin_path]
+    if self.cgroup:
+      cmd += ["-c", self.cgroup]
+    if self.trace_path:
+      cmd += ["-t", self.trace_path]
+    self.process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+
+  def ack_output(self):
+    return "Scheduler Attached"
+
 class ScxWRR(Scheduler):
   def popen(self, scx_build_path):
     bin_path = f"{scx_build_path}/bin/scx_wrr"
@@ -169,6 +183,7 @@ class ScxEAF(Scheduler):
 
 POLICIES = {
   "scx_fp": ScxFP,
+  "scx_ffp": ScxFFP,
   "scx_wrr": ScxWRR,
   "scx_eaf": ScxEAF
 }
