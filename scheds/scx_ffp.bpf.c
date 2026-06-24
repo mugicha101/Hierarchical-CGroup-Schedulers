@@ -1,5 +1,6 @@
 #include <scx/common.bpf.h>
 
+#include "bpf/bpf_helpers.h"
 #include "trace_events.h"
 CREATE_TRACE_BUFF();
 
@@ -682,8 +683,17 @@ void __always_inline pick_cpu(struct task_struct *p, s32 prev_cpu, u64 enq_flags
   bool nmig = is_migration_disabled(p);
   weight_tuple_t task_weight = WT_FROM_FIELDS(get_task_weight(p), nmig, self_cgroup_weight, 0);
 
-	// NON MIGRATEABLE CASE: just need to check prev cpu
-	if (unlikely(nmig)) {
+	bool debug = (bpf_get_prandom_u32() & 0xfff) == 0;
+
+	// debug: print task info
+	if (unlikely(debug)) {
+		u64 mask_bits;
+		BPF_CORE_READ_INTO(&mask_bits, p->cpus_ptr, bits[0]);
+		bpf_printk("[INFO] [FP] [PICK CPU] cpu=%d pid=%d weight=%llu nmig=%d cpus_ptr=%lx", bpf_get_smp_processor_id(), p->pid, task_weight, nmig, mask_bits);
+	}
+
+	// NON MIGRATEABLE / CPU PINNED CASE: just need to check prev cpu
+	if (unlikely(nmig) || p->nr_cpus_allowed == 1) {
 		if (unlikely(!bpf_cpumask_test_cpu(prev_cpu, p->cpus_ptr))) goto dispatch_fail;
 
 		target_cpu = prev_cpu;
@@ -733,7 +743,34 @@ void __always_inline pick_cpu(struct task_struct *p, s32 prev_cpu, u64 enq_flags
 
   // DISPATCH
 	dispatch_preempt:
+
+	
+	// EDGE CASE: https://github.com/sched-ext/scx/pull/1094/commits/7d8b8e75812ab62454c734683de4944938b3edc2
+	// if per-cpu kthread woke up this task, then skip the kick
+	if (target_cpu == prev_cpu && target_cpu == bpf_get_smp_processor_id()) {
+		struct task_struct *curr = bpf_get_current_task_btf();
+		if ((curr->flags & PF_KTHREAD) && curr->nr_cpus_allowed == 1) goto dispatch_idle;
+	}
+
 	u64 kick_start = bpf_ktime_get_ns();
+
+	// debug: print whats being kicked
+	if (unlikely(debug)) {
+		bpf_printk("[INFO] [FP] [PICK CPU] Kicking cpu %d", target_cpu);
+
+		bpf_rcu_read_lock();
+		bpf_for(cpu, 0, 16) {
+			if (unlikely(cpu >= NR_CPUS)) break;
+
+			struct task_struct *curr = scx_bpf_cpu_curr(cpu);
+			char comm[64] = {'\0'};
+			if (curr) BPF_CORE_READ_STR_INTO(&comm, curr, comm);
+			int policy = curr ? (int)BPF_CORE_READ(curr, policy) : -1;
+			bpf_printk("[INFO] [FP] [PICK CPU] cpu=%d pid=%d policy=%d comm=%s", cpu, curr ? curr->pid : -1, policy, comm);
+		}
+		bpf_rcu_read_unlock();
+	}
+
 	scx_bpf_kick_cpu(target_cpu & (NR_CPUS - 1), (u64)SCX_KICK_PREEMPT);
 	u64 kick_delay = bpf_ktime_get_ns() - kick_start;
 	if (unlikely(kick_delay > stats->kick_wcet)) stats->kick_wcet = kick_delay;
