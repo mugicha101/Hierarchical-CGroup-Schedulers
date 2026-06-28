@@ -265,5 +265,10 @@ TRACE_EVENT(struct sched_trace_event_func_end, SCHED_TRACE_FUNC_END, \
 #define SCX_ENQ_WAKEUP 1ULL
 #endif
 
+#if SCX_ENQ_PREEMPT == 0
+#undef SCX_ENQ_PREEMPT
+#define SCX_ENQ_PREEMPT (1ULL << 32)
+#endif
+
 // #undef NR_CPUS
 // #define NR_CPUS 4

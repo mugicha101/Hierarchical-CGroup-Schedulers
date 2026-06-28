@@ -1,6 +1,7 @@
 #include <scx/common.bpf.h>
 
 #include "bpf/bpf_helpers.h"
+#include "scx/enums.bpf.h"
 #include "trace_events.h"
 CREATE_TRACE_BUFF();
 
@@ -64,6 +65,18 @@ u64 slice = 1000000ULL; // 1ms
 # else
 #  define smp_wmb() __sync_synchronize()
 # endif
+#endif
+
+#ifndef SCHED_EXT
+#define SCHED_EXT 7
+#endif
+
+#ifndef SCHED_FIFO
+#define SCHED_FIFO 1
+#endif
+
+#ifndef SCHED_RR
+#define SCHED_RR 2
 #endif
 
 UEI_DEFINE(uei);
@@ -219,7 +232,7 @@ inline struct global_running_data *fetch_running() {
 // per-cpu stats
 struct cpu_stats {
 	u64 n_select_cpu_calls;
-	u64 n_dispatch_calls;
+	u64 n_root_dispatch_calls;
 	u64 n_enqueue_calls;
 	u64 n_pick_cpu_calls;
 	u64 n_ldsq_insertions;
@@ -227,7 +240,7 @@ struct cpu_stats {
 	u64 n_kicks;
 	u64 kick_wcet;
 	u64 pick_cpu_wcet;
-	u64 dispatch_wcet;
+	u64 root_dispatch_wcet;
 	u64 search_wcet;
 	u64 task_dispatch_wcet;
 };
@@ -288,7 +301,7 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(ffp_init)
 {
 	TRACE_FUNC_START("init");
 	bpf_printk("[INFO] [FP] [INIT] cgroup=%d", cgroup_id);
-	bpf_printk("SCX_OPS_ENQ_MIGRATION_DISABLED: %d", SCX_OPS_ENQ_MIGRATION_DISABLED);
+	bpf_printk("SCX_ENQ_PREEMPT: %llu", SCX_ENQ_PREEMPT);
 	TRACE_EVENT(struct sched_trace_event_self, SCHED_TRACE_SELF,
 		e->cgrp_id = cgroup_id;
 		e->weight = DEFAULT_CGROUP_WEIGHT;
@@ -582,12 +595,12 @@ void BPF_STRUCT_OPS(ffp_dispatch, s32 cpu, struct task_struct *prev)
 	struct cpu_stats *stats = bpf_map_lookup_elem(&ffp_cpu_stats, &zero);
 	if (unlikely(!global || !ss || !grd || !stats)) return; // for verifier, should not happen
 
-	++stats->n_dispatch_calls;
+	if (cgroup_id == 0) ++stats->n_root_dispatch_calls;
 
 	// dispatch task
 	if (try_task_dispatch(cpu, grd, ss, stats)) {
 		u64 delay = bpf_ktime_get_ns() - start;
-		if (unlikely(delay > stats->dispatch_wcet)) stats->dispatch_wcet = delay;
+		if (unlikely(cgroup_id == 0 && delay > stats->root_dispatch_wcet)) stats->root_dispatch_wcet = delay;
 		TRACE_FUNC_END("dispatch", "DISPATCHED TASK");
 		return;
 	}
@@ -611,7 +624,7 @@ void BPF_STRUCT_OPS(ffp_dispatch, s32 cpu, struct task_struct *prev)
 				e->success = true;
 			);
 			u64 delay = bpf_ktime_get_ns() - start;
-			if (unlikely(delay > stats->dispatch_wcet)) stats->dispatch_wcet = delay;
+			if (unlikely(cgroup_id == 0 && delay > stats->root_dispatch_wcet)) stats->root_dispatch_wcet = delay;
       TRACE_FUNC_END("dispatch", "DISPATCHED CGROUP");
       return;
     }
@@ -622,7 +635,7 @@ void BPF_STRUCT_OPS(ffp_dispatch, s32 cpu, struct task_struct *prev)
 	}
 	
 	u64 delay = bpf_ktime_get_ns() - start;
-	if (unlikely(delay > stats->dispatch_wcet)) stats->dispatch_wcet = delay;
+	if (unlikely(cgroup_id == 0 && delay > stats->root_dispatch_wcet)) stats->root_dispatch_wcet = delay;
 	TRACE_FUNC_END("dispatch", "NO READY SUBS");
 	return; // no sub schedulers
 }
@@ -679,43 +692,39 @@ void __always_inline pick_cpu(struct task_struct *p, s32 prev_cpu, u64 enq_flags
 	++stats->n_pick_cpu_calls;
 
   // setup
-  int target_cpu = -1;
+  int target_cpu = prev_cpu;
   bool nmig = is_migration_disabled(p);
   weight_tuple_t task_weight = WT_FROM_FIELDS(get_task_weight(p), nmig, self_cgroup_weight, 0);
 
-	bool debug = (bpf_get_prandom_u32() & 0xfff) == 0;
+	// IDLE SEARCH
 
-	// debug: print task info
-	if (unlikely(debug)) {
-		u64 mask_bits;
-		BPF_CORE_READ_INTO(&mask_bits, p->cpus_ptr, bits[0]);
-		bpf_printk("[INFO] [FP] [PICK CPU] cpu=%d pid=%d weight=%llu nmig=%d cpus_ptr=%lx", bpf_get_smp_processor_id(), p->pid, task_weight, nmig, mask_bits);
+	// prev cpu
+	if (likely(bpf_cpumask_test_cpu(prev_cpu, p->cpus_ptr))) {
+		if (scx_bpf_test_and_clear_cpu_idle(prev_cpu)) {
+			goto dispatch;
+		}
+
+		// EDGE CASE: https://github.com/sched-ext/scx/pull/1094/commits/7d8b8e75812ab62454c734683de4944938b3edc2
+		// if per-cpu kthread woke up this task, then treat prev cpu as idle
+		if (prev_cpu == bpf_get_smp_processor_id()) {
+			struct task_struct *curr = bpf_get_current_task_btf();
+			if ((curr->flags & PF_KTHREAD) && curr->nr_cpus_allowed == 1) {
+				goto dispatch;
+			}
+		}
 	}
 
 	// NON MIGRATEABLE / CPU PINNED CASE: just need to check prev cpu
 	if (unlikely(nmig) || p->nr_cpus_allowed == 1) {
-		if (unlikely(!bpf_cpumask_test_cpu(prev_cpu, p->cpus_ptr))) goto dispatch_fail;
-
-		target_cpu = prev_cpu;
-		if (scx_bpf_test_and_clear_cpu_idle(prev_cpu)) goto dispatch_idle;
-
 		if (!preemptive || task_weight <= grd->cpu_running_weight[prev_cpu]) goto dispatch_fail;
 		
-		goto dispatch_preempt;
-	}
-
-  // IDLE SEARCH
-
-  // prev cpu
-	if (bpf_cpumask_test_cpu(prev_cpu, p->cpus_ptr) && scx_bpf_test_and_clear_cpu_idle(prev_cpu)) {
-		target_cpu = prev_cpu;
-		goto dispatch_idle;
+		goto dispatch;
 	}
 
   // nearest idle cpu in numa topology
   s32 prev_node = scx_bpf_cpu_node(prev_cpu);
   target_cpu = scx_bpf_pick_idle_cpu_node(p->cpus_ptr, prev_node, 0);
-  if (target_cpu >= 0) goto dispatch_idle;
+  if (target_cpu >= 0) goto dispatch;
 
   // MIN WEIGHT SEARCH
 
@@ -742,42 +751,10 @@ void __always_inline pick_cpu(struct task_struct *p, s32 prev_cpu, u64 enq_flags
   if (task_weight <= target_weight) goto dispatch_fail;
 
   // DISPATCH
-	dispatch_preempt:
 
-	
-	// EDGE CASE: https://github.com/sched-ext/scx/pull/1094/commits/7d8b8e75812ab62454c734683de4944938b3edc2
-	// if per-cpu kthread woke up this task, then skip the kick
-	if (target_cpu == prev_cpu && target_cpu == bpf_get_smp_processor_id()) {
-		struct task_struct *curr = bpf_get_current_task_btf();
-		if ((curr->flags & PF_KTHREAD) && curr->nr_cpus_allowed == 1) goto dispatch_idle;
-	}
-
-	u64 kick_start = bpf_ktime_get_ns();
-
-	// debug: print whats being kicked
-	if (unlikely(debug)) {
-		bpf_printk("[INFO] [FP] [PICK CPU] Kicking cpu %d", target_cpu);
-
-		bpf_rcu_read_lock();
-		bpf_for(cpu, 0, 16) {
-			if (unlikely(cpu >= NR_CPUS)) break;
-
-			struct task_struct *curr = scx_bpf_cpu_curr(cpu);
-			char comm[64] = {'\0'};
-			if (curr) BPF_CORE_READ_STR_INTO(&comm, curr, comm);
-			int policy = curr ? (int)BPF_CORE_READ(curr, policy) : -1;
-			bpf_printk("[INFO] [FP] [PICK CPU] cpu=%d pid=%d policy=%d comm=%s", cpu, curr ? curr->pid : -1, policy, comm);
-		}
-		bpf_rcu_read_unlock();
-	}
-
-	scx_bpf_kick_cpu(target_cpu & (NR_CPUS - 1), (u64)SCX_KICK_PREEMPT);
-	u64 kick_delay = bpf_ktime_get_ns() - kick_start;
-	if (unlikely(kick_delay > stats->kick_wcet)) stats->kick_wcet = kick_delay;
-	++stats->n_kicks;
-
-  dispatch_idle:
-  scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | (target_cpu & (NR_CPUS - 1)), slice, 0);
+	dispatch:
+	// SCX_ENQ_PREEMPT handles the kicking
+  scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | (target_cpu & (NR_CPUS - 1)), slice, SCX_ENQ_PREEMPT);
 	++stats->n_ldsq_insertions;
 
 	TRACE_FUNC_END("pick_cpu", "");
@@ -855,6 +832,22 @@ void BPF_STRUCT_OPS(ffp_running, struct task_struct *p)
 	if (unlikely(!grd)) return; // for verifier, should not happen
 
 	u32 cpu = bpf_get_smp_processor_id();
+
+	// check policy of task
+	// for SCHED_FIFO or SCHED_RR, set weight to MAX since sched_ext cannot kick it
+	// for SCHED_EXT find their weight in task_weights map
+	// for other policies, set weight to 0 since they are lower priority than SCHED_EXT
+	int policy = BPF_CORE_READ(p, policy);
+	if (policy != SCHED_EXT) {
+		bpf_printk("[WARN] [FP] [RUNNING] Task %d has policy %d", p->pid, policy);
+		if (policy == SCHED_FIFO || policy == SCHED_RR) {
+			grd->cpu_running_weight[cpu] = U128_MAX;
+			return;
+		} else {
+			grd->cpu_running_weight[cpu] = 0;
+			return;
+		}
+	}
 	weight_tuple_t wt = WT_FROM_FIELDS(get_task_weight(p), is_migration_disabled(p), self_cgroup_weight, 0);
 	grd->cpu_running_weight[cpu] = wt;
 }
