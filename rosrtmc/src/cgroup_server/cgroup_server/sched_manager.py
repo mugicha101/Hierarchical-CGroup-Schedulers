@@ -375,8 +375,10 @@ class SchedManager(cmd.Cmd):
     self.monitor_thread.start()
 
   def monitor_thread_func(self):
+    print("Monitor thread running on TID", threading.get_native_id())
     while True:
-      events = self.selector.select(timeout=0.5)
+      time.sleep(0.1)
+      events = self.selector.select(timeout=0)
       written = False
       for key, mask in events:
         pipe = key.fileobj
