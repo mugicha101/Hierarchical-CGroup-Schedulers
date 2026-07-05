@@ -1,0 +1,19 @@
+{
+  "trace_dir": "/home/alexy/tj_sched_ext_kernel/tools/sched_ext/traces",
+  "policy": "scx_ffp",
+  "trace": false,
+  "subs": {
+    "foo": {
+      "policy": "scx_ffp",
+      "weight": 2,
+      "trace": false,
+      "cpus": "0-3"
+    },
+    "other": {
+      "policy": "none",
+      "weight": 1,
+      "trace": false,
+      "cpus": "4-15"
+    }
+  }
+}
