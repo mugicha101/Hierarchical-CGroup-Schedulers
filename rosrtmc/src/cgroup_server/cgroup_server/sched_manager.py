@@ -311,6 +311,13 @@ class CgroupManager:
       raise ValueError(f"Cgroup {self.path} does not support cpu.weight.")
     with open(weight_file, "w") as f:
       f.write(str(weight))
+  
+  def get_cpus(self):
+    cpuset_file = self.path / "cpuset.cpus"
+    if not cpuset_file.exists():
+      return None
+    with open(cpuset_file, "r") as f:
+      return f.read().strip()
 
   def set_cpus(self, cpus):
     if not self.path.exists():
@@ -324,9 +331,11 @@ class CgroupManager:
   def subtree_status(self, indent=0):
     sched_str = self.sched.status() if self.sched else "<No Scheduler>"
     weight = self.get_weight()
-    weight = f" (weight: {weight}) " if weight is not None else ""
+    weight = f" weight={weight}" if weight is not None else ""
+    cpuset = self.get_cpus()
+    cpuset = f" cpuset={cpuset}" if cpuset is not None else ""
     cgroup = self.path.relative_to(CGROUP_PATH) if self.path != CGROUP_PATH else "<root>"
-    s = f"{' ' * indent}{cgroup}{weight}: {sched_str} num tasks: {len(self.get_tasks(scx_only=False, is_process=False))}\n"
+    s = f"{' ' * indent}{cgroup}{weight}{cpuset}: {sched_str} num tasks: {len(self.get_tasks(scx_only=False, is_process=False))}\n"
     for sub in self.subs.values():
       s += sub.subtree_status(indent=indent+2)
     return s
@@ -486,8 +495,6 @@ class SchedManager(cmd.Cmd):
             sched = POLICIES[policy](config)
           case _:
             raise ValueError(f"Unsupported scheduler type: {policy}")
-        if sched is None:
-          continue
         
         weight = config.get("weight", None)
         if weight is not None:
@@ -498,6 +505,9 @@ class SchedManager(cmd.Cmd):
             raise ValueError(f"Cannot set cpus for root cgroup.")
         else:
           cgroup.set_cpus(cpus)
+        
+        if sched is None:
+          continue
         cgroup.attach_sched(sched)
         sched.start(self.scx_build_path)
         os.set_blocking(sched.process.stdout.fileno(), False)
