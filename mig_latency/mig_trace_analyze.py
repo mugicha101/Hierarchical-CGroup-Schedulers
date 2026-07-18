@@ -33,13 +33,13 @@ def parse_trace(target="mig_program"):
   
   mig_latency_samples = [[[] for _ in range(num_cpus)] for _ in range(num_cpus)]
   
-  def record_mig(src_cpu, dest_cpu, start_time, end_time):
+  def record_mig(src_cpu, dest_cpu, start_time, end_time, line):
     nonlocal num_migs, mig_seq, mig_latency_samples
     num_migs += 1
     if len(mig_seq) == 0:
       mig_seq += [src_cpu]
     else:
-      assert mig_seq[-1] == src_cpu, f"Migration source CPU {src_cpu} does not match last recorded CPU {mig_seq[-1]}"
+      assert mig_seq[-1] == src_cpu, f"Migration source CPU {src_cpu} does not match last recorded CPU {mig_seq[-1]}\nLast 10 migrations: {mig_seq[-10:]}\nLine: {line}"
     mig_seq += [dest_cpu]
     latency = int((end_time - start_time) * 1e9)
     mig_latency_samples[src_cpu][dest_cpu].append(latency)
@@ -55,11 +55,11 @@ def parse_trace(target="mig_program"):
     time = float(match.group('time'))
     event = match.group('event')
     details = match.group('details')
-    entries.append((cpu, time, event, details))
+    entries.append((cpu, time, event, details, line))
   entries.sort(key=lambda x: x[1])
     
   for e in entries:
-    cpu, time, event, details = e
+    cpu, time, event, details, line = e
     if event == 'sched_migrate_task':
       mig_fields = {}
       for kv_match in mig_kvp_rg.finditer(details):
@@ -93,7 +93,7 @@ def parse_trace(target="mig_program"):
       new_prio = int(switch_match.group('new_prio'))
       assert old_comm.startswith(f"migration/{cpu}"), f"Old comm does not match expected migration thread for CPU {cpu}: {old_comm}"
       
-      record_mig(cpu_active_migs[cpu]['orig_cpu'], cpu_active_migs[cpu]['dest_cpu'], cpu_active_migs[cpu]['time'], time)
+      record_mig(cpu_active_migs[cpu]['orig_cpu'], cpu_active_migs[cpu]['dest_cpu'], cpu_active_migs[cpu]['time'], time, line)
       
       cpu_active_migs[cpu] = None
     else:

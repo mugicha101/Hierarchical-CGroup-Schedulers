@@ -6,7 +6,7 @@ sudo trace-cmd record -e sched_migrate_task -e sched_switch ./mig_program "$LOOP
 echo "EXPORTING" && \
 trace-cmd report -t --ts-check > trace_report.txt && \
 echo "ANALYZING" && \
-python3 ./mig_trace_analyze.py mig_program > ./mig_latency_results.txt 2>&1 && \
+python3 ./mig_trace_analyze.py mig_program > ./mig_latency_results.txt && \
 echo "VISUALIZING" && \
 python3 ./mig_viz.py && \
 echo "DONE"
