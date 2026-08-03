@@ -32,6 +32,7 @@ const u128 U128_MAX = (((u128)(~0ULL)) << 64) | (u128)(~0ULL);
 #define WT_MISC(wt) ((u64)((wt) >> WT_MISC_SHIFT))
 #define WT_UPPER(wt) ((u64)((wt) >> 64))
 #define WT_LOWER(wt) ((u64)(wt))
+#define WT_STRIP_MISC(wt) ((wt) & ~(U128_MAX << WT_MISC_SHIFT))
 
 // construction macros
 #define WT_LOWER_FROM_FIELDS(task_weight, is_nmig) (((u64)(is_nmig) << WT_IS_NMIG_SHIFT) | (u64)task_weight)

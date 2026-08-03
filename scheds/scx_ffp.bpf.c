@@ -196,7 +196,7 @@ static __always_inline struct topo_data *fetch_global_topo() {
 // shared by all priority schedulers
 struct shard_ctx {
   weight_tuple_t cid_running_weight[SCX_CID_SHARD_MAX_CPUS];
-  weight_tuple_t max_running_weight; // atomically updated but may be stale if reading without lock
+  weight_tuple_t min_running; // atomically updated but may be stale if reading without lock, weight tuple with cid stored in misc bits (upper 48 bits)
   struct bpf_res_spin_lock lock;
 };
 struct {
@@ -208,25 +208,59 @@ struct {
 } ffp_shard_ctx_map SEC(".maps");
 
 static __always_inline weight_tuple_t get_running_weight(u32 cid) {
-  u32 shard_idx = aa.topo.cids[cid & (SCX_FFP_MAX_CPUS - 1)].shard_idx;
-  struct shard_ctx *sctx = bpf_map_lookup_elem(&ffp_shard_ctx_map, &shard_idx);
-  u32 shard_offset = cid - aa.topo.shards[shard_idx].base_cid;
+  u32 shard = aa.topo.cids[cid & (SCX_FFP_MAX_CPUS - 1)].shard_idx;
+  struct shard_ctx *sctx = bpf_map_lookup_elem(&ffp_shard_ctx_map, &shard);
+  u32 shard_offset = cid - aa.topo.shards[shard].base_cid;
   if (unlikely(!sctx || shard_offset >= SCX_CID_SHARD_MAX_CPUS)) return 0; // for verifier, should not happen
 
   return sctx->cid_running_weight[shard_offset];
 }
 
+static __always_inline void set_running_weight_locked(u32 cid, u32 shard, weight_tuple_t wt, struct shard_ctx *sctx) {
+  u32 shard_offset = cid - aa.topo.shards[shard].base_cid;
+  if (unlikely(!sctx || shard_offset >= SCX_CID_SHARD_MAX_CPUS)) return; // for verifier, should not happen
+
+  sctx->cid_running_weight[shard_offset] = wt;
+  u128 curr_min_weight = WT_STRIP_MISC(sctx->min_running);
+  u128 curr_min_cid = WT_MISC(sctx->min_running);
+  if (wt < curr_min_weight) {
+    // existing min higher than new min
+    sctx->min_running = ((u128)cid << WT_MISC_SHIFT) | wt;
+  } else if (wt > curr_min_weight && WT_MISC(sctx->min_running) == cid) {
+    // min cid's weight increased, need to search for new min
+    u32 i;
+    curr_min_weight = sctx->cid_running_weight[0];
+    curr_min_cid = 0;
+    u32 end = aa.topo.shards[shard].nr_cids;
+    if (unlikely(end > SCX_CID_SHARD_MAX_CPUS)) end = SCX_CID_SHARD_MAX_CPUS; // for verifier, should not happen
+    bpf_for(i, 1, end) {
+      weight_tuple_t w = sctx->cid_running_weight[i];
+      if (w < curr_min_weight) {
+        curr_min_weight = w;
+        curr_min_cid = i + aa.topo.shards[shard].base_cid;
+      }
+    }
+    
+    // if finds lower existing weight, prev min_running was wrong
+    // but cannot assert due to holding lock, cannot release lock due to verifier
+
+    sctx->min_running = ((u128)curr_min_cid << WT_MISC_SHIFT) | curr_min_weight;
+  } // otherwise, min weight should be same
+}
+
 static __always_inline void set_running_weight(u32 cid, weight_tuple_t wt) {
-  u32 shard_idx = aa.topo.cids[cid & (SCX_FFP_MAX_CPUS - 1)].shard_idx;
-  struct shard_ctx *sctx = bpf_map_lookup_elem(&ffp_shard_ctx_map, &shard_idx);
-  u32 shard_offset = cid - aa.topo.shards[shard_idx].base_cid;
+  u32 shard = aa.topo.cids[cid & (SCX_FFP_MAX_CPUS - 1)].shard_idx;
+  struct shard_ctx *sctx = bpf_map_lookup_elem(&ffp_shard_ctx_map, &shard);
+  u32 shard_offset = cid - aa.topo.shards[shard].base_cid;
   if (unlikely(!sctx || shard_offset >= SCX_CID_SHARD_MAX_CPUS)) return; // for verifier, should not happen
 
   if (unlikely(bpf_res_spin_lock(&sctx->lock))) {
     scx_bpf_error("failed to acquire shard lock");
     return;
   }
-  sctx->cid_running_weight[shard_offset] = wt;
+
+  set_running_weight_locked(cid, shard, wt, sctx);
+
   bpf_res_spin_unlock(&sctx->lock);
 }
 
@@ -686,7 +720,6 @@ static __always_inline bool try_task_dispatch(u32 cid) {
   // move highest weight in global dsq that can run on this cpu to local dsq
   struct task_struct *t;
   bool moved = false;
-  struct cid_data __arena *cd = &aa.cid_data[cid];
   bpf_for_each(scx_dsq, t, dsq_id, 0) {
     task_ctx_t *tctx = get_task_ctx(t);
     if (unlikely(!tctx)) continue; // for verifier, should not happen
@@ -920,49 +953,90 @@ void __always_inline pick_cid(struct task_struct *p, u32 prev_cid, u64 enq_flags
   }
 
   // nearest idle cpu in numa topology
-  u32 prev_shard = aa.topo.cids[prev_cid].shard_idx;
-  u32 __arena *order = aa.topo.shards[prev_shard & (SCX_FFP_MAX_CPUS - 1)].shard_dist_order;
+  u32 prev_shard = aa.topo.cids[prev_cid].shard_idx & (SCX_FFP_MAX_CPUS - 1);
+  u32 __arena *order = aa.topo.shards[prev_shard].shard_dist_order;
   u32 i;
   bpf_for(i, 0, aa.topo.nr_shards) {
     if (unlikely(i >= SCX_FFP_MAX_CPUS)) break; // for verifier, should not happen
 
-    // from qmap
     u32 shard = order[i] & (SCX_FFP_MAX_CPUS - 1);
     u32 cid = aa.topo.shards[shard].base_cid;
-    bpf_for(i, 0, IDLE_PICK_RETRIES) {
+
+    // from qmap
+    bpf_repeat(IDLE_PICK_RETRIES) {
       cid = cmask_next_and2_set_wrap(&tctx->cpus_allowed,
                   &aa.idle_cids.mask,
-                  &aa.self_cids.mask, cid + 1);
+                  &aa.self_cids.mask, cid);
+
       barrier_var(cid);
+      
       if (cid >= aa.topo.shards[shard].base_cid + aa.topo.shards[shard].nr_cids) break; // no idle
       if (likely(cmask_test_and_clear(cid, &aa.idle_cids.mask))) {
         target_cid = cid;
         goto dispatch;
       }
+      ++cid;
     }
   }
 
   // MIN WEIGHT SEARCH
-  
-  // tie break: prev cpu (misc 2) > cpu on prev numa node (misc 1) > any cpu (misc 0)
-  // u64 search_start = bpf_ktime_get_ns();
-  // target_cpu = -1;
-  // weight_tuple_t target_weight = U128_MAX;
-  // u32 cpu;
-  // bpf_for(cpu, 0, NR_CPUS) {
-  //   if (!bpf_cpumask_test_cpu(cpu, p->cpus_ptr)) continue;
 
-  //   uint numa_class = cpu == prev_cpu ? 2 : scx_bpf_cpu_node(cpu) == prev_node ? 1 : 0;
-  //   weight_tuple_t running_weight = grd->cid_running_weight[cpu] | ((weight_tuple_t)numa_class << WT_MISC_SHIFT);
-  //   if (running_weight < target_weight) {
-  //     target_cpu = cpu;
-  //     target_weight = running_weight;
-  //   }
-  // }
-  // target_weight &= ~(U128_MAX << WT_MISC_SHIFT); // remove misc data (only used for tie breaks)
-  // u64 search_delay = bpf_ktime_get_ns() - search_start;
-  // if (unlikely(search_delay > stats->search_wcet)) stats->search_wcet = search_delay;
-  // if (task_weight <= target_weight) goto dispatch_fail;
+  // find min weight shard (no locking)
+  // tiebreak based on shard distance from prev_cid by traversing using shard_dist_order
+  weight_tuple_t min_running = U128_MAX;
+  bpf_for(i, 0, aa.topo.nr_shards) {
+    if (unlikely(i >= SCX_FFP_MAX_CPUS)) break; // for verifier, should not happen
+
+    u32 shard = order[i] & (SCX_FFP_MAX_CPUS - 1);
+    struct shard_ctx *sctx = bpf_map_lookup_elem(&ffp_shard_ctx_map, &shard);
+    if (unlikely(!sctx)) continue; // for verifier, should not happen
+
+    barrier_var(sctx);
+    weight_tuple_t shard_min_running = READ_ONCE(sctx->min_running);
+    barrier_var(shard_min_running);
+
+    if (WT_STRIP_MISC(shard_min_running) < WT_STRIP_MISC(min_running)) {
+      min_running = shard_min_running;
+    }
+  }
+  if (min_running >= task_weight) goto dispatch_fail;
+
+  // find true min weight cid within shard (lock shard)
+  // min weight synced by time lock acquired
+  u32 shard = WT_MISC(min_running) & (SCX_FFP_MAX_CPUS - 1);
+  struct shard_ctx *sctx = bpf_map_lookup_elem(&ffp_shard_ctx_map, &shard);
+  if (unlikely(!sctx)) goto dispatch_fail; // for verifier, should not happen
+
+  if (unlikely(bpf_res_spin_lock(&sctx->lock))) {
+    scx_bpf_error("failed to acquire shard lock for shard %u", shard);
+    goto dispatch_fail;
+  }
+
+  u128 min_weight = WT_STRIP_MISC(sctx->min_running);
+  if (task_weight <= min_weight) {
+    bpf_res_spin_unlock(&sctx->lock);
+    goto dispatch_fail;
+  }
+
+  target_cid = WT_MISC(sctx->min_running);
+  if (aa.topo.cids[prev_cid].shard_idx == shard) {
+    // if min weight matches prev cid's weight, prefer it even if min_cid is different (tie break)
+    u32 shard_offset = prev_cid - aa.topo.shards[shard].base_cid;
+    if (unlikely(shard_offset >= SCX_CID_SHARD_MAX_CPUS)) { // for verifier, should not happen
+      bpf_res_spin_unlock(&sctx->lock);
+      goto dispatch_fail;
+    }
+    
+    u128 prev_cid_weight = sctx->cid_running_weight[shard_offset];
+    if (prev_cid_weight == min_weight) {
+      target_cid = prev_cid;
+    }
+  }
+
+  set_running_weight_locked(target_cid, shard, task_weight, sctx);
+
+  bpf_res_spin_unlock(&sctx->lock);
+  goto dispatch;
 
   // DISPATCH
 
