@@ -22,15 +22,7 @@
 #include <numa.h>
 #include "trace_events.h"
 #include "scx_cgss_helpers.h"
-
-struct seqlock_global {
-	__u64 gen_fin;
-	__u64 gen_beg;
-};
-
-struct seqlock_local {
-	__u64 gen;
-};
+#include "scx_ffp.h"
 
 #include "scx_ffp.bpf.skel.h"
 #include "scx_ffp.bpf.skel.h"
@@ -136,8 +128,9 @@ restart:
 		}
 		skel->struct_ops.ffp_ops->sub_cgroup_id = st.st_ino;
 		skel->rodata->cgroup_id = st.st_ino;
-		skel->rodata->preemptive = true;
 	}
+	skel->struct_ops.ffp_ops->cid_shard_size = 8; // TODO: make this configurable
+	skel->rodata->max_tasks = 16384; // TODO: make this configurable
 	skel->rodata->trace_enabled = trace_path != NULL;
 
 	// load scheduler
