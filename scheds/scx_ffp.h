@@ -62,6 +62,64 @@ struct ffp_cmask {
 #endif
 };
 
+// topology data
+struct cid_topo_data {
+  u32 cpu;
+
+  s32 shard_idx;
+  s32 core_idx;
+  s32 llc_idx;
+  s32 node_idx;
+};
+struct core_topo_data {
+  u32 base_cid;
+  u32 nr_cids;
+  
+  s32 shard_idx;
+  s32 llc_idx;
+  s32 node_idx;
+};
+struct shard_topo_data {
+  u32 base_cid;
+  u32 nr_cids;
+
+  s32 llc_idx;
+  s32 node_idx;
+
+  // shard indices ordered by distance from this shard (index 0 is this shard)
+  // sorted by same node then same ll3 then shard index
+  u32 shard_dist_order[SCX_FFP_MAX_CPUS];
+};
+struct llc_topo_data {
+  u32 base_cid;
+  u32 nr_cids;
+
+  u32 base_shard;
+  u32 nr_shards;
+
+  s32 node_idx;
+};
+struct node_topo_data {
+  u32 base_cid;
+  u32 nr_cids;
+  
+  u32 base_shard;
+  u32 nr_shards;
+};
+struct topo_data {
+  u32 nr_cids;
+  u32 nr_shards;
+  u32 nr_cores;
+  u32 nr_llcs;
+  u32 nr_nodes;
+
+  struct cid_topo_data cids[SCX_FFP_MAX_CPUS];
+  struct shard_topo_data shards[SCX_FFP_MAX_CPUS];
+  struct core_topo_data cores[SCX_FFP_MAX_CPUS];
+  struct llc_topo_data llcs[SCX_FFP_MAX_CPUS];
+  struct node_topo_data nodes[SCX_FFP_MAX_CPUS];
+};
+
 // seqlock implementation
 // single writer multiple reader lock-free structure
 // allows global data to sync with local data
@@ -177,6 +235,9 @@ struct ffp_arena {
 
   u32 porder[MAX_SUB_SCHEDS]; // sub indices in decreasing priority order
   struct seqlock_global porder_lock;
+
+  // copy of topology
+  struct topo_data topo;
 
   // CMASK MANAGEMENT
   
