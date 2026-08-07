@@ -221,6 +221,9 @@ struct cid_data {
   u32 porder[MAX_SUB_SCHEDS]; // cached indices of global porder
   u32 porder_sync_buff[MAX_SUB_SCHEDS]; // buffer for syncing porder
   struct seqlock_local porder_lock;
+
+  // scratch memory
+  struct ffp_cmask tmp_cmask;
 };
 
 // per scheduler instance arena memory

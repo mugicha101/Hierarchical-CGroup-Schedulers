@@ -469,6 +469,9 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(ffp_init)
       cmask_set(cid, &aa.self_cids.mask);
     }
   }
+  bpf_for(cid, 0, nr_cids) {
+    cmask_init(&aa.cid_data[cid].tmp_cmask.mask, 0, nr_cids);
+  }
 
   // from qmap
   // init dynamic task cmasks
@@ -915,13 +918,17 @@ u64 __always_inline get_task_weight(struct task_struct *p) {
 // called from either select_cid or enqueue
 // moves directly into dsq (either local cpu dsq if high enough priority or global otherwise)
 // if ran in select_cid, will skip enqueue
-void __always_inline pick_cid(struct task_struct *p, u32 prev_cid, u64 enq_flags) {
+static void __always_inline pick_cid(struct task_struct *p, u32 prev_cid, u64 enq_flags) {
+  if (enq_flags & SCX_TASK_REENQ_CAP) {
+    scx_bpf_error("capability issue: pid=%d enq_flags=%llu", p->pid, enq_flags);
+  }
+
   // TRACE_FUNC_START("pick_cid");
   prev_cid = prev_cid & (NR_CPUS - 1); // for verifier
   // ++stats->n_pick_cid_calls;
   
   // setup
-  int target_cid = prev_cid;
+  u32 target_cid = prev_cid;
   bool nmig = is_migration_disabled(p);
   weight_tuple_t task_weight = WT_FROM_FIELDS(get_task_weight(p), nmig, self_cgroup_weight, 0);
   task_ctx_t *tctx = get_task_ctx(p);
@@ -980,12 +987,26 @@ void __always_inline pick_cid(struct task_struct *p, u32 prev_cid, u64 enq_flags
   }
 
   // MIN WEIGHT SEARCH
+  // first pass: checks min weight in shards without locking to find candidate shards
+  // second pass: acquires locks for candidate shards and finds true min
+  // candidate shards:
+  // - shards that partially overlap task's cmask
+  // - min weight of shards that fully overlap task's cmask
 
   // find min weight shard (no locking)
   // tiebreak based on shard distance from prev_cid by traversing using shard_dist_order
-  weight_tuple_t min_running = U128_MAX;
+  struct cid_data __arena *cd = &aa.cid_data[cid];
+  weight_tuple_t fol_min_running = U128_MAX; // full overlap shards
+  weight_tuple_t pol_min_running = U128_MAX; // partial overlap shards (includes full)
+  cmask_clear(cdi->tmp_cmask.mask); // use tmp cmask to store candidate shards
+  bool partial_exists = false;
   bpf_for(i, 0, aa.topo.nr_shards) {
     if (unlikely(i >= SCX_FFP_MAX_CPUS)) break; // for verifier, should not happen
+
+    // check if full overlapped, partial overlap, or no overlap
+    if (!cmask_intersects(&aa.shard_cids[order[i] & (SCX_FFP_MAX_CPUS - 1)].mask, &tctx->cpus_allowed)) {
+      continue; // no overlap, skip
+    }
 
     u32 shard = order[i] & (SCX_FFP_MAX_CPUS - 1);
     struct shard_ctx *sctx = bpf_map_lookup_elem(&ffp_shard_ctx_map, &shard);
@@ -995,15 +1016,31 @@ void __always_inline pick_cid(struct task_struct *p, u32 prev_cid, u64 enq_flags
     weight_tuple_t shard_min_running = READ_ONCE(sctx->min_running);
     barrier_var(shard_min_running);
 
-    if (WT_STRIP_MISC(shard_min_running) < WT_STRIP_MISC(min_running)) {
-      min_running = shard_min_running;
+    if (cmask_subset(&aa.shard_cids[order[i] & (SCX_FFP_MAX_CPUS - 1)].mask, &tctx->cpus_allowed)) {
+      if (WT_STRIP_MISC(shard_min_running) < WT_STRIP_MISC(fol_min_running)) {
+        fol_min_running = shard_min_running;
+      }
+    } else {
+      partial_exists = true;
+    }
+
+    if (WT_STRIP_MISC(shard_min_running) < WT_STRIP_MISC(pol_min_running)) {
+      pol_min_running = shard_min_running;
     }
   }
-  if (min_running >= task_weight) goto dispatch_fail;
+  if (WT_STRIP_MISC(pol_min_running) >= task_weight) goto dispatch_fail;
 
-  // find true min weight cid within shard (lock shard)
+  // if min weight in partially overlapped shards is a fully overlapped shard, we can ignore partial
+  bool pol_min_running_is_fol = pol_min_running == fol_min_running;
+  if (pol_min_running_is_fol) {
+    cmask_clear(cdi->tmp_cmask.mask);
+  }
+  cmask_set(WT_MISC(fol_min_running) & (SCX_FFP_MAX_CPUS - 1), &cdi->tmp_cmask.mask);
+
+  // find true min weight cid within candidate shards (lock shard)
   // min weight synced by time lock acquired
-  u32 shard = WT_MISC(min_running) & (SCX_FFP_MAX_CPUS - 1);
+  // TODO: update to search all candidate shards (use 2 locks: 1 for min shard so far, 1 for current shard)
+  u32 shard = WT_MISC(fol_min_running) & (SCX_FFP_MAX_CPUS - 1);
   struct shard_ctx *sctx = bpf_map_lookup_elem(&ffp_shard_ctx_map, &shard);
   if (unlikely(!sctx)) goto dispatch_fail; // for verifier, should not happen
 
@@ -1061,6 +1098,7 @@ void __always_inline pick_cid(struct task_struct *p, u32 prev_cid, u64 enq_flags
 // task scheduling functions that should not be called
 s32 BPF_STRUCT_OPS(ffp_select_cid, struct task_struct *p, s32 prev_cid, u64 wake_flags)
 {
+  bpf_printk("[INFO] [FP] [SELECT_CID] cgroup=%d pid=%d comm=%s prev_cid=%d wake_flags=%llu", cgroup_id, p->pid, p->comm, prev_cid, wake_flags);
   TRACE_FUNC_START("select_cid");
   // const u32 zero = 0;
   // struct cpu_stats *stats = bpf_map_lookup_elem(&ffp_cpu_stats, &zero);
@@ -1076,6 +1114,7 @@ s32 BPF_STRUCT_OPS(ffp_select_cid, struct task_struct *p, s32 prev_cid, u64 wake
 
 void BPF_STRUCT_OPS(ffp_enqueue, struct task_struct *p, u64 enq_flags) {
   TRACE_FUNC_START("enqueue");
+  bpf_printk("[INFO] [FP] [ENQUEUE] cgroup=%d pid=%d comm=%s enq_flags=%llu", cgroup_id, p->pid, p->comm, enq_flags);
   // const u32 zero = 0;
   // struct cpu_stats *stats = bpf_map_lookup_elem(&ffp_cpu_stats, &zero);
   // if (unlikely(!stats)) return; // for verifier, should not happen
@@ -1176,8 +1215,12 @@ void BPF_STRUCT_OPS(ffp_update_idle, s32 cid, bool idle)
 }
 
 // from qmap
+// TODO: change to if SWITCH_PARTIAL then only allocate if SCX policy or when switches to SCX policy
+// because cid-form removes enable/disable can only be done in enqueue
 s32 BPF_STRUCT_OPS_SLEEPABLE(ffp_init_task, struct task_struct *p, struct scx_init_task_args *args)
 {
+  bpf_printk("[INFO] [FP] [INIT_TASK] cgroup=%d pid=%d comm=%s", cgroup_id, p->pid, p->comm);
+
   /* pop a slab entry off the free list */
 	if (unlikely(bpf_res_spin_lock(&aa_task_lock))) {
     scx_bpf_error("failed to acquire task_ctx slab lock");
@@ -1220,6 +1263,8 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(ffp_init_task, struct task_struct *p, struct scx_in
 // from qmap
 void BPF_STRUCT_OPS(ffp_exit_task, struct task_struct *p)
 {
+  bpf_printk("[INFO] [FP] [EXIT_TASK] cgroup=%d pid=%d comm=%s", cgroup_id, p->pid, p->comm);
+
   // don't need to free task_ctx_ptr since kernel manages it
   // need to free task_ctx since it is allocated from arena memory
 	struct task_ctx_ptr *ptr = bpf_task_storage_get(&task_ctx_ptr_map, p, NULL, 0);
@@ -1242,9 +1287,11 @@ void BPF_STRUCT_OPS(ffp_set_cmask, struct task_struct *p, const struct scx_cmask
 {
   task_ctx_t *tctx = get_task_ctx(p);
   if (unlikely(!tctx)) return; // for verifier, should not happen
-
+  
 	struct scx_cmask __arena *cmask = (struct scx_cmask __arena *)(long)cmask_in;
+  u64 old = cmask_to_int(&tctx->cpus_allowed);
 	cmask_copy(&tctx->cpus_allowed, cmask);
+  bpf_printk("[INFO] [FP] [SET_CMASK] cgroup=%d pid=%d comm=%s nmig=%d cmask: %06llx ->%06llx", cgroup_id, p->pid, p->comm, is_migration_disabled(p), old, cmask_to_int(&tctx->cpus_allowed));
 }
 
 // ops
