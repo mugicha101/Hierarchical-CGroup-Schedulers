@@ -169,8 +169,32 @@ static __always_inline void seqlock_update_end(struct seqlock_global __arena *g)
 struct latency_stat {
   u64 n; // number of samples
   u128 sum; // sum of samples
-  u64 wcet; // worst-case execution time
+  u64 max; // worst-case execution time
 };
+
+#ifdef __BPF__
+struct latency_ctx {
+  u64 start_time; // start time + pause duration
+  u64 pause_start_time; // start time of the current pause
+};
+static __always_inline void lstat_start(struct latency_ctx *lctx) {
+  lctx->start_time = bpf_ktime_get_ns();
+}
+static __always_inline void lstat_sample(struct latency_ctx *lctx, struct latency_stat __arena *lstat) {
+  u64 lat = bpf_ktime_get_ns() - lctx->start_time;
+  ++lstat->n;
+  lstat->sum += lat;
+  if (unlikely(lat > lstat->max)) {
+    lstat->max = lat;
+  }
+}
+static __always_inline void lstat_pause(struct latency_ctx *lctx) {
+  lctx->pause_start_time = bpf_ktime_get_ns();
+}
+static __always_inline void lstat_resume(struct latency_ctx *lctx) {
+  lctx->start_time += bpf_ktime_get_ns() - lctx->pause_start_time;
+}
+#endif
 
 // from qmap
 // per task state for the scheduler
@@ -259,11 +283,21 @@ struct ffp_arena {
   struct ffp_cmask shard_cids[SCX_FFP_MAX_CPUS];
 
   // DIAGNOSTICS
-  struct latency_stat pick_cid_latency;
-  struct latency_stat search_latency;
-  struct latency_stat pick_cpu_latency;
-  struct latency_stat task_dispatch_latency;
-  struct latency_stat sub_dispatch_latency;
+  struct latency_stat ls_no_op;
+  struct latency_stat ls_pick_cid_idle;
+  struct latency_stat ls_pick_cid_search;
+  struct latency_stat ls_task_dispatch;
+  struct latency_stat ls_sub_dispatch;
+  struct latency_stat ls_sync_porder_update;
+  struct latency_stat ls_sync_porder_cached;
+  struct latency_stat ls_task_init;
+  struct latency_stat ls_task_exit;
+  struct latency_stat ls_enqueue;
+  struct latency_stat ls_select_cid;
+  struct latency_stat ls_sub_attach;
+  struct latency_stat ls_sub_detach;
+  struct latency_stat ls_sub_cpuctl_weight_update;
+  struct latency_stat ls_set_cmask;
 };
 
 #endif

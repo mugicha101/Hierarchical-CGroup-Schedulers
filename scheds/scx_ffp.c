@@ -19,7 +19,6 @@
 #include <sys/syscall.h>
 #include <linux/sched.h>
 #include <time.h>
-#include <numa.h>
 #include "trace_events.h"
 #include "scx_cgss_helpers.h"
 #include "scx_ffp.h"
@@ -132,6 +131,8 @@ restart:
 	skel->struct_ops.ffp_ops->cid_shard_size = 8; // TODO: make this configurable
 	skel->rodata->max_tasks = 16384; // TODO: make this configurable
 	skel->rodata->trace_enabled = trace_path != NULL;
+	skel->rodata->lockless = true;
+	skel->rodata->global_search = false;
 
 	// load scheduler
 	SCX_OPS_LOAD(skel, ffp_ops, scx_ffp, uei);
