@@ -180,7 +180,7 @@ struct latency_ctx {
 static __always_inline void lstat_start(struct latency_ctx *lctx) {
   lctx->start_time = bpf_ktime_get_ns();
 }
-static __always_inline void lstat_sample(struct latency_ctx *lctx, struct latency_stat __arena *lstat) {
+static __always_inline void lstat_record(struct latency_ctx *lctx, struct latency_stat __arena *lstat) {
   u64 lat = bpf_ktime_get_ns() - lctx->start_time;
   ++lstat->n;
   lstat->sum += lat;
@@ -237,6 +237,30 @@ struct sub_sched_ctx {
   // struct ffp_cmask prev_granted; // last grant, for delta calculation
 };
 
+// stats stored per-cid to avoid race conditions
+struct stats_data {
+  struct latency_stat no_op;
+  struct latency_stat pick_cid_prev;
+  struct latency_stat pick_cid_idle;
+  struct latency_stat pick_cid_search;
+  struct latency_stat task_dispatch;
+  struct latency_stat sub_dispatch;
+  struct latency_stat dispatch;
+  struct latency_stat sync_porder_update;
+  struct latency_stat sync_porder_fail;
+  struct latency_stat sync_porder_cached;
+  struct latency_stat init_task;
+  struct latency_stat exit_task;
+  struct latency_stat select_cid;
+  struct latency_stat enqueue;
+  struct latency_stat sub_attach;
+  struct latency_stat sub_detach;
+  struct latency_stat cpuctl_weight_update;
+  struct latency_stat set_cmask;
+  struct latency_stat running;
+  struct latency_stat stopping;
+};
+
 struct cid_data {
   // scheduling state
   u32 curr_idx; // index of currently running subscheduler
@@ -282,22 +306,8 @@ struct ffp_arena {
   // per-shard cmasks
   struct ffp_cmask shard_cids[SCX_FFP_MAX_CPUS];
 
-  // DIAGNOSTICS
-  struct latency_stat ls_no_op;
-  struct latency_stat ls_pick_cid_idle;
-  struct latency_stat ls_pick_cid_search;
-  struct latency_stat ls_task_dispatch;
-  struct latency_stat ls_sub_dispatch;
-  struct latency_stat ls_sync_porder_update;
-  struct latency_stat ls_sync_porder_cached;
-  struct latency_stat ls_task_init;
-  struct latency_stat ls_task_exit;
-  struct latency_stat ls_enqueue;
-  struct latency_stat ls_select_cid;
-  struct latency_stat ls_sub_attach;
-  struct latency_stat ls_sub_detach;
-  struct latency_stat ls_sub_cpuctl_weight_update;
-  struct latency_stat ls_set_cmask;
+  // latency stats
+  struct stats_data stats[SCX_FFP_MAX_CPUS];
 };
 
 #endif

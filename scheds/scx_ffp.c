@@ -38,7 +38,8 @@ const char help_fmt[] =
 "  -v              Print libbpf debug messages\n"
 "  -c CGROUP_PATH  Attach the scheduler to an existing cgroup (attaches as root otherwise)\n"
 "  -t TRACE_PATH   Specify the output file to write the trace to (trace output ignored if not provided)\n"
-"  -h              Display this help and exit\n";
+"  -h              Display this help and exit\n"
+"  -s STATS_PATH   Specify the output file to write stats to when scheduler detached (discarded if not provided)\n";
 
 static bool verbose;
 static volatile int exit_req;
@@ -55,17 +56,41 @@ static void sigint_handler(int simple)
 	exit_req = 1;
 }
 
+void write_stat(FILE *fd, struct latency_stat *lstat, const char *name, bool last) {
+	fprintf(fd, "\"%s\":{", name);
+	fprintf(fd, "\"n\":%lu,", lstat->n);
+	fprintf(fd, "\"max\":%lu,", lstat->max);
+	fprintf(fd, "\"sum\":");
+
+	// since u128 not supported by fprintf, print each char individually
+	char u128_str[40] = {};
+	size_t di = 0;
+	u128 t = lstat->sum;
+	while (t) {
+		u128_str[di++] = t % 10;
+		t /= 10;
+	}
+	di += di == 0;
+	while (di > 0) {
+		fprintf(fd, "%d", u128_str[--di]);
+	}
+	fprintf(fd, "}");
+	if (!last) fprintf(fd, ",");
+}
+
 int main(int argc, char **argv)
 {
 	struct scx_ffp *skel;
 	struct bpf_link *link;
 	struct ring_buffer *rb_manager;
 	struct bpf_program *syscall_prog = NULL;
+	struct ffp_arena *aa = NULL;
 
-  const char *cg_path = NULL;
+  	const char *cg_path = NULL;
 	const char *sched_name = "<root>";
 	const char *trace_path = NULL;
 	const char *pin_path = "/sys/fs/bpf/update_weight";
+	const char *stats_path = NULL;
 
 	__u32 opt;
 	__u64 ecode;
@@ -77,17 +102,20 @@ int main(int argc, char **argv)
 restart:
 
 	// parse arguments
-	while ((opt = getopt(argc, argv, "c:vt:h")) != -1) {
+	while ((opt = getopt(argc, argv, "c:v:t:s:h")) != -1) {
 		switch (opt) {
 		case 'v':
 			verbose = true;
 			break;
-    case 'c':
+    	case 'c':
 			cg_path = strdup(optarg);
 			sched_name = cg_path;
-      break;
+      		break;
 		case 't':
 			trace_path = strdup(optarg);
+			break;
+		case 's':
+			stats_path = strdup(optarg);
 			break;
 		case 'h':
 		default:
@@ -131,9 +159,9 @@ restart:
 	skel->struct_ops.ffp_ops->cid_shard_size = 8; // TODO: make this configurable
 	skel->rodata->max_tasks = 16384; // TODO: make this configurable
 	skel->rodata->trace_enabled = trace_path != NULL;
-	skel->rodata->lockless = true;
-	skel->rodata->global_search = false;
-
+	skel->rodata->lockless = true; // TODO: make this configurable
+	skel->rodata->global_search = false; // TODO: make this configurable
+	
 	// load scheduler
 	SCX_OPS_LOAD(skel, ffp_ops, scx_ffp, uei);
 	link = SCX_OPS_ATTACH(skel, ffp_ops, scx_ffp);
@@ -141,6 +169,7 @@ restart:
 		fprintf(stderr, "Error: failed to attach scheduler\n");
 		goto cleanup;
 	}
+	aa = &skel->arena->aa;
 
 	// pin syscall program if no prior instances of it exist
 	if (access(pin_path, F_OK)) {
@@ -192,6 +221,46 @@ cleanup:
 
 	if (link) bpf_link__destroy(link);
 	ecode = UEI_REPORT(skel, uei);
+
+	if (stats_path && aa) {
+		FILE *stats_fd = fopen(stats_path, "w");
+		if (!stats_fd) {
+			fprintf(stderr, "Error opening stats output file %s\n", stats_path);
+		} else {
+			// write stats as json
+			fprintf(stats_fd, "[");
+			for (__u32 cid = 0; cid < aa->topo.nr_cids; ++cid) {
+				if (cid) fprintf(stats_fd, ",");
+				fprintf(stats_fd, "{");
+				struct stats_data *s = &aa->stats[cid];
+
+				write_stat(stats_fd, &s->no_op, "no_op", false);
+				write_stat(stats_fd, &s->pick_cid_prev, "pick_cid_prev", false);
+				write_stat(stats_fd, &s->pick_cid_idle, "pick_cid_idle", false);
+				write_stat(stats_fd, &s->pick_cid_search, "pick_cid_search", false);
+				write_stat(stats_fd, &s->task_dispatch, "task_dispatch", false);
+				write_stat(stats_fd, &s->sub_dispatch, "sub_dispatch", false);
+				write_stat(stats_fd, &s->dispatch, "dispatch", false);
+				write_stat(stats_fd, &s->sync_porder_update, "sync_porder_update", false);
+				write_stat(stats_fd, &s->sync_porder_fail, "sync_porder_fail", false);
+				write_stat(stats_fd, &s->sync_porder_cached, "sync_porder_cached", false);
+				write_stat(stats_fd, &s->init_task, "init_task", false);
+				write_stat(stats_fd, &s->exit_task, "exit_task", false);
+				write_stat(stats_fd, &s->select_cid, "select_cid", false);
+				write_stat(stats_fd, &s->enqueue, "enqueue", false);
+				write_stat(stats_fd, &s->sub_attach, "sub_attach", false);
+				write_stat(stats_fd, &s->sub_detach, "sub_detach", false);
+				write_stat(stats_fd, &s->cpuctl_weight_update, "cpuctl_weight_update", false);
+				write_stat(stats_fd, &s->set_cmask, "set_cmask", false);
+				write_stat(stats_fd, &s->running, "running", false);
+				write_stat(stats_fd, &s->stopping, "stopping", true);
+
+				fprintf(stats_fd, "}");
+			}
+			fprintf(stats_fd, "]");
+		}
+	}
+
 	if (skel) scx_ffp__destroy(skel);
 
 	if (trace_fd && trace_path) {
