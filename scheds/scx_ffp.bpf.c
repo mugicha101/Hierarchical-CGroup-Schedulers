@@ -1,3 +1,4 @@
+#include "vmlinux.h"
 #include <scx/common.bpf.h>
 
 #include "bpf/bpf_helpers.h"
@@ -30,6 +31,8 @@ char _license[] SEC("license") = "GPL";
 // - min cid within task's current shard
 // - global dispatch queue
 // when cpu goes idle, dispatches max weight task with matching cpu affinity in global dispatch queue (if any)
+
+// TODO: ensure search checks capabilities consistently (currently only checks in idle search)
 
 const volatile u64 cgroup_id; // id of this cgroup, 0 if root
 const volatile u32 max_tasks; // max tasks allowed in the cgroup (include non-scx, stores a cmask for all tasks)
@@ -385,6 +388,8 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(ffp_init)
   TRACE_FUNC_START("init");
   bpf_printk("[INFO] [FP] [INIT] cgroup=%d", cgroup_id);
   bpf_printk("SCX_CAP_ENQ_IMMED: %llu", SCX_CAP_ENQ_IMMED);
+  bpf_printk("SCX_CAP_ENQ: %llu", SCX_CAP_ENQ);
+  bpf_printk("SCX_CAP_PREEMPT: %llu", SCX_CAP_PREEMPT);
   TRACE_EVENT(struct sched_trace_event_self, SCHED_TRACE_SELF,
     e->cgrp_id = cgroup_id;
     e->weight = DEFAULT_CGROUP_WEIGHT;
@@ -412,11 +417,13 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(ffp_init)
   // init static cmasks
 	cmask_init(&aa.self_cids.mask, 0, nr_cids);
   cmask_init(&aa.idle_cids.mask, 0, nr_cids);
-  if (cgroup_id == 0) {
+
+  // TODO: handle subschedulers in capabilities ops
+  // if (cgroup_id == 0) {
     bpf_for(cid, 0, nr_cids) {
       cmask_set(cid, &aa.self_cids.mask);
     }
-  }
+  // }
   bpf_for(cid, 0, nr_cids) {
     cmask_init(&aa.cid_data[cid].tmp_cmask.mask, 0, nr_cids);
   }
@@ -715,7 +722,7 @@ s32 BPF_STRUCT_OPS(ffp_sub_attach, struct scx_sub_attach_args *args)
   // debug output cmask
   // bpf_printk("[INFO] [FP] [SUB_ATTACH] cgroup=%llu weight=%llu cmask=%016llx", sub_cgroup_id, sub->weight, cmask_to_int(&aa.self_cids.mask));
 
-  scx_bpf_sub_grant(sub_cgroup_id, SCX_CAP_ENQ_IMMED, (void *)(long)&aa.self_cids.mask, NULL);
+  scx_bpf_sub_grant(sub_cgroup_id, SCX_CAP_ENQ_IMMED | SCX_CAP_ENQ | SCX_CAP_PREEMPT, (void *)(long)&aa.self_cids.mask, NULL);
   
   lstat_record(&lctx, &aa.stats[cid].sub_attach);
   TRACE_FUNC_END("sub_attach", "");
@@ -1088,7 +1095,7 @@ static void __always_inline pick_cid(struct task_struct *p, u32 prev_cid, u64 en
 
   dispatch:
   // SCX_ENQ_PREEMPT handles the kicking
-  scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | (target_cid & (SCX_FFP_MAX_CPUS - 1)), slice, SCX_ENQ_PREEMPT | SCX_ENQ_IMMED);
+  scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | (target_cid & (SCX_FFP_MAX_CPUS - 1)), slice, dispatch_type == 2 ? SCX_ENQ_PREEMPT | SCX_ENQ_IMMED : SCX_ENQ_PREEMPT);
 
   u32 cid = scx_bpf_this_cid();
   lstat_record(&lctx, dispatch_type == 0 ? &aa.stats[cid].pick_cid_prev : dispatch_type == 1 ? &aa.stats[cid].pick_cid_idle : &aa.stats[cid].pick_cid_search);
@@ -1129,7 +1136,16 @@ void BPF_STRUCT_OPS(ffp_enqueue, struct task_struct *p, u64 enq_flags)
 
   struct latency_ctx lctx;
   lstat_start(&lctx);
+
+  // // handle SCX_ENQ_LAST
+  // if (enq_flags & SCX_ENQ_LAST) {
+  //   scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, slice, 0);
+  //   goto skip_pick_cid;
+  // }
+
   pick_cid(p, (u32)scx_bpf_task_cid(p), enq_flags);
+  
+  // skip_pick_cid:
   u32 cid = scx_bpf_this_cid();
   lstat_record(&lctx, &aa.stats[cid].enqueue);
 
@@ -1141,7 +1157,7 @@ void BPF_STRUCT_OPS(ffp_running, struct task_struct *p)
   struct latency_ctx lctx;
   lstat_start(&lctx);
 
-  // bpf_printk("[INFO] [FP] [RUNNING] cgroup=%d pid=%d comm=%s", cgroup_id, p->pid, p->comm);
+  bpf_printk("[INFO] [FP] [RUNNING] cgroup=%d pid=%d comm=%s", cgroup_id, p->pid, p->comm);
   TRACE_EVENT(struct sched_trace_event_run_task, SCHED_TRACE_RUN_TASK,
     e->pid = p->pid;
   );

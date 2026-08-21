@@ -29,17 +29,27 @@
 #define SUB_CG_BASE "/sys/fs/cgroup/scx_ffp"
 
 const char help_fmt[] =
-"A fixed priority sched_ext hierarchical scheduler.\n"
+"A clustered job-level fixed priority sched_ext hierarchical scheduler.\n"
 "\n"
 "See the top-level comment in .bpf.c for more details.\n"
 "\n"
-"Usage: %s [-v] [-c CGROUP_PATH]] [-t TRACE_PATH]\n"
+"Usage: %s [OPTIONS]\n"
 "\n"
-"  -v              Print libbpf debug messages\n"
-"  -c CGROUP_PATH  Attach the scheduler to an existing cgroup (attaches as root otherwise)\n"
-"  -t TRACE_PATH   Specify the output file to write the trace to (trace output ignored if not provided)\n"
-"  -h              Display this help and exit\n"
-"  -s STATS_PATH   Specify the output file to write stats to when scheduler detached (discarded if not provided)\n";
+"General Options:\n"
+"  -v, --verbose              Print libbpf debug messages\n"
+"  -h, --help                 Display this help and exit\n"
+"\n"
+"Scheduler Configuration:\n"
+"  -c, --cgroup PATH          Attach the scheduler to an existing cgroup located at PATH (default: /sys/fs/cgroup/ i.e. the root cgroup)\n"
+"  -l, --search-locking       Enable shard locking in pick_cid min priority search (by default, pick_cid does not lock target shard to ensure running priorities are accurate)\n"
+"  -g, --global-search        Enable Global Shard Search (by default, pick_cid only searches local shard if no idle CPU found)\n"
+"  -S, --max-shard-size N         Sets the maximum shard size (i.e. cluster size) to N (default: 8, however each shard must be within a single LLC)\n"
+"  -T, --max-tasks N          Sets the maximum number of tasks supported by the scheduler to N (default: 16384, must be at least the tasks in the scheduler's cgroup including non-scx tasks)"
+"\n"
+"Diagnostics:\n"
+"  -t, --trace PATH           Output trace data from the scheduler to PATH continuously during runtime (trace output ignored if not provided)\n"
+"  -s, --stats PATH           Output JSON-formatted latency stats to PATH when scheduler exits (discarded if not provided)\n"
+;
 
 static bool verbose;
 static volatile int exit_req;
@@ -86,6 +96,11 @@ int main(int argc, char **argv)
 	struct bpf_program *syscall_prog = NULL;
 	struct ffp_arena *aa = NULL;
 
+	bool search_locking = false;
+	bool global_search = false;
+	uint32_t max_shard_size = 8;
+	uint32_t max_tasks = 16384;
+
   	const char *cg_path = NULL;
 	const char *sched_name = "<root>";
 	const char *trace_path = NULL;
@@ -111,6 +126,18 @@ restart:
 			cg_path = strdup(optarg);
 			sched_name = cg_path;
       		break;
+		case 'l':
+			search_locking = true;
+			break;
+		case 'g':
+			global_search = true;
+			break;
+		case 'S':
+			max_shard_size = strtoul(optarg, NULL, 10);
+			break;
+		case 'T':
+			max_tasks = strtoul(optarg, NULL, 10);
+			break;
 		case 't':
 			trace_path = strdup(optarg);
 			break;
@@ -156,11 +183,11 @@ restart:
 		skel->struct_ops.ffp_ops->sub_cgroup_id = st.st_ino;
 		skel->rodata->cgroup_id = st.st_ino;
 	}
-	skel->struct_ops.ffp_ops->cid_shard_size = 8; // TODO: make this configurable
-	skel->rodata->max_tasks = 16384; // TODO: make this configurable
+	skel->struct_ops.ffp_ops->cid_shard_size = max_shard_size;
+	skel->rodata->max_tasks = max_tasks;
 	skel->rodata->trace_enabled = trace_path != NULL;
-	skel->rodata->lockless = true; // TODO: make this configurable
-	skel->rodata->global_search = false; // TODO: make this configurable
+	skel->rodata->lockless = !search_locking;
+	skel->rodata->global_search = global_search;
 	
 	// load scheduler
 	SCX_OPS_LOAD(skel, ffp_ops, scx_ffp, uei);
