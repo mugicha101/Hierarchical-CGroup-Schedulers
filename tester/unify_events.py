@@ -9,6 +9,8 @@
 
 from collections import deque
 from email import parser
+import heapq
+import json
 import re
 import bt2
 import os
@@ -33,21 +35,22 @@ SCX_TRACE_RE = re.compile(
     r"(?P<type>[^:\s]+):"
     r"(?:\s+(?P<fields>.*))?$"
 )
+INF = (1 << 64) # max time
 input_args = None
 
 def cmd(*args, check=True):
     if input_args.verbose:
-        print("cmd:", *args)
+        print("cmd:", *args, file=sys.stderr)
     p = subprocess.run(args, text=True, capture_output=True)
     if input_args.verbose:
-        print("return code:", p.returncode, flush=True)
+        print("return code:", p.returncode, flush=True, file=sys.stderr)
         if p.stdout:
-            print("stdout:", p.stdout, flush=True)
+            print("stdout:", p.stdout, flush=True, file=sys.stderr)
         if p.stderr:
-            print("stderr:", p.stderr, flush=True)
+            print("stderr:", p.stderr, flush=True, file=sys.stderr)
     if check and p.returncode:
         err = f"command failed: {' '.join(args)}\n{p.stderr}"
-        print(err, flush=True)
+        print(err, flush=True, file=sys.stderr)
         raise RuntimeError(err)
     return p
 
@@ -71,9 +74,23 @@ class Event:
         self.name = name
         self.data = data
 
+    def __str__(self):
+        return json.dumps({"ts": self.ts, "name": self.name, "data": self.data})
+
 class SourceStream:
     def __init__(self):
         self.pending = deque()
+        self.name = ""
+        self.popped_events = 0
+
+    def pop(self):
+        if len(self.pending) == 0:
+            return None
+        self.popped_events += 1
+        return self.pending.popleft()
+
+    def total_popped(self):
+        return self.popped_events
 
     def poll(self):
         raise NotImplementedError("poll() must be implemented by subclasses")
@@ -83,9 +100,15 @@ class SourceStream:
             return None
         return self.pending[0].ts
 
+    def back_ts(self) -> int:
+        if len(self.pending) == 0:
+            return None
+        return self.pending[-1].ts
+
 class BTStream(SourceStream):
     def __init__(self):
         super().__init__()
+        self.name = "LTTNG + BT2"
         url = f"net://localhost/host/{socket.gethostname()}/{SESSION_NAME}"
         spec = bt2.ComponentSpec.from_named_plugin_and_component_class(
             "ctf",
@@ -107,7 +130,7 @@ class BTStream(SourceStream):
             case "sched_switch":
                 data = event.payload_field
                 output = {
-                    "cpu_id": int(event["cpu_id"]),
+                    "cpu": int(event["cpu_id"]),
                     "prev_tid": int(data["prev_tid"]),
                     "next_tid": int(data["next_tid"]),
                     "prev_comm": str(data["prev_comm"]),
@@ -134,7 +157,9 @@ class BTStream(SourceStream):
                 }
             case _:
                 return
-        self.pending.append(Event(msg.default_clock_snapshot.ns_from_origin, event.name, output))
+        snap = msg.default_clock_snapshot
+        ts = snap.value * 1_000_000_000 // snap.clock_class.frequency
+        self.pending.append(Event(ts, event.name, output))
 
     def poll(self):
         try:
@@ -146,7 +171,9 @@ class BTStream(SourceStream):
 class TraceStream(SourceStream):
     def __init__(self, path: Path):
         super().__init__()
-        self.stream = path.open("r")
+        self.name = str(path)
+        self.path = path
+        self.stream = None
         self.start_time = 0
 
     def __del__(self):
@@ -158,7 +185,7 @@ class TraceStream(SourceStream):
             self.start_time = int(line.split(":")[-1])
             return
         
-        match = SCX_TRACE_RE.match()
+        match = SCX_TRACE_RE.match(line)
         if not match:
             return
         
@@ -174,15 +201,22 @@ class TraceStream(SourceStream):
                 except ValueError:
                     pass
                 fields[key] = value
-        self.ts = int(self.start_time + match.group("ts"))
-        self.name = match.group("type")
-        self.data = {
+        ts = self.start_time + int(match.group("ts"))
+        name = match.group("type")
+        data = {
             "cgroup": match.group("cgroup"),
             "cid": int(match.group("cid")),
             **fields
         }
+        self.pending.append(Event(ts, name, data))
 
     def poll(self):
+        if self.stream is None:
+            try:
+                self.stream = self.path.open("r")
+            except FileNotFoundError:
+                self.stream = None
+                return
         while True:
             line = self.stream.readline()
             if not line:
@@ -196,10 +230,18 @@ class EventRecorder:
         self.err = ""
         self.bt = None
         self.streams = None
-        self.output = None
+        self.batch = []
 
     def __del__(self):
+        self.flush()
         self.stop()
+
+    def flush(self):
+        sys.stdout.write("".join(self.batch))
+        self.batch = []
+
+    def output(self, event):
+        self.batch.append(str(event) + "\n")
 
     def start(self):
         if self.active:
@@ -207,12 +249,12 @@ class EventRecorder:
         self.active = True
         
         # cleanup daemons in case of lttng crash
-        print("Killing LTTNG daemons...")
+        print("Killing LTTNG daemons...", file=sys.stderr)
         pkill("lttng-sessiond")
         pkill("lttng-relayd")
 
         # setup lttng
-        print(f"creating live LTTNG session: {SESSION_NAME}")
+        print(f"creating live LTTNG session: {SESSION_NAME}", file=sys.stderr)
         cmd("lttng-relayd", "--daemonize",
             "--control-port=tcp://127.0.0.1:5342",
             "--data-port=tcp://127.0.0.1:5343",
@@ -231,6 +273,9 @@ class EventRecorder:
         cmd("lttng", "add-context", "--kernel", "--session", SESSION_NAME, "--type=tid", "--type=pid", "--type=procname")
 
         # setup input streams
+        for path in input_args.trace_files:
+            if path.exists():
+                print(f"Warning: path {path} exists before scheduler attached, its data will be included", file=sys.stderr)
         self.streams = [BTStream(), *[TraceStream(path) for path in input_args.trace_files]]
 
         # start lttng
@@ -242,6 +287,8 @@ class EventRecorder:
 
         if self.streams:
             self.update(final=True)
+            for stream in self.streams:
+                print(f"Stream {stream.name}: {stream.total_popped()} events", file=sys.stderr)
             self.streams = None
         
         # stop lttng
@@ -254,6 +301,19 @@ class EventRecorder:
     def update(self, final=False):
         for stream in self.streams:
             stream.poll()
+        heap = [ (stream.front_ts(), i) for i, stream in enumerate(self.streams) if stream.front_ts() is not None ]
+        if not final and len(heap) != len(self.streams):
+            return
+        target_time = INF if final else min((stream.back_ts() for stream in self.streams if stream.back_ts() is not None), default=INF)
+        heapq.heapify(heap)
+        while len(heap) > 0:
+            _, i = heapq.heappop(heap)
+            stream = self.streams[i]
+            self.output(stream.pop())
+            fts = stream.front_ts()
+            if fts is not None and fts <= target_time:
+                heapq.heappush(heap, (fts, i))
+        self.flush()
 
     def run(self):
         # setup
@@ -262,27 +322,27 @@ class EventRecorder:
         # wait for root to attach
         root_sched = None
         self.pending = deque()
-        print("waiting for root...")
+        print("waiting for root...", file=sys.stderr)
         while root_sched is None:
             self.update()
             time.sleep(POLL_PERIOD_S)
             root_sched = check_root_sched()
             if input_args.verbose:
-                print("waiting for root...")
-        print(f"root scx scheduler attached: {root_sched}")
+                print("waiting for root...", file=sys.stderr)
+        print(f"root scx scheduler attached: {root_sched}", file=sys.stderr)
 
         while check_root_sched() is not None:
             self.update()
             time.sleep(POLL_PERIOD_S)
 
-        print("root scx scheduler detached, exiting")
+        print("root scx scheduler detached, exiting", file=sys.stderr)
 
         # cleanup
         self.stop()
         
 recorder = None
 def signal_handler(sig, frame):
-    print("Interrupt detected, exiting gracefully", flush=True)
+    print("Interrupt detected, exiting gracefully", flush=True, file=sys.stderr)
     if recorder:
         recorder.stop()
     sys.exit(0)
@@ -291,7 +351,7 @@ def main():
     global input_args, recorder
 
     if os.geteuid() != 0:
-        print("This script must be run with sudo/root.")
+        print("This script must be run with sudo/root.", file=sys.stderr)
         return
 
     parser = argparse.ArgumentParser()
@@ -317,7 +377,7 @@ def main():
     input_args = parser.parse_args()
     if input_args.cpu is not None:
         os.sched_setaffinity(0, {input_args.cpu})
-        print(f"pinned process to cpu {input_args.cpu}")
+        print(f"pinned process to cpu {input_args.cpu}", file=sys.stderr)
     
     recorder = EventRecorder()
     signal.signal(signal.SIGINT, signal_handler)

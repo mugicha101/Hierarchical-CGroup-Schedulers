@@ -20,16 +20,18 @@
   enum sched_trace_event_type {
     SCHED_TRACE_FUNC_START,
     SCHED_TRACE_FUNC_END,
+    SCHED_TRACE_INIT,
+    SCHED_TRACE_EXIT,
     SCHED_TRACE_CGROUP_INIT_ARGS,
     SCHED_TRACE_SET_WEIGHT_ARGS,
     SCHED_TRACE_SUB_ATTACH_ARGS,
     SCHED_TRACE_SUB_DETACH_ARGS,
     SCHED_TRACE_SUB_PARAMS_UPDATE,
     SCHED_TRACE_SET_TASK_WEIGHT,
-    SCHED_TRACE_SELF,
     SCHED_TRACE_SET_CMASK,
     SCHED_TRACE_INIT_TASK_ARGS,
-    SCHED_TRACE_EXIT_TASK_ARGS
+    SCHED_TRACE_EXIT_TASK_ARGS,
+    SCHED_TRACE_CID_TOPO
   };
 
   // note: each scheduler gets its own ring buffer, so don't need to give scheduler identification
@@ -48,6 +50,16 @@
     struct sched_trace_event_header header;
     char func_name[32];
     char reason[32];
+  };
+
+  struct sched_trace_event_init {
+    struct sched_trace_event_header header;
+    uint64_t cgrp_id;
+  };
+
+  struct sched_trace_event_exit {
+    struct sched_trace_event_header header;
+    uint64_t cgrp_id;
   };
 
   struct sched_trace_event_cgroup_init_args {
@@ -85,11 +97,6 @@
     uint64_t weight;
   };
 
-  struct sched_trace_event_self {
-    struct sched_trace_event_header header;
-    uint64_t cgrp_id;
-  };
-
   struct sched_trace_event_set_cmask {
     struct sched_trace_event_header header;
     uint64_t pid;
@@ -105,6 +112,16 @@
   struct sched_trace_event_exit_task_args {
     struct sched_trace_event_header header;
     uint64_t pid;
+  };
+
+  struct sched_trace_event_cid_topo {
+    struct sched_trace_event_header header;
+    int cid;
+    int cpu;
+    int core;
+    int shard;
+    int llc;
+    int node;
   };
 
   #if TRACING
@@ -225,6 +242,14 @@
           struct sched_trace_event_func_end *event = data;
           fprintf(trace_fd, "FUNC_END: %s %s\n", event->func_name, event->reason);
         } break;
+        case SCHED_TRACE_INIT: {
+          struct sched_trace_event_init *event = data;
+          fprintf(trace_fd, "INIT: cgrp_id=%lu\n", event->cgrp_id);
+        } break;
+        case SCHED_TRACE_EXIT: {
+          struct sched_trace_event_exit *event = data;
+          fprintf(trace_fd, "EXIT: cgrp_id=%lu\n", event->cgrp_id);
+        } break;
         case SCHED_TRACE_CGROUP_INIT_ARGS: {
           struct sched_trace_event_cgroup_init_args *event = data;
           fprintf(trace_fd, "CGROUP_INIT_ARGS: cgrp_id=%lu weight=%lu\n", event->cgrp_id, event->weight);
@@ -249,10 +274,6 @@
           struct sched_trace_event_set_task_weight *event = data;
           fprintf(trace_fd, "SET_TASK_WEIGHT: pid=%lu weight=%lu\n", event->pid, event->weight);
         } break;
-        case SCHED_TRACE_SELF: {
-          struct sched_trace_event_self *event = data;
-          fprintf(trace_fd, "SELF: cgrp_id=%lu\n", event->cgrp_id);
-        } break;
         case SCHED_TRACE_SET_CMASK: {
           struct sched_trace_event_set_cmask *event = data;
           fprintf(trace_fd, "SET_CMASK: pid=%lu cmask=%016lx\n", event->pid, event->cmask);
@@ -264,6 +285,10 @@
         case SCHED_TRACE_EXIT_TASK_ARGS: {
           struct sched_trace_event_exit_task_args *event = data;
           fprintf(trace_fd, "EXIT_TASK_ARGS: pid=%lu\n", event->pid);
+        } break;
+        case SCHED_TRACE_CID_TOPO: {
+          struct sched_trace_event_cid_topo *event = data;
+          fprintf(trace_fd, "CID_TOPO: cid=%d cpu=%d core=%d shard=%d llc=%d node=%d\n", event->cid, event->cpu, event->core, event->shard, event->llc, event->node);
         } break;
         default:
           fprintf(trace_fd, "UNKNOWN_EVENT_TYPE\n");

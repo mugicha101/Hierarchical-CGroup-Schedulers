@@ -247,6 +247,16 @@ cleanup:
 	if (link) bpf_link__destroy(link);
 	ecode = UEI_REPORT(skel, uei);
 
+	#if TRACING
+	// read exit event
+	if (rb_manager) {
+		int err = ring_buffer__poll(rb_manager, 100);
+		if (err < 0) {
+			fprintf(stderr, "Error polling ring buffer: %d\n", err);
+		}
+	}
+	#endif
+
 	if (stats_path && aa) {
 		FILE *stats_fd = fopen(stats_path, "w");
 		if (!stats_fd) {

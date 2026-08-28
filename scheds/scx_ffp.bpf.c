@@ -260,6 +260,14 @@ static __always_inline void root_init() {
       t.shard_cid,
       t.shard_idx
     );
+    TRACE_EVENT(struct sched_trace_event_cid_topo, SCHED_TRACE_CID_TOPO,
+      e->cid = cid;
+      e->cpu = scx_bpf_cid_to_cpu(cid);
+      e->core = t.core_idx;
+      e->shard = t.shard_idx;
+      e->llc = t.llc_idx;
+      e->node = t.node_idx;
+    );
 
     // since cids with core/llc/node unknown (-1) are at back
     // we can allocate a core/llc/node for them at the back upon seeing first
@@ -387,7 +395,7 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(ffp_init)
 {
   TRACE_FUNC_START("init");
   bpf_printk("[INFO] [FP] [INIT] cgroup=%d", cgroup_id);
-  TRACE_EVENT(struct sched_trace_event_self, SCHED_TRACE_SELF,
+  TRACE_EVENT(struct sched_trace_event_init, SCHED_TRACE_INIT,
     e->cgrp_id = cgroup_id;
   );
 
@@ -536,6 +544,9 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(ffp_init)
 
 void BPF_STRUCT_OPS(ffp_exit, struct scx_exit_info *ei)
 {
+  TRACE_EVENT(struct sched_trace_event_exit, SCHED_TRACE_EXIT,
+    e->cgrp_id = cgroup_id;
+  );
   bpf_printk("[INFO] [FP] [EXIT] cgroup=%d\n", cgroup_id);
   UEI_RECORD(uei, ei);
 }
