@@ -19,8 +19,6 @@
 #include <sys/syscall.h>
 #include <linux/sched.h>
 #include <time.h>
-#include "trace_events.h"
-#include "scx_cgss_helpers.h"
 #include "scx_ffp.h"
 
 #include "scx_ffp.bpf.skel.h"
@@ -199,18 +197,18 @@ restart:
 	aa = &skel->arena->aa;
 
 	// pin syscall program if no prior instances of it exist
-	if (access(pin_path, F_OK)) {
-		syscall_prog = bpf_object__find_program_by_name(skel->obj, "update_weight");
-		if (!syscall_prog) {
-			fprintf(stderr, "Error: failed to find update_weight program\n");
-			goto cleanup;
-		}
-		if (bpf_program__pin(syscall_prog, pin_path) < 0) {
-			fprintf(stderr, "Error: failed to pin update_weight program\n");
-			goto cleanup;
-		}
-		fprintf(stdout, "Pinned update_weight program to %s\n", pin_path);
-	}
+	// if (access(pin_path, F_OK)) {
+	// 	syscall_prog = bpf_object__find_program_by_name(skel->obj, "update_weight");
+	// 	if (!syscall_prog) {
+	// 		fprintf(stderr, "Error: failed to find update_weight program\n");
+	// 		goto cleanup;
+	// 	}
+	// 	if (bpf_program__pin(syscall_prog, pin_path) < 0) {
+	// 		fprintf(stderr, "Error: failed to pin update_weight program\n");
+	// 		goto cleanup;
+	// 	}
+	// 	fprintf(stdout, "Pinned update_weight program to %s\n", pin_path);
+	// }
 	
 	fprintf(stdout, "Scheduler Attached\n");
 	fflush(stdout);

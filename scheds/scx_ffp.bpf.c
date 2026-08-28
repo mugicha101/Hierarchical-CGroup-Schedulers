@@ -216,7 +216,7 @@ static __always_inline void set_running_weight(u32 cid, weight_tuple_t wt) {
 }
 
 // dump helper
-static __always_inline u64 cmask_to_int(struct scx_cmask __arena *cmask) {
+static __always_inline u64 cmask_to_u64(struct scx_cmask __arena *cmask) {
   u64 out = 0;
   u32 i;
   bpf_for(i, cmask->base, cmask->nr_cids + cmask->base) {
@@ -387,12 +387,8 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(ffp_init)
 {
   TRACE_FUNC_START("init");
   bpf_printk("[INFO] [FP] [INIT] cgroup=%d", cgroup_id);
-  bpf_printk("SCX_CAP_ENQ_IMMED: %llu", SCX_CAP_ENQ_IMMED);
-  bpf_printk("SCX_CAP_ENQ: %llu", SCX_CAP_ENQ);
-  bpf_printk("SCX_CAP_PREEMPT: %llu", SCX_CAP_PREEMPT);
   TRACE_EVENT(struct sched_trace_event_self, SCHED_TRACE_SELF,
     e->cgrp_id = cgroup_id;
-    e->weight = DEFAULT_CGROUP_WEIGHT;
   );
 
   if (cgroup_id == 0) {
@@ -521,7 +517,7 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(ffp_init)
     bpf_for(j, 0, shard_td->nr_cids) {
       cmask_set(shard_td->base_cid + j, mask);
     }
-    bpf_printk("[INFO] [FP] [INIT] shard[%u] shard_td->nr_cids=%llu base=%llu nr_cids=%llu cmask=%06llx", i, shard_td->nr_cids, mask->base, mask->nr_cids, cmask_to_int(mask));
+    bpf_printk("[INFO] [FP] [INIT] shard[%u] shard_td->nr_cids=%llu base=%llu nr_cids=%llu cmask=%06llx", i, shard_td->nr_cids, mask->base, mask->nr_cids, cmask_to_u64(mask));
   }
 
   // init task data structs
@@ -711,16 +707,16 @@ s32 BPF_STRUCT_OPS(ffp_sub_attach, struct scx_sub_attach_args *args)
   
   sub->cgroup_id = sub_cgroup_id;
   sub->weight = cgroup_curr_weight(sub_cgroup_id);
-  update_porder(cid, sub - aa.sub_scheds);
-
   TRACE_EVENT(struct sched_trace_sub_params_update, SCHED_TRACE_SUB_PARAMS_UPDATE,
     e->idx = sub - aa.sub_scheds;
     e->cgrp_id = sub->cgroup_id;
     e->weight = sub->weight;
   );
+  
+  update_porder(cid, sub - aa.sub_scheds);
 
   // debug output cmask
-  // bpf_printk("[INFO] [FP] [SUB_ATTACH] cgroup=%llu weight=%llu cmask=%016llx", sub_cgroup_id, sub->weight, cmask_to_int(&aa.self_cids.mask));
+  // bpf_printk("[INFO] [FP] [SUB_ATTACH] cgroup=%llu weight=%llu cmask=%016llx", sub_cgroup_id, sub->weight, cmask_to_u64(&aa.self_cids.mask));
 
   scx_bpf_sub_grant(sub_cgroup_id, SCX_CAP_ENQ_IMMED | SCX_CAP_ENQ | SCX_CAP_PREEMPT, (void *)(long)&aa.self_cids.mask, NULL);
   
@@ -762,22 +758,19 @@ void BPF_STRUCT_OPS(ffp_cpuctl_set_weight, struct cgroup *cgrp, u32 weight)
 {
   TRACE_FUNC_START("cpuctl_set_weight");
 
-  struct latency_ctx lctx;
-  lstat_start(&lctx);
-
-  u32 cid = scx_bpf_this_cid();
   u64 sub_cgroup_id = cgrp->kn->id;
   TRACE_EVENT(struct sched_trace_event_set_weight_args, SCHED_TRACE_SET_WEIGHT_ARGS,
     e->cgrp_id = sub_cgroup_id;
     e->weight = weight;
   );
 
+  struct latency_ctx lctx;
+  lstat_start(&lctx);
+
+  u32 cid = scx_bpf_this_cid();
+
   if (sub_cgroup_id == cgroup_id) {
     self_cgroup_weight = weight;
-    TRACE_EVENT(struct sched_trace_event_self, SCHED_TRACE_SELF,
-      e->cgrp_id = cgroup_id;
-      e->weight = weight;
-    );
     TRACE_FUNC_END("cpuctl_set_weight", "SELF");
     return; // self not in subs
   }
@@ -789,13 +782,12 @@ void BPF_STRUCT_OPS(ffp_cpuctl_set_weight, struct cgroup *cgrp, u32 weight)
   }
   
   sub->weight = weight;
-  update_porder(cid, sub - aa.sub_scheds);
-
   TRACE_EVENT(struct sched_trace_sub_params_update, SCHED_TRACE_SUB_PARAMS_UPDATE,
     e->idx = sub - aa.sub_scheds;
     e->cgrp_id = sub->cgroup_id;
     e->weight = sub->weight;
   );
+  update_porder(cid, sub - aa.sub_scheds);
 
   lstat_record(&lctx, &aa.stats[cid].cpuctl_weight_update)
 
@@ -871,19 +863,11 @@ void BPF_STRUCT_OPS(ffp_dispatch, s32 cid, struct task_struct *prev)
 
     cd->curr_idx = idx;
     if (scx_bpf_sub_dispatch(sub_cgroup_id)) {
-      TRACE_EVENT(struct sched_trace_try_sub_dispatch, SCHED_TRACE_TRY_SUB_DISPATCH,
-        e->idx = idx;
-        e->success = true;
-      );
       lstat_record(&lctx_sub, &aa.stats[cid].sub_dispatch);
       lstat_record(&lctx, &aa.stats[cid].dispatch);
       TRACE_FUNC_END("dispatch", "DISPATCHED CGROUP");
       return;
     }
-    TRACE_EVENT(struct sched_trace_try_sub_dispatch, SCHED_TRACE_TRY_SUB_DISPATCH,
-      e->idx = idx;
-      e->success = false;
-    );
   }
   
   lstat_record(&lctx, &aa.stats[cid].dispatch);
@@ -929,6 +913,7 @@ static void __always_inline pick_cid(struct task_struct *p, u32 prev_cid, u64 en
   bool nmig = is_migration_disabled(p);
   weight_tuple_t task_weight = WT_FROM_FIELDS(get_task_weight(p), nmig, self_cgroup_weight, 0);
   task_ctx_t *tctx = get_task_ctx(p);
+  bool weight_changed = tctx->weight != task_weight;
   tctx->weight = task_weight;
 
   // IDLE SEARCH
@@ -1100,7 +1085,7 @@ static void __always_inline pick_cid(struct task_struct *p, u32 prev_cid, u64 en
   u32 cid = scx_bpf_this_cid();
   lstat_record(&lctx, dispatch_type == 0 ? &aa.stats[cid].pick_cid_prev : dispatch_type == 1 ? &aa.stats[cid].pick_cid_idle : &aa.stats[cid].pick_cid_search);
   TRACE_FUNC_END("pick_cid", "");
-  return;
+  goto pick_cid_end;
 
   // NO DISPATCH
   dispatch_fail:
@@ -1112,6 +1097,15 @@ static void __always_inline pick_cid(struct task_struct *p, u32 prev_cid, u64 en
   cid = scx_bpf_this_cid();
   lstat_record(&lctx, dispatch_type == 0 ? &aa.stats[cid].pick_cid_prev : dispatch_type == 1 ? &aa.stats[cid].pick_cid_idle : &aa.stats[cid].pick_cid_search);
   TRACE_FUNC_END("pick_cid", "GLOBAL DSQ");
+
+  pick_cid_end:
+
+  if (unlikely(weight_changed)) {
+    TRACE_EVENT(struct sched_trace_event_set_task_weight, SCHED_TRACE_SET_TASK_WEIGHT,
+      e->pid = p->pid;
+      e->weight = task_weight;
+    );
+  }
 }
 
 s32 BPF_STRUCT_OPS(ffp_select_cid, struct task_struct *p, s32 prev_cid, u64 wake_flags)
@@ -1156,11 +1150,6 @@ void BPF_STRUCT_OPS(ffp_running, struct task_struct *p)
 {
   struct latency_ctx lctx;
   lstat_start(&lctx);
-
-  bpf_printk("[INFO] [FP] [RUNNING] cgroup=%d pid=%d comm=%s", cgroup_id, p->pid, p->comm);
-  TRACE_EVENT(struct sched_trace_event_run_task, SCHED_TRACE_RUN_TASK,
-    e->pid = p->pid;
-  );
   
   u32 cid = scx_bpf_this_cid();
 
@@ -1187,11 +1176,6 @@ void BPF_STRUCT_OPS(ffp_stopping, struct task_struct *p, bool runnable)
   struct latency_ctx lctx;
   lstat_start(&lctx);
 
-  // bpf_printk("[INFO] [FP] [STOPPING] cgroup=%d pid=%d comm=%s runnable=%d", cgroup_id, p->pid, p->comm, runnable);
-  TRACE_EVENT(struct sched_trace_event_stop_task, SCHED_TRACE_STOP_TASK,
-    e->pid = p->pid;
-  );
-
   u32 cid = scx_bpf_this_cid();
   set_running_weight(cid, 0);
 
@@ -1202,37 +1186,33 @@ void BPF_STRUCT_OPS(ffp_stopping, struct task_struct *p, bool runnable)
 // since this only runs in the first attached FP scheduler (typically root), doesn't know the running weight of the tasks in lower cgroups
 // thus just blindly kick
 // can probably improve this by loading a new instance per FP scheduler
-SEC("syscall")
-int BPF_PROG(update_weight, u64 pid, u64 weight) {
-  // bpf_printk("[INFO] [FP] [UPDATE_WEIGHT] Updating weight of task %d to %llu\n", pid, weight);
-  // update weight in map
-  struct task_struct *p = bpf_task_from_pid(pid);
-  if (unlikely(!p)) {
-    return 0; // for verifier, should not happen
-  }
+// SEC("syscall")
+// int BPF_PROG(update_weight, u64 pid, u64 weight) {
+//   // bpf_printk("[INFO] [FP] [UPDATE_WEIGHT] Updating weight of task %d to %llu\n", pid, weight);
+//   // update weight in map
+//   struct task_struct *p = bpf_task_from_pid(pid);
+//   if (unlikely(!p)) {
+//     return 0; // for verifier, should not happen
+//   }
 
-  u64 *task_weight_ptr = bpf_task_storage_get(&task_weights, p, 0, BPF_LOCAL_STORAGE_GET_F_CREATE);
-  if (unlikely(!task_weight_ptr)) {
-    bpf_task_release(p);
-    return 0; // for verifier, should not happen
-  }
-  u32 cid = scx_bpf_task_cid(p);
-  *task_weight_ptr = weight;
-  bpf_task_release(p);
+//   u64 *task_weight_ptr = bpf_task_storage_get(&task_weights, p, 0, BPF_LOCAL_STORAGE_GET_F_CREATE);
+//   if (unlikely(!task_weight_ptr)) {
+//     bpf_task_release(p);
+//     return 0; // for verifier, should not happen
+//   }
+//   u32 cid = scx_bpf_task_cid(p);
+//   *task_weight_ptr = weight;
+//   bpf_task_release(p);
 
-  TRACE_EVENT(struct sched_trace_event_set_task_weight, SCHED_TRACE_SET_TASK_WEIGHT,
-    e->pid = pid;
-    e->weight = weight;
-  );
+//   TRACE_EVENT(struct sched_trace_event_set_task_weight, SCHED_TRACE_SET_TASK_WEIGHT,
+//     e->pid = pid;
+//     e->weight = weight;
+//   );
 
-  // kick cid
-  scx_bpf_kick_cid(cid, (u64)SCX_KICK_PREEMPT);
-  TRACE_EVENT(struct sched_trace_event_kick_cpu, SCHED_TRACE_KICK_CPU,
-    e->cpu = cid;
-  );
+//   // kick cid
 
-  return 0;
-}
+//   return 0;
+// }
 
 void BPF_STRUCT_OPS(ffp_update_idle, s32 cid, bool idle)
 {
@@ -1248,6 +1228,11 @@ void BPF_STRUCT_OPS(ffp_update_idle, s32 cid, bool idle)
 s32 BPF_STRUCT_OPS_SLEEPABLE(ffp_init_task, struct task_struct *p, struct scx_init_task_args *args)
 {
   TRACE_FUNC_START("init_task");
+  
+  TRACE_EVENT(struct sched_trace_event_init_task_args, SCHED_TRACE_INIT_TASK_ARGS,
+    e->pid = p->pid;
+    e->fork = args->fork;
+  );
   struct latency_ctx lctx;
   lstat_start(&lctx);
 
@@ -1301,6 +1286,11 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(ffp_init_task, struct task_struct *p, struct scx_in
 void BPF_STRUCT_OPS(ffp_exit_task, struct task_struct *p)
 {
   TRACE_FUNC_START("exit_task");
+
+  TRACE_EVENT(struct sched_trace_event_exit_task_args, SCHED_TRACE_EXIT_TASK_ARGS,
+    e->pid = p->pid;
+  );
+  
   // bpf_printk("[INFO] [FP] [EXIT_TASK] cgroup=%d pid=%d comm=%s", cgroup_id, p->pid, p->comm);
   struct latency_ctx lctx;
   lstat_start(&lctx);
@@ -1337,13 +1327,18 @@ void BPF_STRUCT_OPS(ffp_set_cmask, struct task_struct *p, const struct scx_cmask
   if (unlikely(!tctx)) return; // for verifier, should not happen
   
 	struct scx_cmask __arena *cmask = (struct scx_cmask __arena *)(long)cmask_in;
-  // u64 old = cmask_to_int(&tctx->cpus_allowed);
+  // u64 old = cmask_to_u64(&tctx->cpus_allowed);
 	cmask_copy(&tctx->cpus_allowed, cmask);
-  // bpf_printk("[INFO] [FP] [SET_CMASK] cgroup=%d pid=%d comm=%s nmig=%d cmask: %06llx ->%06llx", cgroup_id, p->pid, p->comm, is_migration_disabled(p), old, cmask_to_int(&tctx->cpus_allowed));
+  // bpf_printk("[INFO] [FP] [SET_CMASK] cgroup=%d pid=%d comm=%s nmig=%d cmask: %06llx ->%06llx", cgroup_id, p->pid, p->comm, is_migration_disabled(p), old, cmask_to_u64(&tctx->cpus_allowed));
 
   u32 cid = scx_bpf_this_cid();
   lstat_record(&lctx, &aa.stats[cid].set_cmask);
   TRACE_FUNC_END("set_cmask", "");
+
+  TRACE_EVENT(struct sched_trace_event_set_cmask, SCHED_TRACE_SET_CMASK,
+    e->pid = p->pid;
+    e->cmask = cmask_to_u64(&tctx->cpus_allowed);
+  );
 }
 
 void BPF_STRUCT_OPS(ffp_tick, struct task_struct *p) {
