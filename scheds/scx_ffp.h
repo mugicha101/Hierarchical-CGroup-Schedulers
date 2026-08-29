@@ -180,6 +180,7 @@ struct task_ctx {
   struct scx_cmask cpus_allowed;	/* per-task affinity in cid space */
   u64 tid;
   weight_tuple_t weight; // weight tuple of task at enqueue time
+  u32 pending_cid; // target of incomplete task dispatch (SCX_FFP_MAX_CPUS if none)
 };
 /*
  * Slab stride for task_ctx. cpus_allowed's flex array bits[] overlaps the

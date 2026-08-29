@@ -25,6 +25,7 @@ char _license[] SEC("license") = "GPL";
 
 // task scheduling:
 // ignores certain race conditions for lower latency
+// assumes all tasks have same cpuset that is shard aligned (with exception for single cpu tasks)
 // when task enqueued, finds cid to dispatch to by picking first match in this order:
 // - closest idle cpu based on hardware topology
 // - if global_search enabled, min cid within all cid shards that are fully contained within the task's cpu affinity mask
@@ -146,9 +147,39 @@ static __always_inline struct topo_data *fetch_global_topo() {
 // protected by lock
 // shared by all priority schedulers
 struct shard_ctx {
-  weight_tuple_t cid_running_weight[SCX_CID_SHARD_MAX_CPUS];
-  weight_tuple_t min_running; // atomically updated but may be stale if reading without lock, weight tuple with cid stored in misc bits (upper 48 bits)
+  // shard lock
   struct bpf_res_spin_lock lock;
+
+  // pending avoids scenario:
+  //     pick_cid(A) preempts B and sets running weight to A.weight
+  //     stopping(B) sets running weight to 0
+  //     pick_cid(C) preempts A where C.weight < A.weight
+
+  // note: all updates to pending_owner, pending_weight, and running_weight are shard lock protected
+
+  // pick_cid(A):
+  //     if A already pending at A.pending_cid (happens when enq immed fails and reenqs)
+  //         if pending_owner[A.pending_cid] == A:
+  //             pending_weight[A.pending_cid] = 0
+  //             pending_owner[A.pending_cid] = 0
+  //     on dispatch to target_cid:
+  //         pending_weight[target_cid] = A.weight
+  //         pending_owner[target_cid] = A
+  // running(A):
+  //     running_weight[cid] = A.weight
+  //     if pending_owner[cid] == A
+  //         pending_weight[cid] = 0
+  //         pending_owner[cid] = 0
+  // stopping(A):
+  //     running_weight[cid] = 0
+  weight_tuple_t cid_running_weight[SCX_CID_SHARD_MAX_CPUS];
+  weight_tuple_t cid_pending_weight[SCX_CID_SHARD_MAX_CPUS];
+  u64 cid_pending_owner[SCX_CID_SHARD_MAX_CPUS];
+
+  // effective_weight[cid] = max(running_weight[cid], pending_weight[cid])
+  // min_effective = max effective_weight[cid] over all cids in shard (cid stored in misc bits of weight tuple)
+  // atomically updated but may be stale if reading without lock (fine for global search)
+  weight_tuple_t min_effective;
 };
 struct {
   __uint(type, BPF_MAP_TYPE_ARRAY);
@@ -158,13 +189,62 @@ struct {
   __uint(pinning, LIBBPF_PIN_BY_NAME);
 } ffp_shard_ctx_map SEC(".maps");
 
-static __always_inline weight_tuple_t get_running_weight(u32 cid) {
+static __always_inline weight_tuple_t sctx_get_effective_weight(struct shard_ctx *sctx, u32 shard_offset) {
+  // may be stale if shard lock not acquired
+  weight_tuple_t running = sctx->cid_running_weight[shard_offset];
+  weight_tuple_t pending = sctx->cid_pending_weight[shard_offset];
+  return running > pending ? running : pending;
+};
+
+static __always_inline weight_tuple_t get_effective_weight(u32 cid) {
   u32 shard = aa.topo.cids[cid & (SCX_FFP_MAX_CPUS - 1)].shard_idx;
   struct shard_ctx *sctx = bpf_map_lookup_elem(&ffp_shard_ctx_map, &shard);
   u32 shard_offset = cid - aa.topo.shards[shard].base_cid;
   if (unlikely(!sctx || shard_offset >= SCX_CID_SHARD_MAX_CPUS)) return 0; // for verifier, should not happen
 
-  return sctx->cid_running_weight[shard_offset];
+  return sctx_get_effective_weight(sctx, shard_offset);
+}
+
+static __always_inline void update_min_effective_locked(u32 cid, u32 shard, struct shard_ctx *sctx) {
+  u32 shard_offset = cid - aa.topo.shards[shard].base_cid;
+  if (unlikely(!sctx || shard_offset >= SCX_CID_SHARD_MAX_CPUS)) return; // for verifier, should not happen
+
+  weight_tuple_t new_weight = sctx_get_effective_weight(sctx, shard_offset);
+  weight_tuple_t curr_min_weight = WT_STRIP_MISC(sctx->min_effective);
+  u32 curr_min_cid = WT_MISC(sctx->min_effective);
+
+  // if existing min higher than new min, simple update
+  if (new_weight < curr_min_weight) {
+    sctx->min_effective = ((u128)cid << WT_MISC_SHIFT) | new_weight;
+    return;
+  }
+  
+  // if new weight is higher than min, min only changes if the cid matches
+  if (new_weight == curr_min_weight || curr_min_cid != cid) {
+    return;
+  }
+
+  // need to search shard for new min
+  u32 base_cid = aa.topo.shards[shard].base_cid;
+  curr_min_weight = sctx_get_effective_weight(sctx, 0);
+  curr_min_cid = base_cid;
+  u32 end = aa.topo.shards[shard].nr_cids;
+  if (unlikely(end > SCX_CID_SHARD_MAX_CPUS)) end = SCX_CID_SHARD_MAX_CPUS; // for verifier, should not happen
+  
+  u32 i;
+  bpf_for(i, 1, end) {
+    weight_tuple_t w = sctx_get_effective_weight(sctx, i);
+    if (w < curr_min_weight) {
+      curr_min_weight = w;
+      curr_min_cid = i + base_cid;
+    }
+  }
+
+
+  // note: if finds lower existing weight, prev min_running was wrong
+  // but cannot assert due to holding lock, cannot release lock due to verifier
+
+  sctx->min_effective = ((u128)curr_min_cid << WT_MISC_SHIFT) | curr_min_weight;
 }
 
 static __always_inline void set_running_weight_locked(u32 cid, u32 shard, weight_tuple_t wt, struct shard_ctx *sctx) {
@@ -172,47 +252,16 @@ static __always_inline void set_running_weight_locked(u32 cid, u32 shard, weight
   if (unlikely(!sctx || shard_offset >= SCX_CID_SHARD_MAX_CPUS)) return; // for verifier, should not happen
 
   sctx->cid_running_weight[shard_offset] = wt;
-  u128 curr_min_weight = WT_STRIP_MISC(sctx->min_running);
-  u128 curr_min_cid = WT_MISC(sctx->min_running);
-  if (wt < curr_min_weight) {
-    // existing min higher than new min
-    sctx->min_running = ((u128)cid << WT_MISC_SHIFT) | wt;
-  } else if (wt > curr_min_weight && WT_MISC(sctx->min_running) == cid) {
-    // min cid's weight increased, need to search for new min
-    u32 i;
-    curr_min_weight = sctx->cid_running_weight[0];
-    curr_min_cid = 0;
-    u32 end = aa.topo.shards[shard].nr_cids;
-    if (unlikely(end > SCX_CID_SHARD_MAX_CPUS)) end = SCX_CID_SHARD_MAX_CPUS; // for verifier, should not happen
-    bpf_for(i, 1, end) {
-      weight_tuple_t w = sctx->cid_running_weight[i];
-      if (w < curr_min_weight) {
-        curr_min_weight = w;
-        curr_min_cid = i + aa.topo.shards[shard].base_cid;
-      }
-    }
-    
-    // if finds lower existing weight, prev min_running was wrong
-    // but cannot assert due to holding lock, cannot release lock due to verifier
-
-    sctx->min_running = ((u128)curr_min_cid << WT_MISC_SHIFT) | curr_min_weight;
-  } // otherwise, min weight should be same
+  update_min_effective_locked(cid, shard, sctx);
 }
 
-static __always_inline void set_running_weight(u32 cid, weight_tuple_t wt) {
-  u32 shard = aa.topo.cids[cid & (SCX_FFP_MAX_CPUS - 1)].shard_idx;
-  struct shard_ctx *sctx = bpf_map_lookup_elem(&ffp_shard_ctx_map, &shard);
+static __always_inline void set_pending_weight_locked(u32 cid, u32 shard, weight_tuple_t wt, struct shard_ctx *sctx, u64 scx_tid) {
   u32 shard_offset = cid - aa.topo.shards[shard].base_cid;
   if (unlikely(!sctx || shard_offset >= SCX_CID_SHARD_MAX_CPUS)) return; // for verifier, should not happen
 
-  if (unlikely(bpf_res_spin_lock(&sctx->lock))) {
-    scx_bpf_error("failed to acquire shard lock");
-    return;
-  }
-
-  set_running_weight_locked(cid, shard, wt, sctx);
-
-  bpf_res_spin_unlock(&sctx->lock);
+  sctx->cid_pending_weight[shard_offset] = wt;
+  sctx->cid_pending_owner[shard_offset] = scx_tid;
+  update_min_effective_locked(cid, shard, sctx);
 }
 
 // dump helper
@@ -230,7 +279,9 @@ static __always_inline u64 cmask_to_u64(struct scx_cmask __arena *cmask) {
 // init global structures
 // TODO: move to base root scheduler for all hierarchical schedulers to pull from
 static __always_inline void root_init() {
-  u32 nr_cids = scx_bpf_nr_cids() & (SCX_FFP_MAX_CPUS-1);
+  u32 nr_cids = scx_bpf_nr_cids();
+  if (nr_cids > SCX_FFP_MAX_CPUS)
+    nr_cids = SCX_FFP_MAX_CPUS;
   bpf_printk("[INFO] [FP] [INIT] nr_cids=%u", nr_cids);
   
   // init topology
@@ -271,6 +322,7 @@ static __always_inline void root_init() {
 
     // since cids with core/llc/node unknown (-1) are at back
     // we can allocate a core/llc/node for them at the back upon seeing first
+    // TODO: fix bug in case where multiple shards have no-topo nodes
     if (t.core_idx == -1) {
       if (no_topo_core == SCX_FFP_MAX_CPUS) {
         no_topo_core = topo->nr_cores;
@@ -307,6 +359,8 @@ static __always_inline void root_init() {
     topo->nr_cores++;
     core_td->base_cid = t.core_cid;
     core_td->nr_cids = 1;
+    core_td->shard_idx = t.shard_idx;
+    core_td->node_idx = t.node_idx;
     bpf_printk("[INFO] [FP] [INIT] new core: %lld", t.core_idx);
 
     if (t.shard_idx < topo->nr_shards) {
@@ -319,6 +373,8 @@ static __always_inline void root_init() {
     topo->nr_shards++;
     shard_td->base_cid = t.shard_cid;
     shard_td->nr_cids = 1;
+    shard_td->llc_idx = t.llc_idx;
+    shard_td->node_idx = t.node_idx;
     bpf_printk("[INFO] [FP] [INIT] new shard: %lld", t.shard_idx);
 
     if (t.llc_idx < topo->nr_llcs) {
@@ -331,6 +387,7 @@ static __always_inline void root_init() {
     llc_td->base_shard = t.shard_idx;
     llc_td->nr_cids = 1;
     llc_td->nr_shards = 1;
+    llc_td->node_idx = t.node_idx;
     bpf_printk("[INFO] [FP] [INIT] new llc: %lld", t.llc_idx);
 
     if (t.node_idx < topo->nr_nodes) {
@@ -821,7 +878,8 @@ static __always_inline bool try_task_dispatch(u32 cid) {
     if (unlikely(!tctx)) continue; // for verifier, should not happen
     
     // skip tasks that can't run on this cpu (either due to cmask or is non-migratable on another cpu)
-    if (!cmask_test(cid, &tctx->cpus_allowed) && likely(!is_migration_disabled(t) || scx_bpf_task_cid(t) == cid)) {
+    if (!cmask_test(cid, &tctx->cpus_allowed) ||
+      (is_migration_disabled(t) && scx_bpf_task_cid(t) != cid)) {
       continue;
     }
 
@@ -927,6 +985,29 @@ static void __always_inline pick_cid(struct task_struct *p, u32 prev_cid, u64 en
   bool weight_changed = tctx->weight != task_weight;
   tctx->weight = task_weight;
 
+  // handle case where task was re-enqueued from enq_immed
+  // this happens when its pending_cid is still set
+  if (tctx->pending_cid < SCX_FFP_MAX_CPUS) {
+    u32 pending_cid = tctx->pending_cid;
+    tctx->pending_cid = 0;
+    u32 pending_shard = aa.topo.cids[pending_cid].shard_idx;
+    u32 shard_offset = pending_cid - aa.topo.shards[pending_shard].base_cid;
+    struct shard_ctx *sctx = bpf_map_lookup_elem(&ffp_shard_ctx_map, &pending_shard);
+    if (unlikely(bpf_res_spin_lock(&sctx->lock))) {
+      scx_bpf_error("Failed to lock pending shard %u", pending_shard);
+      goto dispatch_fail;
+    }
+
+    // SHARD LOCK CS START
+
+    if (sctx->cid_pending_owner[shard_offset] == p->pid) {
+      set_pending_weight_locked(pending_cid, pending_shard, 0, sctx, 0);
+    }
+    bpf_res_spin_unlock(&sctx->lock);
+
+    // SHARD LOCK CS END
+  }
+
   // IDLE SEARCH
 
   // prev cid
@@ -947,7 +1028,7 @@ static void __always_inline pick_cid(struct task_struct *p, u32 prev_cid, u64 en
 
   // NON MIGRATEABLE / CPU PINNED CASE: just need to check prev cpu
   if (unlikely(nmig) || p->nr_cpus_allowed == 1) {
-    if (task_weight <= get_running_weight(prev_cid)) goto dispatch_fail;
+    if (task_weight <= get_effective_weight(prev_cid)) goto dispatch_fail;
     
     goto dispatch;
   }
@@ -999,7 +1080,7 @@ static void __always_inline pick_cid(struct task_struct *p, u32 prev_cid, u64 en
   if (global_search) {
     u32 cid = scx_bpf_this_cid() & (SCX_FFP_MAX_CPUS - 1);
     struct cid_data __arena *cd = &aa.cid_data[cid];
-    weight_tuple_t min_running = U128_MAX; // min over full overlap shards
+    weight_tuple_t min_effective = U128_MAX; // min over full overlap shards
     cmask_andnot(&cd->tmp_cmask.mask, &cd->tmp_cmask.mask); // use tmp cmask to store candidate shards
     bool partial_exists = false;
     bpf_for(i, 0, aa.topo.nr_shards) {
@@ -1016,18 +1097,19 @@ static void __always_inline pick_cid(struct task_struct *p, u32 prev_cid, u64 en
 
       // since min running can become stale anyways during this search without global lock, we can instead atomically read the min running weight
       barrier_var(sctx);
-      weight_tuple_t shard_min_running = READ_ONCE(sctx->min_running);
-      barrier_var(shard_min_running);
+      weight_tuple_t shard_min_effective = READ_ONCE(sctx->min_effective);
+      barrier_var(shard_min_effective);
 
-      if (WT_STRIP_MISC(shard_min_running) < WT_STRIP_MISC(min_running)) {
-        min_running = shard_min_running;
+      if (WT_STRIP_MISC(shard_min_effective) < WT_STRIP_MISC(min_effective)) {
+        min_effective = shard_min_effective;
+        target_shard = shard;
       }
     }
 
     if (partial_exists) {
       bpf_printk("WARNING: task %d has partial shard overlap, partial shards skipped", p->pid);
     }
-    if (WT_STRIP_MISC(min_running) >= task_weight) {
+    if (WT_STRIP_MISC(min_effective) >= task_weight) {
       // fall back on previous shard
       target_shard = prev_shard;
     }
@@ -1036,62 +1118,51 @@ static void __always_inline pick_cid(struct task_struct *p, u32 prev_cid, u64 en
   struct shard_ctx *sctx = bpf_map_lookup_elem(&ffp_shard_ctx_map, &target_shard);
   if (unlikely(!sctx)) goto dispatch_fail; // for verifier, should not happen
   
-  if (lockless) {
-    // instead of locking shard and searching, we just check min_running atomically
-    
-    barrier_var(sctx);
-    weight_tuple_t shard_min_running = READ_ONCE(sctx->min_running);
-    barrier_var(shard_min_running);
-    
-    // if not in cmask, push to gdsq instead of searching further
-    target_cid = WT_MISC(shard_min_running);
-    if (!cmask_test(target_cid, &tctx->cpus_allowed) || WT_STRIP_MISC(shard_min_running) >= task_weight) {
-      goto dispatch_fail;
-    } else {
-      goto dispatch;
-    }
-  } else {
-    // lock target shard and choose min weight cid to dispatch to (if weight lower than task weight)
-    // TODO: if cmask doesn't match then do full search
-    if (unlikely(bpf_res_spin_lock(&sctx->lock))) {
-      scx_bpf_error("Failed to lock target shard %u", target_shard);
-      goto dispatch_fail;
-    }
+  if (unlikely(bpf_res_spin_lock(&sctx->lock))) {
+    scx_bpf_error("Failed to lock target shard %u", target_shard);
+    goto dispatch_fail;
+  }
 
-    u128 min_running_weight = WT_STRIP_MISC(sctx->min_running);
-    if (task_weight <= min_running_weight) {
+  // SHARD LOCK CS START
+
+  u128 min_weight = WT_STRIP_MISC(sctx->min_effective);
+  target_cid = WT_MISC(sctx->min_effective);
+
+  if (prev_shard == target_shard) {
+    // if min weight matches prev cid's weight, prefer it even if min_cid is different (tie break)
+    u32 shard_offset = prev_cid - aa.topo.shards[target_shard].base_cid;
+    if (unlikely(shard_offset >= SCX_CID_SHARD_MAX_CPUS)) { // for verifier, should not happen
       bpf_res_spin_unlock(&sctx->lock);
       goto dispatch_fail;
     }
-
-    target_cid = WT_MISC(sctx->min_running);
-    if (prev_shard == target_shard) {
-      // if min weight matches prev cid's weight, prefer it even if min_cid is different (tie break)
-      u32 shard_offset = prev_cid - aa.topo.shards[target_shard].base_cid;
-      if (unlikely(shard_offset >= SCX_CID_SHARD_MAX_CPUS)) { // for verifier, should not happen
-        bpf_res_spin_unlock(&sctx->lock);
-        goto dispatch_fail;
-      }
-      
-      u128 prev_cid_weight = sctx->cid_running_weight[shard_offset];
-      if (prev_cid_weight == min_running_weight) {
-        target_cid = prev_cid;
-      }
+    
+    u128 prev_cid_weight = sctx->cid_running_weight[shard_offset];
+    if (prev_cid_weight == min_weight) {
+      target_cid = prev_cid;
     }
-
-    // update running weight while lock held (cannot call scx_bpf_dispatch with lock held)
-    set_running_weight_locked(target_cid, target_shard, task_weight, sctx);
-    bpf_res_spin_unlock(&sctx->lock);
-
-    goto dispatch;
   }
+
+  // if outside cmask, add to gdsq instead since assuming tasks have shard aligned cpusets
+  if (!cmask_test(target_cid, &tctx->cpus_allowed) || task_weight <= min_weight) {
+    bpf_res_spin_unlock(&sctx->lock);
+    goto dispatch_fail;
+  }
+
+  // reserve cid
+  set_pending_weight_locked(target_cid, target_shard, task_weight, sctx, p->scx.tid);
+  tctx->pending_cid = target_cid;
+  bpf_res_spin_unlock(&sctx->lock);
+
+  // SHARD LOCK CS END
+
+  goto dispatch;
 
   // DISPATCH
   // NOTE: does not handle running weight update, should be done with shard lock held if possible
 
   dispatch:
   // SCX_ENQ_PREEMPT handles the kicking
-  scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | (target_cid & (SCX_FFP_MAX_CPUS - 1)), slice, dispatch_type == 2 ? SCX_ENQ_PREEMPT | SCX_ENQ_IMMED : SCX_ENQ_PREEMPT);
+  scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | (target_cid & (SCX_FFP_MAX_CPUS - 1)), slice, SCX_ENQ_PREEMPT | SCX_ENQ_IMMED);
 
   u32 cid = scx_bpf_this_cid();
   lstat_record(&lctx, dispatch_type == 0 ? &aa.stats[cid].pick_cid_prev : dispatch_type == 1 ? &aa.stats[cid].pick_cid_idle : &aa.stats[cid].pick_cid_search);
@@ -1113,7 +1184,7 @@ static void __always_inline pick_cid(struct task_struct *p, u32 prev_cid, u64 en
 
   if (unlikely(weight_changed)) {
     TRACE_EVENT(struct sched_trace_event_set_task_weight, SCHED_TRACE_SET_TASK_WEIGHT,
-      e->pid = p->pid;
+      e->tid = p->pid;
       e->weight = task_weight;
     );
   }
@@ -1166,19 +1237,52 @@ void BPF_STRUCT_OPS(ffp_running, struct task_struct *p)
 
   // check policy of task
   // for SCHED_FIFO or SCHED_RR, set weight to MAX since sched_ext cannot kick it
-  // for SCHED_EXT find their weight in task_weights map
+  // for SCHED_EXT find their weight in task context
   // for other policies, set weight to 0 since they are lower priority than SCHED_EXT
   int policy = BPF_CORE_READ(p, policy);
   weight_tuple_t wt;
+  task_ctx_t *tctx = get_task_ctx(p);
   if (policy != SCHED_EXT) {
     bpf_printk("[WARN] [FP] [RUNNING] Task %d has policy %d", p->pid, policy);
     wt = (policy == SCHED_FIFO || policy == SCHED_RR) ? U128_MAX : 0;
   } else {
-    wt = WT_FROM_FIELDS(get_task_weight(p), is_migration_disabled(p), self_cgroup_weight, 0);
+    if (unlikely(!tctx)) { // should not happen but just incase
+      wt = WT_FROM_FIELDS(get_task_weight(p), is_migration_disabled(p), self_cgroup_weight, 0);
+    } else {
+      wt = tctx->weight;
+    }
   }
 
-  set_running_weight(cid, wt);
+  // update running weight and clear pending weight
+  u32 shard = aa.topo.cids[cid & (SCX_FFP_MAX_CPUS - 1)].shard_idx;
+  struct shard_ctx *sctx = bpf_map_lookup_elem(&ffp_shard_ctx_map, &shard);
+  if (unlikely(!sctx)) return; // for verifier, should not happen
 
+  u32 shard_offset = cid - aa.topo.shards[shard].base_cid;
+  if (unlikely(shard_offset >= SCX_CID_SHARD_MAX_CPUS)) return; // for verifier, should not happen
+
+  if (unlikely(bpf_res_spin_lock(&sctx->lock))) {
+    scx_bpf_error("Failed to lock shard %u", shard);
+    return;
+  }
+  
+  // SHARD LOCK CS START
+  
+  sctx->cid_running_weight[shard_offset] = wt;
+  if (sctx->cid_pending_owner[shard_offset] == p->scx.tid) {
+    // only clear pending if this is the pending owner
+    // case where its not owner: this task won the race to local dsq and pending owner got re-enqueued
+    // in this case, pending owner will clear its pending status in pick_cid
+    sctx->cid_pending_weight[shard_offset] = 0;
+    sctx->cid_pending_owner[shard_offset] = 0;
+  }
+  update_min_effective_locked(cid, shard, sctx);
+
+  bpf_res_spin_unlock(&sctx->lock);
+  
+  // SHARD LOCK CS END
+  
+  if (likely(tctx)) tctx->pending_cid = SCX_FFP_MAX_CPUS;
   lstat_record(&lctx, &aa.stats[cid].running);
 }
 
@@ -1188,7 +1292,25 @@ void BPF_STRUCT_OPS(ffp_stopping, struct task_struct *p, bool runnable)
   lstat_start(&lctx);
 
   u32 cid = scx_bpf_this_cid();
-  set_running_weight(cid, 0);
+
+  // update running weight only
+  u32 shard = aa.topo.cids[cid & (SCX_FFP_MAX_CPUS - 1)].shard_idx;
+  struct shard_ctx *sctx = bpf_map_lookup_elem(&ffp_shard_ctx_map, &shard);
+  if (unlikely(!sctx)) return; // for verifier, should not happen
+
+  u32 shard_offset = cid - aa.topo.shards[shard].base_cid;
+  if (unlikely(shard_offset >= SCX_CID_SHARD_MAX_CPUS)) return; // for verifier, should not happen
+
+  if (unlikely(bpf_res_spin_lock(&sctx->lock))) {
+    scx_bpf_error("Failed to lock shard %u", shard);
+    return;
+  }
+
+  // SHARD LOCK CS START
+
+  set_running_weight_locked(cid, shard, 0, sctx);
+
+  // SHARD LOCK CS END
 
   lstat_record(&lctx, &aa.stats[cid].stopping);
 }
@@ -1216,7 +1338,7 @@ void BPF_STRUCT_OPS(ffp_stopping, struct task_struct *p, bool runnable)
 //   bpf_task_release(p);
 
 //   TRACE_EVENT(struct sched_trace_event_set_task_weight, SCHED_TRACE_SET_TASK_WEIGHT,
-//     e->pid = pid;
+//     e->tid = pid;
 //     e->weight = weight;
 //   );
 
@@ -1241,7 +1363,7 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(ffp_init_task, struct task_struct *p, struct scx_in
   TRACE_FUNC_START("init_task");
   
   TRACE_EVENT(struct sched_trace_event_init_task_args, SCHED_TRACE_INIT_TASK_ARGS,
-    e->pid = p->pid;
+    e->tid = p->pid;
     e->fork = args->fork;
   );
   struct latency_ctx lctx;
@@ -1299,7 +1421,7 @@ void BPF_STRUCT_OPS(ffp_exit_task, struct task_struct *p)
   TRACE_FUNC_START("exit_task");
 
   TRACE_EVENT(struct sched_trace_event_exit_task_args, SCHED_TRACE_EXIT_TASK_ARGS,
-    e->pid = p->pid;
+    e->tid = p->pid;
   );
   
   // bpf_printk("[INFO] [FP] [EXIT_TASK] cgroup=%d pid=%d comm=%s", cgroup_id, p->pid, p->comm);
@@ -1347,7 +1469,7 @@ void BPF_STRUCT_OPS(ffp_set_cmask, struct task_struct *p, const struct scx_cmask
   TRACE_FUNC_END("set_cmask", "");
 
   TRACE_EVENT(struct sched_trace_event_set_cmask, SCHED_TRACE_SET_CMASK,
-    e->pid = p->pid;
+    e->tid = p->pid;
     e->cmask = cmask_to_u64(&tctx->cpus_allowed);
   );
 }

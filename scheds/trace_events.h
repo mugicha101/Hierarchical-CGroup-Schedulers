@@ -93,25 +93,25 @@
 
   struct sched_trace_event_set_task_weight {
     struct sched_trace_event_header header;
-    uint64_t pid;
+    uint64_t tid;
     uint64_t weight;
   };
 
   struct sched_trace_event_set_cmask {
     struct sched_trace_event_header header;
-    uint64_t pid;
+    uint64_t tid;
     uint64_t cmask;
   };
 
   struct sched_trace_event_init_task_args {
     struct sched_trace_event_header header;
-    uint64_t pid;
+    uint64_t tid;
     bool fork;
   };
 
   struct sched_trace_event_exit_task_args {
     struct sched_trace_event_header header;
-    uint64_t pid;
+    uint64_t tid;
   };
 
   struct sched_trace_event_cid_topo {
@@ -272,19 +272,19 @@
         } break;
         case SCHED_TRACE_SET_TASK_WEIGHT: {
           struct sched_trace_event_set_task_weight *event = data;
-          fprintf(trace_fd, "SET_TASK_WEIGHT: pid=%lu weight=%lu\n", event->pid, event->weight);
+          fprintf(trace_fd, "SET_TASK_WEIGHT: tid=%lu weight=%lu\n", event->tid, event->weight);
         } break;
         case SCHED_TRACE_SET_CMASK: {
           struct sched_trace_event_set_cmask *event = data;
-          fprintf(trace_fd, "SET_CMASK: pid=%lu cmask=%016lx\n", event->pid, event->cmask);
+          fprintf(trace_fd, "SET_CMASK: tid=%lu cmask=%016lx\n", event->tid, event->cmask);
         } break;
         case SCHED_TRACE_INIT_TASK_ARGS: {
           struct sched_trace_event_init_task_args *event = data;
-          fprintf(trace_fd, "INIT_TASK_ARGS: pid=%lu fork=%d\n", event->pid, event->fork);
+          fprintf(trace_fd, "INIT_TASK_ARGS: tid=%lu fork=%d\n", event->tid, event->fork);
         } break;
         case SCHED_TRACE_EXIT_TASK_ARGS: {
           struct sched_trace_event_exit_task_args *event = data;
-          fprintf(trace_fd, "EXIT_TASK_ARGS: pid=%lu\n", event->pid);
+          fprintf(trace_fd, "EXIT_TASK_ARGS: tid=%lu\n", event->tid);
         } break;
         case SCHED_TRACE_CID_TOPO: {
           struct sched_trace_event_cid_topo *event = data;
