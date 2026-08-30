@@ -136,6 +136,13 @@ class BTStream(SourceStream):
                     "prev_comm": str(data["prev_comm"]),
                     "next_comm": str(data["next_comm"])
                 }
+            case "sched_waking" | "sched_wakeup" | "sched_wakeup_new":
+                data = event.payload_field
+                output = {
+                    "tid": int(data["tid"]),
+                    "comm": str(data["comm"]),
+                    "target_cpu": int(data["target_cpu"])
+                }
             case "syscall_entry_bpf":
                 data = event.payload_field
                 if int(data["cmd"]) != BPF_MAP_UPDATE_ELEM_CMD:
@@ -161,9 +168,10 @@ class BTStream(SourceStream):
         ts = snap.value * 1_000_000_000 // snap.clock_class.frequency
         self.pending.append(Event(ts, event.name, output))
 
-    def poll(self):
+    def poll(self, max_msgs=1048576):
         try:
-            for msg in self.bt:
+            for _ in range(max_msgs):
+                msg = next(self.bt)
                 self.handle_msg(msg)
         except bt2.TryAgain:
             pass
@@ -264,6 +272,15 @@ class EventRecorder:
         cmd("lttng", "enable-event", "--kernel", "sched_switch",
             "--session", SESSION_NAME
         )
+        cmd("lttng", "enable-event", "--kernel", "sched_waking",
+            "--session", SESSION_NAME
+        )
+        cmd("lttng", "enable-event", "--kernel", "sched_wakeup",
+            "--session", SESSION_NAME
+        )
+        cmd("lttng", "enable-event", "--kernel", "sched_wakeup_new",
+            "--session", SESSION_NAME
+        )
         cmd("lttng", "enable-event", "--kernel", "--syscall", "bpf",
             "--session", SESSION_NAME
         )
@@ -325,7 +342,6 @@ class EventRecorder:
         print("waiting for root...", file=sys.stderr)
         while root_sched is None:
             self.update()
-            time.sleep(POLL_PERIOD_S)
             root_sched = check_root_sched()
             if input_args.verbose:
                 print("waiting for root...", file=sys.stderr)
@@ -333,7 +349,6 @@ class EventRecorder:
 
         while check_root_sched() is not None:
             self.update()
-            time.sleep(POLL_PERIOD_S)
 
         print("root scx scheduler detached, exiting", file=sys.stderr)
 
@@ -341,7 +356,12 @@ class EventRecorder:
         self.stop()
         
 recorder = None
+reentrant = False
 def signal_handler(sig, frame):
+    global reentrant
+    if reentrant:
+        sys.exit(0)
+    reentrant = True
     print("Interrupt detected, exiting gracefully", flush=True, file=sys.stderr)
     if recorder:
         recorder.stop()
