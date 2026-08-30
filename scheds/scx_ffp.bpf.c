@@ -34,6 +34,7 @@ char _license[] SEC("license") = "GPL";
 // when cpu goes idle, dispatches max weight task with matching cpu affinity in global dispatch queue (if any)
 
 // TODO: ensure search checks capabilities consistently (currently only checks in idle search)
+// TODO: replace all verifier sat checks with explicit errors
 
 const volatile u64 cgroup_id; // id of this cgroup, 0 if root
 const volatile u32 max_tasks; // max tasks allowed in the cgroup (include non-scx, stores a cmask for all tasks)
@@ -177,7 +178,7 @@ struct shard_ctx {
   u64 cid_pending_owner[SCX_CID_SHARD_MAX_CPUS];
 
   // effective_weight[cid] = max(running_weight[cid], pending_weight[cid])
-  // min_effective = max effective_weight[cid] over all cids in shard (cid stored in misc bits of weight tuple)
+  // min_effective = min effective_weight[cid] over all cids in shard (cid stored in misc bits of weight tuple)
   // atomically updated but may be stale if reading without lock (fine for global search)
   weight_tuple_t min_effective;
 };
@@ -360,6 +361,7 @@ static __always_inline void root_init() {
     core_td->base_cid = t.core_cid;
     core_td->nr_cids = 1;
     core_td->shard_idx = t.shard_idx;
+    core_td->llc_idx = t.llc_idx;
     core_td->node_idx = t.node_idx;
     bpf_printk("[INFO] [FP] [INIT] new core: %lld", t.core_idx);
 
@@ -376,6 +378,21 @@ static __always_inline void root_init() {
     shard_td->llc_idx = t.llc_idx;
     shard_td->node_idx = t.node_idx;
     bpf_printk("[INFO] [FP] [INIT] new shard: %lld", t.shard_idx);
+
+    // clear new shard context in case junk from prior scheduler
+    struct shard_ctx *sctx = bpf_map_lookup_elem(&ffp_shard_ctx_map, &t.shard_idx);
+    if (unlikely(!sctx)) { // for verifier, should not happen
+      scx_bpf_error("Failed to lookup shard %d", t.shard_idx);
+      return;
+    }
+    
+    u32 i;
+    bpf_for(i, 0, SCX_CID_SHARD_MAX_CPUS) {
+      sctx->cid_pending_owner[i] = 0;
+      sctx->cid_pending_weight[i] = 0;
+      sctx->cid_running_weight[i] = 0;
+    }
+    sctx->min_effective = (weight_tuple_t)shard_td->base_cid << WT_MISC_SHIFT;
 
     if (t.llc_idx < topo->nr_llcs) {
       bpf_assert(llc_td->base_cid == t.llc_cid);
@@ -466,6 +483,8 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(ffp_init)
   u32 cid;
   u32 i;
   u32 nr_cids = scx_bpf_nr_cids();
+  if (nr_cids > SCX_FFP_MAX_CPUS) nr_cids = SCX_FFP_MAX_CPUS;
+
   bpf_for(i, 0, MAX_SUB_SCHEDS) {
     aa.porder[i] = i;
   }
@@ -591,7 +610,7 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(ffp_init)
   } else {
     // root cgroup
     dsq_id = 1;
-    self_cgroup_weight = ~0ULL;
+    self_cgroup_weight = WT_CGRP_WEIGHT_MASK;
   }
   scx_bpf_create_dsq(dsq_id, -1);
 
@@ -857,13 +876,13 @@ void BPF_STRUCT_OPS(ffp_cpuctl_set_weight, struct cgroup *cgrp, u32 weight)
   );
   update_porder(cid, sub - aa.sub_scheds);
 
-  lstat_record(&lctx, &aa.stats[cid].cpuctl_weight_update)
+  lstat_record(&lctx, &aa.stats[cid].cpuctl_weight_update);
 
   TRACE_FUNC_END("cpuctl_set_weight", "");
 }
 
 // attempt to dispatch a task from global dsq to local dsq
-static __always_inline bool try_task_dispatch(u32 cid) {
+static __always_inline bool try_task_dispatch(u32 cid, u64 prev_pid) {
   TRACE_FUNC_START("try_task_dispatch")
   if (unlikely(cid >= SCX_FFP_MAX_CPUS)) return false; // for verifier, should not happen
 
@@ -880,19 +899,44 @@ static __always_inline bool try_task_dispatch(u32 cid) {
     // skip tasks that can't run on this cpu (either due to cmask or is non-migratable on another cpu)
     if (!cmask_test(cid, &tctx->cpus_allowed) ||
       (is_migration_disabled(t) && scx_bpf_task_cid(t) != cid)) {
+      HOTPATH_TRACE_EVENT(struct sched_trace_event_dispatch_gdsq_iter, SCHED_TRACE_DISPATCH_GDSQ_ITER,
+        e->result = SCHED_TRACE_DISPATCH_GDSQ_ITER_CMASK_MISMATCH;
+        e->tid = t->pid;
+        e->weight = WT_LOWER_FROM_VTIME(t->scx.dsq_vtime);
+      );
       continue;
     }
 
     // this move only fails if another cpu's dispatch claims the task first
     if (likely(scx_bpf_dsq_move(BPF_FOR_EACH_ITER, t, SCX_DSQ_LOCAL, 0))) {
       moved = true;
+      HOTPATH_TRACE_EVENT(struct sched_trace_event_dispatch_gdsq_iter, SCHED_TRACE_DISPATCH_GDSQ_ITER,
+        e->result = SCHED_TRACE_DISPATCH_GDSQ_ITER_SUCCESS;
+        e->tid = t->pid;
+        e->weight = WT_LOWER_FROM_VTIME(t->scx.dsq_vtime);
+      );
       break;
     }
+
+    HOTPATH_TRACE_EVENT(struct sched_trace_event_dispatch_gdsq_iter, SCHED_TRACE_DISPATCH_GDSQ_ITER,
+      e->result = SCHED_TRACE_DISPATCH_GDSQ_ITER_MOVE_FAIL;
+      e->tid = t->pid;
+      e->weight = WT_LOWER_FROM_VTIME(t->scx.dsq_vtime);
+    );
   }
 
   lstat_record(&lctx, &aa.stats[cid].task_dispatch);
 
   TRACE_FUNC_END("try_task_dispatch", moved ? "MOVED" : "NOT MOVED");
+
+  if (moved) {
+    HOTPATH_TRACE_EVENT(struct sched_trace_event_dispatch_result, SCHED_TRACE_DISPATCH_RESULT,
+      e->sub_dispatch = false;
+      e->prev_tid = prev_pid;
+      e->next_tid = t->pid;
+      e->next_weight = WT_LOWER_FROM_VTIME(t->scx.dsq_vtime);
+    );
+  }
   return moved;
 }
 
@@ -909,7 +953,7 @@ void BPF_STRUCT_OPS(ffp_dispatch, s32 cid, struct task_struct *prev)
   cid = cid & (SCX_FFP_MAX_CPUS - 1); // for verifier
 
   // dispatch task
-  if (try_task_dispatch(cid)) {
+  if (try_task_dispatch(cid, prev ? prev->pid : 0)) {
     lstat_record(&lctx, &aa.stats[cid].dispatch);
     TRACE_FUNC_END("dispatch", "DISPATCHED TASK");
     return;
@@ -935,12 +979,25 @@ void BPF_STRUCT_OPS(ffp_dispatch, s32 cid, struct task_struct *prev)
       lstat_record(&lctx_sub, &aa.stats[cid].sub_dispatch);
       lstat_record(&lctx, &aa.stats[cid].dispatch);
       TRACE_FUNC_END("dispatch", "DISPATCHED CGROUP");
+
+      HOTPATH_TRACE_EVENT(struct sched_trace_event_dispatch_result, SCHED_TRACE_DISPATCH_RESULT,
+        e->sub_dispatch = true;
+        e->prev_tid = prev ? prev->pid : 0;
+        e->next_tid = idx;
+        e->next_weight = aa.sub_scheds[idx].weight;
+      );
       return;
     }
   }
   
   lstat_record(&lctx, &aa.stats[cid].dispatch);
   TRACE_FUNC_END("dispatch", "NO READY SUBS");
+  HOTPATH_TRACE_EVENT(struct sched_trace_event_dispatch_result, SCHED_TRACE_DISPATCH_RESULT,
+    e->sub_dispatch = false;
+    e->prev_tid = prev ? prev->pid : 0;
+    e->next_tid = 0;
+    e->next_weight = 0;
+  );
   return; // no sub schedulers
 }
 
@@ -989,10 +1046,21 @@ static void __always_inline pick_cid(struct task_struct *p, u32 prev_cid, u64 en
   // this happens when its pending_cid is still set
   if (tctx->pending_cid < SCX_FFP_MAX_CPUS) {
     u32 pending_cid = tctx->pending_cid;
-    tctx->pending_cid = 0;
     u32 pending_shard = aa.topo.cids[pending_cid].shard_idx;
+    if (unlikely(pending_shard >= SCX_FFP_MAX_CPUS)) {
+      scx_bpf_error("Invalid pending shard %u", pending_shard);
+      return;
+    }
     u32 shard_offset = pending_cid - aa.topo.shards[pending_shard].base_cid;
+    if (unlikely(pending_cid < aa.topo.shards[pending_shard].base_cid || shard_offset >= SCX_CID_SHARD_MAX_CPUS)) {
+      scx_bpf_error("Failed to fetch pending cid %u or pending shard %u", pending_cid, pending_shard);
+      return;
+    }
     struct shard_ctx *sctx = bpf_map_lookup_elem(&ffp_shard_ctx_map, &pending_shard);
+    if (unlikely(!sctx)) {
+      scx_bpf_error("Failed to lookup pending shard %u", pending_shard);
+      return;
+    }
     if (unlikely(bpf_res_spin_lock(&sctx->lock))) {
       scx_bpf_error("Failed to lock pending shard %u", pending_shard);
       goto dispatch_fail;
@@ -1000,12 +1068,13 @@ static void __always_inline pick_cid(struct task_struct *p, u32 prev_cid, u64 en
 
     // SHARD LOCK CS START
 
-    if (sctx->cid_pending_owner[shard_offset] == p->pid) {
+    if (sctx->cid_pending_owner[shard_offset] == p->scx.tid) {
       set_pending_weight_locked(pending_cid, pending_shard, 0, sctx, 0);
     }
     bpf_res_spin_unlock(&sctx->lock);
 
     // SHARD LOCK CS END
+    tctx->pending_cid = SCX_FFP_MAX_CPUS;
   }
 
   // IDLE SEARCH
@@ -1136,7 +1205,7 @@ static void __always_inline pick_cid(struct task_struct *p, u32 prev_cid, u64 en
       goto dispatch_fail;
     }
     
-    u128 prev_cid_weight = sctx->cid_running_weight[shard_offset];
+    u128 prev_cid_weight = sctx_get_effective_weight(sctx, shard_offset);
     if (prev_cid_weight == min_weight) {
       target_cid = prev_cid;
     }
@@ -1172,6 +1241,8 @@ static void __always_inline pick_cid(struct task_struct *p, u32 prev_cid, u64 en
   // NO DISPATCH
   dispatch_fail:
 
+  target_cid = SCX_FFP_MAX_CPUS;
+
   // enqueue to global dsq instead
   u64 vtime = WT_VTIME_FROM_LOWER(WT_LOWER(task_weight));
   scx_bpf_dsq_insert_vtime(p, dsq_id, slice, vtime, enq_flags);
@@ -1188,6 +1259,29 @@ static void __always_inline pick_cid(struct task_struct *p, u32 prev_cid, u64 en
       e->weight = task_weight;
     );
   }
+
+  HOTPATH_TRACE_EVENT(struct sched_trace_event_pick_cid_result, SCHED_TRACE_PICK_CID_RESULT,
+    enum sched_trace_pick_cid_type type;
+    switch (dispatch_type) {
+      case 0:
+        type = nmig ? SCHED_TRACE_PICK_CID_NMIG : SCHED_TRACE_PICK_CID_PREV_IMMED;
+        break;
+      case 1:
+        type = SCHED_TRACE_PICK_CID_IDLE;
+        break;
+      case 2:
+        type = SCHED_TRACE_PICK_CID_SEARCH;
+        break;
+      default: // should not happen
+        type = SCHED_TRACE_PICK_CID_NMIG;
+        break;
+    }
+    e->type = type;
+    e->tid = p->pid;
+    e->enq_flags = enq_flags;
+    e->prev_cid = prev_cid;
+    e->target_cid = target_cid == SCX_FFP_MAX_CPUS ? -1 : target_cid;
+  );
 }
 
 s32 BPF_STRUCT_OPS(ffp_select_cid, struct task_struct *p, s32 prev_cid, u64 wake_flags)
@@ -1209,6 +1303,12 @@ void BPF_STRUCT_OPS(ffp_enqueue, struct task_struct *p, u64 enq_flags)
 {
   // bpf_printk("[INFO] [FP] [ENQUEUE] cgroup=%d pid=%d comm=%s enq_flags=%llu", cgroup_id, p->pid, p->comm, enq_flags);
   TRACE_FUNC_START("enqueue");
+
+  HOTPATH_TRACE_EVENT(struct sched_trace_event_enqueue_args, SCHED_TRACE_ENQUEUE_ARGS,
+    e->enq_flags = enq_flags;
+    e->prev_cid = (u32)scx_bpf_task_cid(p);
+    e->tid = p->pid;
+  );
 
   struct latency_ctx lctx;
   lstat_start(&lctx);
@@ -1284,6 +1384,11 @@ void BPF_STRUCT_OPS(ffp_running, struct task_struct *p)
   
   if (likely(tctx)) tctx->pending_cid = SCX_FFP_MAX_CPUS;
   lstat_record(&lctx, &aa.stats[cid].running);
+
+  HOTPATH_TRACE_EVENT(struct sched_trace_event_running, SCHED_TRACE_RUNNING,
+    e->tid = p->pid;
+    e->weight = WT_LOWER(wt);
+  );
 }
 
 void BPF_STRUCT_OPS(ffp_stopping, struct task_struct *p, bool runnable)
@@ -1309,10 +1414,16 @@ void BPF_STRUCT_OPS(ffp_stopping, struct task_struct *p, bool runnable)
   // SHARD LOCK CS START
 
   set_running_weight_locked(cid, shard, 0, sctx);
+  bpf_res_spin_unlock(&sctx->lock);
 
   // SHARD LOCK CS END
 
   lstat_record(&lctx, &aa.stats[cid].stopping);
+
+  HOTPATH_TRACE_EVENT(struct sched_trace_event_stopping, SCHED_TRACE_STOPPING,
+    e->tid = p->pid;
+    e->runnable = runnable;
+  );
 }
 
 // update weight of current running task
@@ -1387,7 +1498,8 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(ffp_init_task, struct task_struct *p, struct scx_in
 
   tctx->tid = p->scx.tid;
   tctx->weight = DEFAULT_TASK_WEIGHT; // will be overwritten in pick_cid anyways no reason to set here
-	cmask_init(&tctx->cpus_allowed, 0, scx_bpf_nr_cids());
+  tctx->pending_cid = SCX_FFP_MAX_CPUS;
+	cmask_init(&tctx->cpus_allowed, 0, aa.topo.nr_cids);
   
 	bpf_rcu_read_lock();
 	cmask_from_cpumask(&tctx->cpus_allowed, p->cpus_ptr);

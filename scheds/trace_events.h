@@ -1,8 +1,9 @@
 // trace events + latency stats
 
-// only captures low-frequency events (i.e. not every enqueue/dispatch)
+// without HOTPATH_TRACING, only captures low-frequency events (i.e. not every enqueue/dispatch)
 // rest can be captured through switch events, latency stats, tracebox, and scx_tracer (if can get working)
 // omitted from latency stats wherever possible unless denotes update that is immediately useable by other cpus
+// with HOTPATH_TRACING latency will be a lot higher, but trace will have enough info to reconstruct execution without needing LTTNG
 
 // TODO: fix and cleanup SCX_TRACER
 
@@ -14,10 +15,12 @@
   #define __TRACE_EVENTS_H
 
   #define TRACING 1
+  #define HOTPATH_TRACING 1
   #define SCX_TRACER 0
   #define TRACE_FUNCS 0
 
   enum sched_trace_event_type {
+    // non-hotpath
     SCHED_TRACE_FUNC_START,
     SCHED_TRACE_FUNC_END,
     SCHED_TRACE_INIT,
@@ -31,7 +34,29 @@
     SCHED_TRACE_SET_CMASK,
     SCHED_TRACE_INIT_TASK_ARGS,
     SCHED_TRACE_EXIT_TASK_ARGS,
-    SCHED_TRACE_CID_TOPO
+    SCHED_TRACE_CID_TOPO,
+
+    // hotpath
+    SCHED_TRACE_ENQUEUE_ARGS,
+    SCHED_TRACE_SELECT_CID_ARGS,
+    SCHED_TRACE_PICK_CID_RESULT,
+    SCHED_TRACE_DISPATCH_RESULT,
+    SCHED_TRACE_DISPATCH_GDSQ_ITER,
+    SCHED_TRACE_RUNNING,
+    SCHED_TRACE_STOPPING
+  };
+
+  enum sched_trace_pick_cid_type {
+    SCHED_TRACE_PICK_CID_PREV_IMMED, // pick prev cid prior to any search
+    SCHED_TRACE_PICK_CID_NMIG, // nmig task
+    SCHED_TRACE_PICK_CID_IDLE, // find idle cid
+    SCHED_TRACE_PICK_CID_SEARCH // search for running task to preempt
+  };
+
+  enum sched_trace_event_dispatch_gdsq_iter_result {
+    SCHED_TRACE_DISPATCH_GDSQ_ITER_CMASK_MISMATCH,
+    SCHED_TRACE_DISPATCH_GDSQ_ITER_MOVE_FAIL,
+    SCHED_TRACE_DISPATCH_GDSQ_ITER_SUCCESS
   };
 
   // note: each scheduler gets its own ring buffer, so don't need to give scheduler identification
@@ -124,6 +149,56 @@
     int node;
   };
 
+  struct sched_trace_event_enqueue_args {
+    struct sched_trace_event_header header;
+    uint64_t tid;
+    int prev_cid;
+    uint64_t enq_flags;
+  };
+
+  struct sched_trace_event_select_cid_args {
+    struct sched_trace_event_header header;
+    uint64_t tid;
+    int prev_cid;
+    uint64_t wake_flags;
+  };
+
+  struct sched_trace_event_pick_cid_result {
+    struct sched_trace_event_header header;
+    enum sched_trace_pick_cid_type type;
+    uint64_t tid;
+    uint32_t prev_cid;
+    uint64_t enq_flags;
+    int target_cid; // -1 if dispatched to gdsq
+  };
+
+  struct sched_trace_event_dispatch_result {
+    struct sched_trace_event_header header;
+    bool sub_dispatch;
+    uint64_t prev_tid; // 0 if none
+    uint64_t next_tid; // 0 if none, task tid if !sub_dispatch, sub index if sub_dispatch
+    uint64_t next_weight; // task weight if !sub_dispatch, sub weight if sub_dispatch
+  };
+
+  struct sched_trace_event_dispatch_gdsq_iter {
+    struct sched_trace_event_header header;
+    enum sched_trace_event_dispatch_gdsq_iter_result result;
+    uint64_t tid;
+    uint64_t weight;
+  };
+
+  struct sched_trace_event_running {
+    struct sched_trace_event_header header;
+    uint64_t tid;
+    uint64_t weight;
+  };
+
+  struct sched_trace_event_stopping {
+    struct sched_trace_event_header header;
+    uint64_t tid;
+    bool runnable;
+  };
+
   #if TRACING
 
     #define TRACE_EVENT(STRUCT_TYPE, EVENT_TYPE, ...) \
@@ -136,7 +211,7 @@
         else { \
           e->header.timestamp = timestamp; \
           e->header.type = EVENT_TYPE; \
-          e->header.cid = bpf_get_smp_processor_id(); \
+          e->header.cid = scx_bpf_this_cid(); \
           __VA_ARGS__ \
           bpf_ringbuf_submit(e, 0); \
         } \
@@ -154,7 +229,7 @@
       extern void scx_custom_trace_event_instant(const char *name__str) __ksym; \
       struct { \
           __uint(type, BPF_MAP_TYPE_RINGBUF); \
-          __uint(max_entries, 256 * 1024); \
+          __uint(max_entries, 8 * 1024 * 1024); \
       } trace_buff SEC(".maps");
 
     #else
@@ -290,6 +365,34 @@
           struct sched_trace_event_cid_topo *event = data;
           fprintf(trace_fd, "CID_TOPO: cid=%d cpu=%d core=%d shard=%d llc=%d node=%d\n", event->cid, event->cpu, event->core, event->shard, event->llc, event->node);
         } break;
+        case SCHED_TRACE_ENQUEUE_ARGS: {
+          struct sched_trace_event_enqueue_args *event = data;
+          fprintf(trace_fd, "ENQUEUE_ARGS: tid=%lu prev_cid=%d enq_flags=0x%lx\n", event->tid, event->prev_cid, event->enq_flags);
+        } break;
+        case SCHED_TRACE_SELECT_CID_ARGS: {
+          struct sched_trace_event_select_cid_args *event = data;
+          fprintf(trace_fd, "SELECT_CID_ARGS: tid=%lu prev_cid=%d wake_flags=0x%lx\n", event->tid, event->prev_cid, event->wake_flags);
+        } break;
+        case SCHED_TRACE_PICK_CID_RESULT: {
+          struct sched_trace_event_pick_cid_result *event = data;
+          fprintf(trace_fd, "PICK_CID_RESULT: type=%d tid=%lu prev_cid=%u enq_flags=0x%lx target_cid=%d\n", event->type, event->tid, event->prev_cid, event->enq_flags, event->target_cid);
+        } break;
+        case SCHED_TRACE_DISPATCH_RESULT: {
+          struct sched_trace_event_dispatch_result *event = data;
+          fprintf(trace_fd, "DISPATCH_RESULT: sub_dispatch=%d prev_tid=%lu next_tid=%lu next_weight=%lu\n", event->sub_dispatch, event->prev_tid, event->next_tid, event->next_weight);
+        } break;
+        case SCHED_TRACE_DISPATCH_GDSQ_ITER: {
+          struct sched_trace_event_dispatch_gdsq_iter *event = data;
+          fprintf(trace_fd, "DISPATCH_GDSQ_ITER: result=%d tid=%lu weight=%lu\n", event->result, event->tid, event->weight);
+        } break;
+        case SCHED_TRACE_RUNNING: {
+          struct sched_trace_event_running *event = data;
+          fprintf(trace_fd, "RUNNING: tid=%lu weight=%lu\n", event->tid, event->weight);
+        } break;
+        case SCHED_TRACE_STOPPING: {
+          struct sched_trace_event_stopping *event = data;
+          fprintf(trace_fd, "STOPPING: tid=%lu runnable=%d\n", event->tid, event->runnable);
+        } break;
         default:
           fprintf(trace_fd, "UNKNOWN_EVENT_TYPE\n");
       }
@@ -297,6 +400,12 @@
       return 0;
     }
 
+  #endif
+
+  #if HOTPATH_TRACING
+    #define HOTPATH_TRACE_EVENT(STRUCT_TYPE, EVENT_TYPE, ...) TRACE_EVENT(STRUCT_TYPE, EVENT_TYPE, __VA_ARGS__)
+  #else
+    #define HOTPATH_TRACE_EVENT(STRUCT_TYPE, EVENT_TYPE, ...)
   #endif
 
   // LATENCY STATS

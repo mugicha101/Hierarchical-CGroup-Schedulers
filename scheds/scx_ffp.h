@@ -18,29 +18,34 @@
 #define u128 unsigned __int128
 
 // weight tuple consists of 2 64 bit halves
-// upper: misc data (48 bits), cgrp_weight (16 bits)
-// lower: is_nmig(1 bit), task_weight (63 bits)
+// upper: misc data [127..80], cgrp_weight [79..64]
+// lower: is_nmig [63], task_weight [62..0]
 // inverse of lower is used as vtime in global dsq
 typedef u128 weight_tuple_t;
 #define WT_IS_NMIG_SHIFT 63
 #define WT_CGRP_WEIGHT_SHIFT 64
-#define WT_MISC_SHIFT 112
+#define WT_MISC_SHIFT 80
 const u128 U128_MAX = (((u128)(~0ULL)) << 64) | (u128)(~0ULL);
 
+#define WT_TASK_WEIGHT_MASK 0x7fffffffffffffffull
+#define WT_IS_NMIG_MASK 1
+#define WT_CGRP_WEIGHT_MASK 0xffffull
+#define WT_MISC_MASK 0xffffffffffffull
+
 // extraction macros
-#define WT_TASK_WEIGHT(wt) ((u64)wt & 0x7fffffffffffffffull)
-#define WT_IS_NMIG(wt) ((bool)((wt) >> WT_IS_NMIG_SHIFT & 1))
-#define WT_CGRP_WEIGHT(wt) ((u64)((wt) >> WT_CGRP_WEIGHT_SHIFT) & 0xffffull)
-#define WT_MISC(wt) ((u64)((wt) >> WT_MISC_SHIFT))
+#define WT_TASK_WEIGHT(wt) ((u64)wt & WT_TASK_WEIGHT_MASK)
+#define WT_IS_NMIG(wt) ((bool)((wt >> WT_IS_NMIG_SHIFT) & WT_IS_NMIG_MASK))
+#define WT_CGRP_WEIGHT(wt) (u64)((wt >> WT_CGRP_WEIGHT_SHIFT) & WT_CGRP_WEIGHT_MASK)
+#define WT_MISC(wt) ((u64)((wt >> WT_MISC_SHIFT) & WT_MISC_MASK))
 #define WT_UPPER(wt) ((u64)((wt) >> 64))
 #define WT_LOWER(wt) ((u64)(wt))
 #define WT_STRIP_MISC(wt) ((wt) & ~(U128_MAX << WT_MISC_SHIFT))
 
 // construction macros
-#define WT_LOWER_FROM_FIELDS(task_weight, is_nmig) (((u64)(is_nmig) << WT_IS_NMIG_SHIFT) | (u64)task_weight)
-#define WT_UPPER_FROM_FIELDS(cgrp_weight, misc) ((u64)(misc << (WT_MISC_SHIFT-64)) | (u64)cgrp_weight)
+#define WT_LOWER_FROM_FIELDS(task_weight, is_nmig) ((((u64)is_nmig & WT_IS_NMIG_MASK) << WT_IS_NMIG_SHIFT) | ((u64)task_weight & WT_TASK_WEIGHT_MASK))
+#define WT_UPPER_FROM_FIELDS(cgrp_weight, misc) ((((u64)misc & WT_MISC_MASK) << (WT_MISC_SHIFT-64)) | ((u64)cgrp_weight & WT_CGRP_WEIGHT_MASK))
 #define WT_FROM_HALVES(lower, upper) ((weight_tuple_t)(lower) | ((weight_tuple_t)(upper) << 64))
-#define WT_FROM_FIELDS(task_weight, is_nmig, cgrp_weight, misc) (((weight_tuple_t)(task_weight) | ((weight_tuple_t)(is_nmig) << WT_IS_NMIG_SHIFT) | ((weight_tuple_t)(cgrp_weight) << WT_CGRP_WEIGHT_SHIFT) | ((weight_tuple_t)(misc) << WT_MISC_SHIFT)))
+#define WT_FROM_FIELDS(task_weight, is_nmig, cgrp_weight, misc) (((weight_tuple_t)((u64)task_weight & WT_TASK_WEIGHT_MASK) | ((weight_tuple_t)((u64)is_nmig & WT_IS_NMIG_MASK) << WT_IS_NMIG_SHIFT) | ((weight_tuple_t)((u64)cgrp_weight & WT_CGRP_WEIGHT_MASK) << WT_CGRP_WEIGHT_SHIFT) | ((weight_tuple_t)((u64)misc & WT_MISC_MASK) << WT_MISC_SHIFT)))
 
 // conversion macros
 #define WT_VTIME_FROM_LOWER(lower) (~0ULL - (u64)(lower))
