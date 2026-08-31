@@ -90,7 +90,9 @@ int main(int argc, char **argv)
 {
 	struct scx_ffp *skel;
 	struct bpf_link *link;
+	#if TRACING
 	struct ring_buffer *rb_manager;
+	#endif
 	struct bpf_program *syscall_prog = NULL;
 	struct ffp_arena *aa = NULL;
 

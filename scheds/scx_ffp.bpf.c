@@ -35,6 +35,7 @@ char _license[] SEC("license") = "GPL";
 
 // TODO: ensure search checks capabilities consistently (currently only checks in idle search)
 // TODO: replace all verifier sat checks with explicit errors
+// TODO: fix dispatch not considering prev task
 
 const volatile u64 cgroup_id; // id of this cgroup, 0 if root
 const volatile u32 max_tasks; // max tasks allowed in the cgroup (include non-scx, stores a cmask for all tasks)
@@ -172,6 +173,8 @@ struct shard_ctx {
   //         pending_weight[cid] = 0
   //         pending_owner[cid] = 0
   // stopping(A):
+  //     if A prev running and will resume on same CPU:
+  //         pending_weight[cid] = A.weight
   //     running_weight[cid] = 0
   weight_tuple_t cid_running_weight[SCX_CID_SHARD_MAX_CPUS];
   weight_tuple_t cid_pending_weight[SCX_CID_SHARD_MAX_CPUS];
@@ -469,6 +472,7 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(ffp_init)
 {
   TRACE_FUNC_START("init");
   bpf_printk("[INFO] [FP] [INIT] cgroup=%d", cgroup_id);
+  bpf_printk("[INFO] [FP] [INIT] SCX_TASK_QUEUED=%u", SCX_TASK_QUEUED);
   TRACE_EVENT(struct sched_trace_event_init, SCHED_TRACE_INIT,
     e->cgrp_id = cgroup_id;
   );
@@ -882,9 +886,20 @@ void BPF_STRUCT_OPS(ffp_cpuctl_set_weight, struct cgroup *cgrp, u32 weight)
 }
 
 // attempt to dispatch a task from global dsq to local dsq
-static __always_inline bool try_task_dispatch(u32 cid, u64 prev_pid) {
+static __always_inline u64 try_task_dispatch(u32 cid, struct task_struct *prev) {
   TRACE_FUNC_START("try_task_dispatch")
   if (unlikely(cid >= SCX_FFP_MAX_CPUS)) return false; // for verifier, should not happen
+
+  // if prev task has a weight and is runnable, need to consider it
+  weight_tuple_t prev_weight = 0;
+  u32 scx_flags = prev ? BPF_CORE_READ(prev, scx.flags) : 0;
+  task_ctx_t *pctx = NULL;
+  if (scx_flags & SCX_TASK_QUEUED) {
+    pctx = get_task_ctx(prev);
+    if (likely(pctx)) {
+      prev_weight = WT_STRIP_MISC(pctx->weight);
+    }
+  }
 
   struct latency_ctx lctx;
   lstat_start(&lctx);
@@ -892,52 +907,71 @@ static __always_inline bool try_task_dispatch(u32 cid, u64 prev_pid) {
   // move highest weight in global dsq that can run on this cpu to local dsq
   struct task_struct *t;
   bool moved = false;
+  u64 moved_pid = 0;
+  u64 moved_weight = 0;
   bpf_for_each(scx_dsq, t, dsq_id, 0) {
     task_ctx_t *tctx = get_task_ctx(t);
     if (unlikely(!tctx)) continue; // for verifier, should not happen
+
+    // since tasks ordered by decreasing weight in gdsq, early exit if weight can't beat prev
+    if (prev_weight && WT_STRIP_MISC(tctx->weight) <= prev_weight) {
+      break;
+    }
     
     // skip tasks that can't run on this cpu (either due to cmask or is non-migratable on another cpu)
     if (!cmask_test(cid, &tctx->cpus_allowed) ||
       (is_migration_disabled(t) && scx_bpf_task_cid(t) != cid)) {
-      HOTPATH_TRACE_EVENT(struct sched_trace_event_dispatch_gdsq_iter, SCHED_TRACE_DISPATCH_GDSQ_ITER,
-        e->result = SCHED_TRACE_DISPATCH_GDSQ_ITER_CMASK_MISMATCH;
-        e->tid = t->pid;
-        e->weight = WT_LOWER_FROM_VTIME(t->scx.dsq_vtime);
-      );
+      // HOTPATH_TRACE_EVENT(struct sched_trace_event_dispatch_gdsq_iter, SCHED_TRACE_DISPATCH_GDSQ_ITER,
+      //   e->result = SCHED_TRACE_DISPATCH_GDSQ_ITER_CMASK_MISMATCH;
+      //   e->tid = t->pid;
+      //   e->weight = WT_LOWER_FROM_VTIME(t->scx.dsq_vtime);
+      // );
       continue;
     }
 
     // this move only fails if another cpu's dispatch claims the task first
     if (likely(scx_bpf_dsq_move(BPF_FOR_EACH_ITER, t, SCX_DSQ_LOCAL, 0))) {
       moved = true;
-      HOTPATH_TRACE_EVENT(struct sched_trace_event_dispatch_gdsq_iter, SCHED_TRACE_DISPATCH_GDSQ_ITER,
-        e->result = SCHED_TRACE_DISPATCH_GDSQ_ITER_SUCCESS;
-        e->tid = t->pid;
-        e->weight = WT_LOWER_FROM_VTIME(t->scx.dsq_vtime);
-      );
+      moved_pid = t->pid;
+      moved_weight = tctx->weight;
+      // HOTPATH_TRACE_EVENT(struct sched_trace_event_dispatch_gdsq_iter, SCHED_TRACE_DISPATCH_GDSQ_ITER,
+      //   e->result = SCHED_TRACE_DISPATCH_GDSQ_ITER_SUCCESS;
+      //   e->tid = t->pid;
+      //   e->weight = WT_LOWER_FROM_VTIME(t->scx.dsq_vtime);
+      // );
       break;
     }
 
-    HOTPATH_TRACE_EVENT(struct sched_trace_event_dispatch_gdsq_iter, SCHED_TRACE_DISPATCH_GDSQ_ITER,
-      e->result = SCHED_TRACE_DISPATCH_GDSQ_ITER_MOVE_FAIL;
-      e->tid = t->pid;
-      e->weight = WT_LOWER_FROM_VTIME(t->scx.dsq_vtime);
-    );
+    // HOTPATH_TRACE_EVENT(struct sched_trace_event_dispatch_gdsq_iter, SCHED_TRACE_DISPATCH_GDSQ_ITER,
+    //   e->result = SCHED_TRACE_DISPATCH_GDSQ_ITER_MOVE_FAIL;
+    //   e->tid = t->pid;
+    //   e->weight = WT_LOWER_FROM_VTIME(t->scx.dsq_vtime);
+    // );
   }
 
   lstat_record(&lctx, &aa.stats[cid].task_dispatch);
 
+  // rerun the previous task
+  if (!moved && prev_weight && likely(prev && pctx)) {
+    moved = true;
+    moved_pid = prev->pid;
+    moved_weight = WT_LOWER(prev_weight);
+    scx_bpf_task_set_slice(prev, slice);
+  }
+  
   TRACE_FUNC_END("try_task_dispatch", moved ? "MOVED" : "NOT MOVED");
 
   if (moved) {
     HOTPATH_TRACE_EVENT(struct sched_trace_event_dispatch_result, SCHED_TRACE_DISPATCH_RESULT,
       e->sub_dispatch = false;
-      e->prev_tid = prev_pid;
-      e->next_tid = t->pid;
-      e->next_weight = WT_LOWER_FROM_VTIME(t->scx.dsq_vtime);
+      e->prev_tid = prev ? prev->pid : 0;
+      e->prev_weight = prev_weight;
+      e->next_tid = moved_pid;
+      e->next_weight = moved_weight;
     );
   }
-  return moved;
+
+  return moved_pid;
 }
 
 void BPF_STRUCT_OPS(ffp_dispatch, s32 cid, struct task_struct *prev)
@@ -953,9 +987,10 @@ void BPF_STRUCT_OPS(ffp_dispatch, s32 cid, struct task_struct *prev)
   cid = cid & (SCX_FFP_MAX_CPUS - 1); // for verifier
 
   // dispatch task
-  if (try_task_dispatch(cid, prev ? prev->pid : 0)) {
+  u64 tid = try_task_dispatch(cid, prev);
+  if (tid) {
     lstat_record(&lctx, &aa.stats[cid].dispatch);
-    TRACE_FUNC_END("dispatch", "DISPATCHED TASK");
+    TRACE_FUNC_END("dispatch", prev && tid == prev->pid ? "DISPATCHED PREV" : "DISPATCHED TASK");
     return;
   }
 
@@ -992,13 +1027,15 @@ void BPF_STRUCT_OPS(ffp_dispatch, s32 cid, struct task_struct *prev)
   
   lstat_record(&lctx, &aa.stats[cid].dispatch);
   TRACE_FUNC_END("dispatch", "NO READY SUBS");
-  HOTPATH_TRACE_EVENT(struct sched_trace_event_dispatch_result, SCHED_TRACE_DISPATCH_RESULT,
-    e->sub_dispatch = false;
-    e->prev_tid = prev ? prev->pid : 0;
-    e->next_tid = 0;
-    e->next_weight = 0;
-  );
-  return; // no sub schedulers
+  if (prev) {
+    HOTPATH_TRACE_EVENT(struct sched_trace_event_dispatch_result, SCHED_TRACE_DISPATCH_RESULT,
+      e->sub_dispatch = false;
+      e->prev_tid = prev ? prev->pid : 0;
+      e->next_tid = 0;
+      e->next_weight = 0;
+    );
+    return; // no sub schedulers
+  }
 }
 
 // lookup task weight in task_weights map
@@ -1393,6 +1430,10 @@ void BPF_STRUCT_OPS(ffp_running, struct task_struct *p)
 
 void BPF_STRUCT_OPS(ffp_stopping, struct task_struct *p, bool runnable)
 {
+  if (unlikely(!p)) { // for verifier, should not happen
+    scx_bpf_error("Stopping task is NULL");
+    return;
+  }
   struct latency_ctx lctx;
   lstat_start(&lctx);
 
@@ -1401,7 +1442,10 @@ void BPF_STRUCT_OPS(ffp_stopping, struct task_struct *p, bool runnable)
   // update running weight only
   u32 shard = aa.topo.cids[cid & (SCX_FFP_MAX_CPUS - 1)].shard_idx;
   struct shard_ctx *sctx = bpf_map_lookup_elem(&ffp_shard_ctx_map, &shard);
-  if (unlikely(!sctx)) return; // for verifier, should not happen
+  if (unlikely(!sctx)) { // for verifier, should not happen
+    scx_bpf_error("Failed to lookup sctx");
+    return;
+  }
 
   u32 shard_offset = cid - aa.topo.shards[shard].base_cid;
   if (unlikely(shard_offset >= SCX_CID_SHARD_MAX_CPUS)) return; // for verifier, should not happen
@@ -1415,7 +1459,7 @@ void BPF_STRUCT_OPS(ffp_stopping, struct task_struct *p, bool runnable)
 
   set_running_weight_locked(cid, shard, 0, sctx);
   bpf_res_spin_unlock(&sctx->lock);
-
+  
   // SHARD LOCK CS END
 
   lstat_record(&lctx, &aa.stats[cid].stopping);

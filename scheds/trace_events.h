@@ -14,8 +14,8 @@
 #ifndef __TRACE_EVENTS_H
   #define __TRACE_EVENTS_H
 
-  #define TRACING 1
-  #define HOTPATH_TRACING 1
+  #define TRACING 0
+  #define HOTPATH_TRACING 0
   #define SCX_TRACER 0
   #define TRACE_FUNCS 0
 
@@ -176,6 +176,7 @@
     struct sched_trace_event_header header;
     bool sub_dispatch;
     uint64_t prev_tid; // 0 if none
+    uint64_t prev_weight; // prev weight if prev exists, is runnable, and has weight
     uint64_t next_tid; // 0 if none, task tid if !sub_dispatch, sub index if sub_dispatch
     uint64_t next_weight; // task weight if !sub_dispatch, sub weight if sub_dispatch
   };
@@ -379,7 +380,7 @@
         } break;
         case SCHED_TRACE_DISPATCH_RESULT: {
           struct sched_trace_event_dispatch_result *event = data;
-          fprintf(trace_fd, "DISPATCH_RESULT: sub_dispatch=%d prev_tid=%lu next_tid=%lu next_weight=%lu\n", event->sub_dispatch, event->prev_tid, event->next_tid, event->next_weight);
+          fprintf(trace_fd, "DISPATCH_RESULT: sub_dispatch=%d prev_tid=%lu prev_weight=%lu next_tid=%lu next_weight=%lu\n", event->sub_dispatch, event->prev_tid, event->prev_weight, event->next_tid, event->next_weight);
         } break;
         case SCHED_TRACE_DISPATCH_GDSQ_ITER: {
           struct sched_trace_event_dispatch_gdsq_iter *event = data;
@@ -483,6 +484,11 @@
     #if SCX_ENQ_LAST == 0
     #undef SCX_ENQ_LAST
     #define SCX_ENQ_LAST 2199023255552ULL
+    #endif
+
+    #if SCX_TASK_QUEUED == 0
+    #undef SCX_TASK_QUEUED
+    #define SCX_TASK_QUEUED 1
     #endif
 
   #endif
