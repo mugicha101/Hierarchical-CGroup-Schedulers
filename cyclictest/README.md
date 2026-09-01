@@ -1,4 +1,4 @@
-Clone `https://github.com/jlelli/rt-tests.git` into `./rt-tests` (tested on version 0.84 which hasn't changed in 14 years)
+Clone `https://git.kernel.org/pub/scm/utils/rt-tests/rt-tests.git` into `./rt-tests`
 
 Modify `rt-tests/src/cyclictest/cyclictest.c` to match `modified_cyclictest.c` to allow cyclictest to set its policy to SCHED_EXT
 
