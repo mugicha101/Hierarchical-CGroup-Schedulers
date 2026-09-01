@@ -17,8 +17,6 @@ while sudo kill -0 $TRACE_PID 2>/dev/null; do
 done
 sudo chown $USER:$USER trace.perfetto
 
-python3 readstats.py
-
 # prevent viewlogs from seeing a bunch of junk enabled for tracebox
 echo "Reseting tracing settings"
 TRACING_DIR="/sys/kernel/debug/tracing"
