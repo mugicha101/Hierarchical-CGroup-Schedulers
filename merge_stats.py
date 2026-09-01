@@ -62,14 +62,14 @@ def parse_cidset(cidset):
                     res.append([first, last])
         else:
             cpu = int(itv)
-            res.append(range(cpu, cpu+1))
+            res.append([cpu, cpu])
     return None if invalid else res
 
-def included_cid(cidset: list[range], cid):
+def included_cid(cidset: list[list[int]], cid):
     if len(cidset) == 0:
         return True
 
-    return any(cid >= itv[0] and (itv[1] is None or cid >= itv[1]) for itv in cidset)
+    return any(cid >= itv[0] and (itv[1] is None or cid <= itv[1]) for itv in cidset)
 
 def main():
     parser = argparse.ArgumentParser(description="Merge JSON files.")
