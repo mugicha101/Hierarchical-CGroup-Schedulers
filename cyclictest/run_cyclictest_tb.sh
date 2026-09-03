@@ -8,7 +8,7 @@ echo "Waiting 5 seconds for tracebox setup to finish"
 sleep 5
 echo "Running cyclictest for $secs seconds"
 
-sudo sh -c "echo \$$ > /sys/fs/cgroup/foo/cgroup.procs && exec ./rt-tests/cyclictest -a -t -i 1000 -l 500000 -p 0 -D ${secs}s --policy=ext"
+sudo ./cyclictest_common.sh "$secs"
 
 sudo kill -SIGINT $TRACE_PID
 echo "Waiting for tracebox to finish..."
