@@ -167,7 +167,10 @@ restart:
 	}
 
 	// open skel
-	skel = scx_ffp__open();
+	LIBBPF_OPTS(bpf_object_open_opts, opts,
+		.pin_root_path = "/sys/fs/bpf/scx",
+	);
+	skel = scx_ffp__open_opts(&opts);
 	if (!skel) {
 		fprintf(stderr, "Error: failed to open skel\n");
 		goto cleanup;
