@@ -65,7 +65,7 @@ def pkill(name):
 def check_root_sched():
     try:
         return ROOT_OPS.read_text().strip()
-    except FileNotFoundError:
+    except FileNotFoundError, OSError:
         return None
 
 class Event:
@@ -293,7 +293,10 @@ class EventRecorder:
         for path in input_args.trace_files:
             if path.exists():
                 print(f"Warning: path {path} exists before scheduler attached, its data will be included", file=sys.stderr)
-        self.streams = [BTStream(), *[TraceStream(path) for path in input_args.trace_files]]
+        self.streams = []
+        if input_args.lttng:
+            self.streams.append(BTStream())
+        self.streams.extend([TraceStream(path) for path in input_args.trace_files])
 
         # start lttng
         cmd("lttng", "start", SESSION_NAME)
@@ -387,6 +390,12 @@ def main():
         type=int,
         default=None,
         help="pin recorder process to this CPU",
+    )
+    parser.add_argument(
+        "-l",
+        "--lttng",
+        action="store_true",
+        help="enable lttng tracepoints"
     )
     parser.add_argument(
         "trace_files",
