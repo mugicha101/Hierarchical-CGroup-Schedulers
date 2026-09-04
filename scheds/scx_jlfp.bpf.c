@@ -3,7 +3,7 @@
 #include "bpf/bpf_helpers.h"
 #include "scx/enums.bpf.h"
 #include "trace_events.h"
-#include "scx_ffp.h"
+#include "scx_jlfp.h"
 
 CREATE_TRACE_BUFF();
 
@@ -36,6 +36,35 @@ char _license[] SEC("license") = "GPL";
 // TODO: replace all verifier sat checks with explicit errors
 // TODO: fix dispatch not considering prev task
 
+// pending vs running
+// running weight: weight of task currently running on a cid
+// effective_weight[cid] = max(running_weight[cid], pending_weight[cid])  
+// pending weight: highest weight of task set to run on cid but not yet running
+// pending avoids scenario:
+//     pick_cid(A) preempts B and sets running weight to A.weight
+//     stopping(B) sets running weight to 0
+//     pick_cid(C) preempts A where C.weight < A.weight
+
+// note: all updates to pending_owner, pending_weight, and running_weight are shard lock protected
+
+// pick_cid(A):
+//     if A already pending at A.pending_cid (happens when enq immed fails and reenqs)
+//         if pending_owner[A.pending_cid] == A:
+//             pending_weight[A.pending_cid] = 0
+//             pending_owner[A.pending_cid] = 0
+//     on dispatch to target_cid:
+//         pending_weight[target_cid] = A.weight
+//         pending_owner[target_cid] = A
+// running(A):
+//     running_weight[cid] = A.weight
+//     if pending_owner[cid] == A
+//         pending_weight[cid] = 0
+//         pending_owner[cid] = 0
+// stopping(A):
+//     if A prev running and will resume on same CPU:
+//         pending_weight[cid] = A.weight
+//     running_weight[cid] = 0
+
 const volatile u64 cgroup_id; // id of this cgroup, 0 if root
 const volatile u32 max_tasks; // max tasks allowed in the cgroup (include non-scx, stores a cmask for all tasks)
 const volatile bool lockless; // avoid locking in min weight search at cost of higher likelihood of priority inversions
@@ -61,7 +90,7 @@ u64 slice = 1000000ULL; // 1ms
 
 // taken from qmap for getting arena memory through verifier
 // so far doesn't seem to be needed yet though
-#define FFP_TOUCH_ARENA() do { asm volatile("" :: "r"(&arena)); } while (0)
+#define JLFP_TOUCH_ARENA() do { asm volatile("" :: "r"(&arena)); } while (0)
 
 // from qmap
 // max number of times to try idle claim
@@ -81,14 +110,14 @@ struct {
 #endif
 } arena SEC(".maps");
 
-struct ffp_arena __arena_global aa;
+struct jlfp_arena __arena_global aa;
 
 /* ensure that BPF and userspace are seeing the same size for qmap_cmask */
-_Static_assert(FFP_CMASK_WORDS == CMASK_NR_WORDS(SCX_FFP_MAX_CPUS),
-	       "FFP_CMASK_WORDS must equal CMASK_NR_WORDS(SCX_FFP_MAX_CPUS)");
-_Static_assert(sizeof(struct ffp_cmask) ==
-	       struct_size_t(struct scx_cmask, bits, FFP_CMASK_WORDS),
-	       "ffp_cmask must be exactly sized to back a full scx_cmask");
+_Static_assert(JLFP_CMASK_WORDS == CMASK_NR_WORDS(SCX_JLFP_MAX_CPUS),
+	       "JLFP_CMASK_WORDS must equal CMASK_NR_WORDS(SCX_JLFP_MAX_CPUS)");
+_Static_assert(sizeof(struct jlfp_cmask) ==
+	       struct_size_t(struct scx_cmask, bits, JLFP_CMASK_WORDS),
+	       "jlfp_cmask must be exactly sized to back a full scx_cmask");
 
 // id of global vtime-based task dsq (non-migrateable per-cpu dsqs stored at dsq_id + 1 + cpu)
 // updated to cgroup_id in init
@@ -120,7 +149,7 @@ __hidden struct bpf_res_spin_lock aa_task_lock SEC(".data.aa_task_lock");
 
 static __always_inline task_ctx_t *get_task_ctx(struct task_struct *p) {
 
-	FFP_TOUCH_ARENA();
+	JLFP_TOUCH_ARENA();
 
   struct task_ctx_ptr *ptr = bpf_task_storage_get(&task_ctx_ptr_map, p, 0, 0);
   return ptr ? ptr->tctx : NULL;
@@ -151,42 +180,18 @@ struct shard_ctx {
   // shard lock
   struct bpf_res_spin_lock lock;
 
-  // pending avoids scenario:
-  //     pick_cid(A) preempts B and sets running weight to A.weight
-  //     stopping(B) sets running weight to 0
-  //     pick_cid(C) preempts A where C.weight < A.weight
-
-  // note: all updates to pending_owner, pending_weight, and running_weight are shard lock protected
-
-  // pick_cid(A):
-  //     if A already pending at A.pending_cid (happens when enq immed fails and reenqs)
-  //         if pending_owner[A.pending_cid] == A:
-  //             pending_weight[A.pending_cid] = 0
-  //             pending_owner[A.pending_cid] = 0
-  //     on dispatch to target_cid:
-  //         pending_weight[target_cid] = A.weight
-  //         pending_owner[target_cid] = A
-  // running(A):
-  //     running_weight[cid] = A.weight
-  //     if pending_owner[cid] == A
-  //         pending_weight[cid] = 0
-  //         pending_owner[cid] = 0
-  // stopping(A):
-  //     if A prev running and will resume on same CPU:
-  //         pending_weight[cid] = A.weight
-  //     running_weight[cid] = 0
+  // GLOBAL JLFP CONTEXT
   weight_tuple_t cid_running_weight[SCX_CID_SHARD_MAX_CPUS];
   weight_tuple_t cid_pending_weight[SCX_CID_SHARD_MAX_CPUS];
   u64 cid_pending_owner[SCX_CID_SHARD_MAX_CPUS];
 
-  // effective_weight[cid] = max(running_weight[cid], pending_weight[cid])
-  // min_effective = min effective_weight[cid] over all cids in shard (cid stored in misc bits of weight tuple)
+  // min effective_weight[cid] over all cids in shard (cid stored in misc bits of weight tuple)
   // atomically updated but may be stale if reading without lock (fine for global search)
   weight_tuple_t min_effective;
 };
 struct {
   __uint(type, BPF_MAP_TYPE_ARRAY);
-  __uint(max_entries, SCX_FFP_MAX_CPUS);
+  __uint(max_entries, SCX_JLFP_MAX_CPUS);
   __type(key, u32);
   __type(value, struct shard_ctx);
   __uint(pinning, LIBBPF_PIN_BY_NAME);
@@ -200,7 +205,7 @@ static __always_inline weight_tuple_t sctx_get_effective_weight(struct shard_ctx
 };
 
 static __always_inline weight_tuple_t get_effective_weight(u32 cid) {
-  u32 shard = aa.topo.cids[cid & (SCX_FFP_MAX_CPUS - 1)].shard_idx;
+  u32 shard = aa.topo.cids[cid & (SCX_JLFP_MAX_CPUS - 1)].shard_idx;
   struct shard_ctx *sctx = bpf_map_lookup_elem(&shard_ctx_map, &shard);
   u32 shard_offset = cid - aa.topo.shards[shard].base_cid;
   if (unlikely(!sctx || shard_offset >= SCX_CID_SHARD_MAX_CPUS)) return 0; // for verifier, should not happen
@@ -283,9 +288,9 @@ static __always_inline u64 cmask_to_u64(struct scx_cmask __arena *cmask) {
 // TODO: move to base root scheduler for all hierarchical schedulers to pull from
 static __always_inline void root_init() {
   u32 nr_cids = scx_bpf_nr_cids();
-  if (nr_cids > SCX_FFP_MAX_CPUS)
-    nr_cids = SCX_FFP_MAX_CPUS;
-  bpf_printk("[INFO] [FP] [INIT] nr_cids=%u", nr_cids);
+  if (nr_cids > SCX_JLFP_MAX_CPUS)
+    nr_cids = SCX_JLFP_MAX_CPUS;
+  bpf_printk("[INFO] [JLFP] [INIT] nr_cids=%u", nr_cids);
   
   // init topology
   // note: cannot assume zero initialized due to pinning
@@ -298,13 +303,13 @@ static __always_inline void root_init() {
   topo->nr_llcs = 0;
   topo->nr_nodes = 0;
   u32 cid;
-  u32 no_topo_core = SCX_FFP_MAX_CPUS;
-  u32 no_topo_llc = SCX_FFP_MAX_CPUS;
-  u32 no_topo_node = SCX_FFP_MAX_CPUS;
+  u32 no_topo_core = SCX_JLFP_MAX_CPUS;
+  u32 no_topo_llc = SCX_JLFP_MAX_CPUS;
+  u32 no_topo_node = SCX_JLFP_MAX_CPUS;
   bpf_for(cid, 0, nr_cids) {
     struct scx_cid_topo t = {};
     scx_bpf_cid_topo(cid, &t);
-    bpf_printk("[INFO] [FP] [INIT] core_cid=%u core_idx=%d llc_cid=%d llc_idx=%d node_cid=%d node_idx=%d shard_cid=%d shard_idx=%d",
+    bpf_printk("[INFO] [JLFP] [INIT] core_cid=%u core_idx=%d llc_cid=%d llc_idx=%d node_cid=%d node_idx=%d shard_cid=%d shard_idx=%d",
       t.core_cid,
       t.core_idx,
       t.llc_cid,
@@ -327,7 +332,7 @@ static __always_inline void root_init() {
     // we can allocate a core/llc/node for them at the back upon seeing first
     // TODO: fix bug in case where multiple shards have no-topo nodes
     if (t.core_idx == -1) {
-      if (no_topo_core == SCX_FFP_MAX_CPUS) {
+      if (no_topo_core == SCX_JLFP_MAX_CPUS) {
         no_topo_core = topo->nr_cores;
         no_topo_llc = topo->nr_llcs;
         no_topo_node = topo->nr_nodes;
@@ -338,10 +343,10 @@ static __always_inline void root_init() {
     }
 
     struct cid_topo_data *cid_td = &topo->cids[cid];
-    struct core_topo_data *core_td = &topo->cores[t.core_idx & (SCX_FFP_MAX_CPUS-1)];
-    struct shard_topo_data *shard_td = &topo->shards[t.shard_idx & (SCX_FFP_MAX_CPUS-1)];
-    struct llc_topo_data *llc_td = &topo->llcs[t.llc_idx & (SCX_FFP_MAX_CPUS-1)];
-    struct node_topo_data *node_td = &topo->nodes[t.node_idx & (SCX_FFP_MAX_CPUS-1)];
+    struct core_topo_data *core_td = &topo->cores[t.core_idx & (SCX_JLFP_MAX_CPUS-1)];
+    struct shard_topo_data *shard_td = &topo->shards[t.shard_idx & (SCX_JLFP_MAX_CPUS-1)];
+    struct llc_topo_data *llc_td = &topo->llcs[t.llc_idx & (SCX_JLFP_MAX_CPUS-1)];
+    struct node_topo_data *node_td = &topo->nodes[t.node_idx & (SCX_JLFP_MAX_CPUS-1)];
 
     core_td->nr_cids++;
     shard_td->nr_cids++;
@@ -365,7 +370,7 @@ static __always_inline void root_init() {
     core_td->shard_idx = t.shard_idx;
     core_td->llc_idx = t.llc_idx;
     core_td->node_idx = t.node_idx;
-    bpf_printk("[INFO] [FP] [INIT] new core: %lld", t.core_idx);
+    bpf_printk("[INFO] [JLFP] [INIT] new core: %lld", t.core_idx);
 
     if (t.shard_idx < topo->nr_shards) {
       bpf_assert(shard_td->base_cid == t.shard_cid);
@@ -379,7 +384,7 @@ static __always_inline void root_init() {
     shard_td->nr_cids = 1;
     shard_td->llc_idx = t.llc_idx;
     shard_td->node_idx = t.node_idx;
-    bpf_printk("[INFO] [FP] [INIT] new shard: %lld", t.shard_idx);
+    bpf_printk("[INFO] [JLFP] [INIT] new shard: %lld", t.shard_idx);
 
     // clear new shard context in case junk from prior scheduler
     struct shard_ctx *sctx = bpf_map_lookup_elem(&shard_ctx_map, &t.shard_idx);
@@ -407,7 +412,7 @@ static __always_inline void root_init() {
     llc_td->nr_cids = 1;
     llc_td->nr_shards = 1;
     llc_td->node_idx = t.node_idx;
-    bpf_printk("[INFO] [FP] [INIT] new llc: %lld", t.llc_idx);
+    bpf_printk("[INFO] [JLFP] [INIT] new llc: %lld", t.llc_idx);
 
     if (t.node_idx < topo->nr_nodes) {
       bpf_assert(node_td->base_cid == t.node_cid);
@@ -419,9 +424,9 @@ static __always_inline void root_init() {
     node_td->base_shard = t.shard_idx;
     node_td->nr_cids = 1;
     node_td->nr_shards = 1;
-    bpf_printk("[INFO] [FP] [INIT] new node: %lld", t.node_idx);
+    bpf_printk("[INFO] [JLFP] [INIT] new node: %lld", t.node_idx);
   }
-  bpf_printk("[INFO] [FP] [INIT] topo nr_cids=%u nr_cores=%u nr_shards=%u nr_llcs=%u nr_nodes=%u",
+  bpf_printk("[INFO] [JLFP] [INIT] topo nr_cids=%u nr_cores=%u nr_shards=%u nr_llcs=%u nr_nodes=%u",
     topo->nr_cids,
     topo->nr_cores,
     topo->nr_shards,
@@ -433,9 +438,9 @@ static __always_inline void root_init() {
   u32 i;
   u32 nr_shards = topo->nr_shards;
   bpf_for(i, 0, nr_shards) {
-    struct shard_topo_data *shard_td = &topo->shards[i & (SCX_FFP_MAX_CPUS-1)];
-    struct llc_topo_data *llc_td = &topo->llcs[shard_td->llc_idx & (SCX_FFP_MAX_CPUS-1)];
-    struct node_topo_data *node_td = &topo->nodes[shard_td->node_idx & (SCX_FFP_MAX_CPUS-1)];
+    struct shard_topo_data *shard_td = &topo->shards[i & (SCX_JLFP_MAX_CPUS-1)];
+    struct llc_topo_data *llc_td = &topo->llcs[shard_td->llc_idx & (SCX_JLFP_MAX_CPUS-1)];
+    struct node_topo_data *node_td = &topo->nodes[shard_td->node_idx & (SCX_JLFP_MAX_CPUS-1)];
 
     
     shard_td->shard_dist_order[0] = i;
@@ -445,33 +450,33 @@ static __always_inline void root_init() {
     u32 off = i - llc_td->base_shard;
     u32 end = llc_td->nr_shards - 1;
     bpf_for(j, 0, end) {
-      shard_td->shard_dist_order[(1 + j) & (SCX_FFP_MAX_CPUS-1)] = llc_td->base_shard + j + (j < off ? (u32)0 : (u32)1);
+      shard_td->shard_dist_order[(1 + j) & (SCX_JLFP_MAX_CPUS-1)] = llc_td->base_shard + j + (j < off ? (u32)0 : (u32)1);
     }
 
     // same node: [llc->nr_shards, node->nr_shards - llc->nr_shards]
     off = llc_td->base_shard - node_td->base_shard;
     end = node_td->nr_shards - llc_td->nr_shards;
     bpf_for(j, 0, end) {
-      shard_td->shard_dist_order[(llc_td->nr_shards + j) & (SCX_FFP_MAX_CPUS-1)] = node_td->base_shard + j + (j < off ? (u32)0 : llc_td->nr_shards);
+      shard_td->shard_dist_order[(llc_td->nr_shards + j) & (SCX_JLFP_MAX_CPUS-1)] = node_td->base_shard + j + (j < off ? (u32)0 : llc_td->nr_shards);
     }
 
     // other nodes: [node->nr_shards, topo->nr_shards - node->nr_shards]
     off = node_td->base_shard;
     end = nr_shards - node_td->nr_shards;
-    if (unlikely(end >= SCX_FFP_MAX_CPUS-off)) return; // for verifier, should not happen
+    if (unlikely(end >= SCX_JLFP_MAX_CPUS-off)) return; // for verifier, should not happen
     bpf_for(j, 0, end) {
-      shard_td->shard_dist_order[(node_td->nr_shards + j) & (SCX_FFP_MAX_CPUS-1)] = j + (j < off ? (u32)0 : node_td->nr_shards);
+      shard_td->shard_dist_order[(node_td->nr_shards + j) & (SCX_JLFP_MAX_CPUS-1)] = j + (j < off ? (u32)0 : node_td->nr_shards);
     }
     
-    bpf_printk("[INFO] [FP] [INIT] shard[%u] shard_dist_order: %u %u %u", i, shard_td->shard_dist_order[0], shard_td->shard_dist_order[1], shard_td->shard_dist_order[2]);
+    bpf_printk("[INFO] [JLFP] [INIT] shard[%u] shard_dist_order: %u %u %u", i, shard_td->shard_dist_order[0], shard_td->shard_dist_order[1], shard_td->shard_dist_order[2]);
   }
 }
 
-s32 BPF_STRUCT_OPS_SLEEPABLE(ffp_init)
+s32 BPF_STRUCT_OPS_SLEEPABLE(jlfp_init)
 {
   TRACE_FUNC_START("init");
-  bpf_printk("[INFO] [FP] [INIT] cgroup=%d", cgroup_id);
-  bpf_printk("[INFO] [FP] [INIT] SCX_TASK_QUEUED=%u", SCX_TASK_QUEUED);
+  bpf_printk("[INFO] [JLFP] [INIT] cgroup=%d", cgroup_id);
+  bpf_printk("[INFO] [JLFP] [INIT] SCX_TASK_QUEUED=%u", SCX_TASK_QUEUED);
   TRACE_EVENT(struct sched_trace_event_init, SCHED_TRACE_INIT,
     e->cgrp_id = cgroup_id;
   );
@@ -486,7 +491,7 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(ffp_init)
   u32 cid;
   u32 i;
   u32 nr_cids = scx_bpf_nr_cids();
-  if (nr_cids > SCX_FFP_MAX_CPUS) nr_cids = SCX_FFP_MAX_CPUS;
+  if (nr_cids > SCX_JLFP_MAX_CPUS) nr_cids = SCX_JLFP_MAX_CPUS;
 
   bpf_for(i, 0, MAX_SUB_SCHEDS) {
     aa.porder[i] = i;
@@ -541,8 +546,8 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(ffp_init)
   aa.topo.nr_llcs = global_topo->nr_llcs;
   aa.topo.nr_nodes = global_topo->nr_nodes;
   bpf_for(i, 0, aa.topo.nr_cids) {
-    struct cid_topo_data __arena *a = &aa.topo.cids[i & (SCX_FFP_MAX_CPUS-1)];
-    struct cid_topo_data *b = &global_topo->cids[i & (SCX_FFP_MAX_CPUS-1)];
+    struct cid_topo_data __arena *a = &aa.topo.cids[i & (SCX_JLFP_MAX_CPUS-1)];
+    struct cid_topo_data *b = &global_topo->cids[i & (SCX_JLFP_MAX_CPUS-1)];
 
     a->cpu = b->cpu;
     a->shard_idx = b->shard_idx;
@@ -551,8 +556,8 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(ffp_init)
     a->node_idx = b->node_idx;
   }
   bpf_for(i, 0, aa.topo.nr_cores) {
-    struct core_topo_data __arena *a = &aa.topo.cores[i & (SCX_FFP_MAX_CPUS-1)];
-    struct core_topo_data *b = &global_topo->cores[i & (SCX_FFP_MAX_CPUS-1)];
+    struct core_topo_data __arena *a = &aa.topo.cores[i & (SCX_JLFP_MAX_CPUS-1)];
+    struct core_topo_data *b = &global_topo->cores[i & (SCX_JLFP_MAX_CPUS-1)];
 
     
     a->base_cid = b->base_cid;
@@ -562,8 +567,8 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(ffp_init)
     a->node_idx = b->node_idx;
   }
   bpf_for(i, 0, aa.topo.nr_shards) {
-    struct shard_topo_data __arena *a = &aa.topo.shards[i & (SCX_FFP_MAX_CPUS-1)];
-    struct shard_topo_data *b = &global_topo->shards[i & (SCX_FFP_MAX_CPUS-1)];
+    struct shard_topo_data __arena *a = &aa.topo.shards[i & (SCX_JLFP_MAX_CPUS-1)];
+    struct shard_topo_data *b = &global_topo->shards[i & (SCX_JLFP_MAX_CPUS-1)];
     
     a->base_cid = b->base_cid;
     a->nr_cids = b->nr_cids;
@@ -571,13 +576,13 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(ffp_init)
     a->node_idx = b->node_idx;
     u32 j;
     bpf_for(j, 0, aa.topo.nr_shards) {
-      if (unlikely(j >= SCX_FFP_MAX_CPUS)) break;
+      if (unlikely(j >= SCX_JLFP_MAX_CPUS)) break;
       a->shard_dist_order[j] = b->shard_dist_order[j];
     }
   }
   bpf_for(i, 0, aa.topo.nr_llcs) {
-    struct llc_topo_data __arena *a = &aa.topo.llcs[i & (SCX_FFP_MAX_CPUS-1)];
-    struct llc_topo_data *b = &global_topo->llcs[i & (SCX_FFP_MAX_CPUS-1)];
+    struct llc_topo_data __arena *a = &aa.topo.llcs[i & (SCX_JLFP_MAX_CPUS-1)];
+    struct llc_topo_data *b = &global_topo->llcs[i & (SCX_JLFP_MAX_CPUS-1)];
     
     a->base_cid = b->base_cid;
     a->nr_cids = b->nr_cids;
@@ -586,8 +591,8 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(ffp_init)
     a->node_idx = b->node_idx;
   }
   bpf_for(i, 0, aa.topo.nr_nodes) {
-    struct node_topo_data __arena *a = &aa.topo.nodes[i & (SCX_FFP_MAX_CPUS-1)];
-    struct node_topo_data *b = &global_topo->nodes[i & (SCX_FFP_MAX_CPUS-1)];
+    struct node_topo_data __arena *a = &aa.topo.nodes[i & (SCX_JLFP_MAX_CPUS-1)];
+    struct node_topo_data *b = &global_topo->nodes[i & (SCX_JLFP_MAX_CPUS-1)];
 
     a->base_cid = b->base_cid;
     a->nr_cids = b->nr_cids;
@@ -597,14 +602,14 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(ffp_init)
 
   // init shard cmasks
   bpf_for(i, 0, aa.topo.nr_shards) {
-    struct shard_topo_data __arena *shard_td = &aa.topo.shards[i & (SCX_FFP_MAX_CPUS-1)];
-    struct scx_cmask __arena *mask = &aa.shard_cids[i & (SCX_FFP_MAX_CPUS-1)].mask;
+    struct shard_topo_data __arena *shard_td = &aa.topo.shards[i & (SCX_JLFP_MAX_CPUS-1)];
+    struct scx_cmask __arena *mask = &aa.shard_cids[i & (SCX_JLFP_MAX_CPUS-1)].mask;
     cmask_init(mask, shard_td->base_cid, shard_td->nr_cids);
     u32 j;
     bpf_for(j, 0, shard_td->nr_cids) {
       cmask_set(shard_td->base_cid + j, mask);
     }
-    bpf_printk("[INFO] [FP] [INIT] shard[%u] shard_td->nr_cids=%llu base=%llu nr_cids=%llu cmask=%06llx", i, shard_td->nr_cids, mask->base, mask->nr_cids, cmask_to_u64(mask));
+    bpf_printk("[INFO] [JLFP] [INIT] shard[%u] shard_td->nr_cids=%llu base=%llu nr_cids=%llu cmask=%06llx", i, shard_td->nr_cids, mask->base, mask->nr_cids, cmask_to_u64(mask));
   }
 
   // init task data structs
@@ -621,12 +626,12 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(ffp_init)
   return err;
 }
 
-void BPF_STRUCT_OPS(ffp_exit, struct scx_exit_info *ei)
+void BPF_STRUCT_OPS(jlfp_exit, struct scx_exit_info *ei)
 {
   TRACE_EVENT(struct sched_trace_event_exit, SCHED_TRACE_EXIT,
     e->cgrp_id = cgroup_id;
   );
-  bpf_printk("[INFO] [FP] [EXIT] cgroup=%d\n", cgroup_id);
+  bpf_printk("[INFO] [JLFP] [EXIT] cgroup=%d\n", cgroup_id);
   UEI_RECORD(uei, ei);
 }
 
@@ -717,9 +722,9 @@ static __always_inline void update_porder(u32 cid, u32 sub_index) {
     bpf_for(i, 1, MAX_SUB_SCHEDS) {
       if (unlikely(aa.sub_scheds[cd->porder[i-1] & (MAX_SUB_SCHEDS - 1)].weight < aa.sub_scheds[cd->porder[i] & (MAX_SUB_SCHEDS - 1)].weight)) {
         u32 j;
-        bpf_printk("[ERROR] [FP] [UPDATE_PORDER] porder not sorted after update for cid %u", cid);
+        bpf_printk("[ERROR] [JLFP] [UPDATE_PORDER] porder not sorted after update for cid %u", cid);
         bpf_for(j, 0, MAX_SUB_SCHEDS) {
-          bpf_printk("[ERROR] [FP] [UPDATE_PORDER] porder[%u]=%u weight=%u", j, cd->porder[j], aa.sub_scheds[cd->porder[j] & (MAX_SUB_SCHEDS - 1)].weight);
+          bpf_printk("[ERROR] [JLFP] [UPDATE_PORDER] porder[%u]=%u weight=%u", j, cd->porder[j], aa.sub_scheds[cd->porder[j] & (MAX_SUB_SCHEDS - 1)].weight);
         }
         scx_bpf_error("Error in porder sorting");
         break;
@@ -747,7 +752,7 @@ static __always_inline void update_porder(u32 cid, u32 sub_index) {
 // if this is not the case, this update is ignored until the next sync
 // fine since dispatches to invalid cgroups just return false and newly attached cgroups should be picked up eventually if weight updates are infrequent enough
 static __always_inline bool sync_porder(u32 cid) {
-  if (unlikely(cid >= SCX_FFP_MAX_CPUS)) return false; // for verifier, should not happen
+  if (unlikely(cid >= SCX_JLFP_MAX_CPUS)) return false; // for verifier, should not happen
 
   struct latency_ctx lctx;
   lstat_start(&lctx);
@@ -778,7 +783,7 @@ static __always_inline bool sync_porder(u32 cid) {
   return true;
 }
 
-s32 BPF_STRUCT_OPS(ffp_sub_attach, struct scx_sub_attach_args *args)
+s32 BPF_STRUCT_OPS(jlfp_sub_attach, struct scx_sub_attach_args *args)
 {
   TRACE_FUNC_START("sub_attach");
 
@@ -806,7 +811,7 @@ s32 BPF_STRUCT_OPS(ffp_sub_attach, struct scx_sub_attach_args *args)
   update_porder(cid, sub - aa.sub_scheds);
 
   // debug output cmask
-  // bpf_printk("[INFO] [FP] [SUB_ATTACH] cgroup=%llu weight=%llu cmask=%016llx", sub_cgroup_id, sub->weight, cmask_to_u64(&aa.self_cids.mask));
+  // bpf_printk("[INFO] [JLFP] [SUB_ATTACH] cgroup=%llu weight=%llu cmask=%016llx", sub_cgroup_id, sub->weight, cmask_to_u64(&aa.self_cids.mask));
 
   scx_bpf_sub_grant(sub_cgroup_id, SCX_CAP_ENQ_IMMED | SCX_CAP_ENQ | SCX_CAP_PREEMPT, (void *)(long)&aa.self_cids.mask, NULL);
   
@@ -815,7 +820,7 @@ s32 BPF_STRUCT_OPS(ffp_sub_attach, struct scx_sub_attach_args *args)
   return 0;
 }
 
-void BPF_STRUCT_OPS(ffp_sub_detach, struct scx_sub_detach_args *args)
+void BPF_STRUCT_OPS(jlfp_sub_detach, struct scx_sub_detach_args *args)
 {
   TRACE_FUNC_START("sub_detach");
 
@@ -844,7 +849,7 @@ void BPF_STRUCT_OPS(ffp_sub_detach, struct scx_sub_detach_args *args)
   TRACE_FUNC_END("sub_detach", "");
 }
 
-void BPF_STRUCT_OPS(ffp_cpuctl_set_weight, struct cgroup *cgrp, u32 weight)
+void BPF_STRUCT_OPS(jlfp_cpuctl_set_weight, struct cgroup *cgrp, u32 weight)
 {
   TRACE_FUNC_START("cpuctl_set_weight");
 
@@ -887,7 +892,7 @@ void BPF_STRUCT_OPS(ffp_cpuctl_set_weight, struct cgroup *cgrp, u32 weight)
 // attempt to dispatch a task from global dsq to local dsq
 static __always_inline u64 try_task_dispatch(u32 cid, struct task_struct *prev) {
   TRACE_FUNC_START("try_task_dispatch")
-  if (unlikely(cid >= SCX_FFP_MAX_CPUS)) return false; // for verifier, should not happen
+  if (unlikely(cid >= SCX_JLFP_MAX_CPUS)) return false; // for verifier, should not happen
 
   // if prev task has a weight and is runnable, need to consider it
   weight_tuple_t prev_weight = 0;
@@ -973,17 +978,17 @@ static __always_inline u64 try_task_dispatch(u32 cid, struct task_struct *prev) 
   return moved_pid;
 }
 
-void BPF_STRUCT_OPS(ffp_dispatch, s32 cid, struct task_struct *prev)
+void BPF_STRUCT_OPS(jlfp_dispatch, s32 cid, struct task_struct *prev)
 {
-  if (unlikely(cid >= SCX_FFP_MAX_CPUS)) return; // for testing limited CPUs
+  if (unlikely(cid >= SCX_JLFP_MAX_CPUS)) return; // for testing limited CPUs
   
-  // bpf_printk("[INFO] [FP] [DISPATCH] dispatching on cpu %u", cpu);
+  // bpf_printk("[INFO] [JLFP] [DISPATCH] dispatching on cpu %u", cpu);
   TRACE_FUNC_START("dispatch");
 
   struct latency_ctx lctx;
   lstat_start(&lctx);
 
-  cid = cid & (SCX_FFP_MAX_CPUS - 1); // for verifier
+  cid = cid & (SCX_JLFP_MAX_CPUS - 1); // for verifier
 
   // dispatch task
   u64 tid = try_task_dispatch(cid, prev);
@@ -1046,7 +1051,7 @@ u64 __always_inline get_task_weight(struct task_struct *p) {
     weight = *lookup_weight;
   }
   if (unlikely(weight == 0)) {
-    bpf_printk("[WARN] [FP] [GET_WEIGHT] Task %d has weight 0, using weight 1 instead", p->pid);
+    bpf_printk("[WARN] [JLFP] [GET_WEIGHT] Task %d has weight 0, using weight 1 instead", p->pid);
     weight = 1;
   }
   return weight;
@@ -1080,10 +1085,10 @@ static void __always_inline pick_cid(struct task_struct *p, u32 prev_cid, u64 en
 
   // handle case where task was re-enqueued from enq_immed
   // this happens when its pending_cid is still set
-  if (tctx->pending_cid < SCX_FFP_MAX_CPUS) {
+  if (tctx->pending_cid < SCX_JLFP_MAX_CPUS) {
     u32 pending_cid = tctx->pending_cid;
     u32 pending_shard = aa.topo.cids[pending_cid].shard_idx;
-    if (unlikely(pending_shard >= SCX_FFP_MAX_CPUS)) {
+    if (unlikely(pending_shard >= SCX_JLFP_MAX_CPUS)) {
       scx_bpf_error("Invalid pending shard %u", pending_shard);
       return;
     }
@@ -1110,7 +1115,7 @@ static void __always_inline pick_cid(struct task_struct *p, u32 prev_cid, u64 en
     bpf_res_spin_unlock(&sctx->lock);
 
     // SHARD LOCK CS END
-    tctx->pending_cid = SCX_FFP_MAX_CPUS;
+    tctx->pending_cid = SCX_JLFP_MAX_CPUS;
   }
 
   // IDLE SEARCH
@@ -1141,13 +1146,13 @@ static void __always_inline pick_cid(struct task_struct *p, u32 prev_cid, u64 en
   dispatch_type = 1;
 
   // nearest idle cpu in numa topology
-  u32 prev_shard = aa.topo.cids[prev_cid].shard_idx & (SCX_FFP_MAX_CPUS - 1);
+  u32 prev_shard = aa.topo.cids[prev_cid].shard_idx & (SCX_JLFP_MAX_CPUS - 1);
   u32 __arena *order = aa.topo.shards[prev_shard].shard_dist_order;
   u32 i;
   bpf_for(i, 0, aa.topo.nr_shards) {
-    if (unlikely(i >= SCX_FFP_MAX_CPUS)) break; // for verifier, should not happen
+    if (unlikely(i >= SCX_JLFP_MAX_CPUS)) break; // for verifier, should not happen
 
-    u32 shard = order[i] & (SCX_FFP_MAX_CPUS - 1);
+    u32 shard = order[i] & (SCX_JLFP_MAX_CPUS - 1);
     u32 cid = aa.topo.shards[shard].base_cid;
 
     // from qmap
@@ -1183,20 +1188,20 @@ static void __always_inline pick_cid(struct task_struct *p, u32 prev_cid, u64 en
   // tiebreak based on shard distance from prev_cid by traversing using shard_dist_order
   u32 target_shard = prev_shard;
   if (global_search) {
-    u32 cid = scx_bpf_this_cid() & (SCX_FFP_MAX_CPUS - 1);
+    u32 cid = scx_bpf_this_cid() & (SCX_JLFP_MAX_CPUS - 1);
     struct cid_data __arena *cd = &aa.cid_data[cid];
     weight_tuple_t min_effective = U128_MAX; // min over full overlap shards
     cmask_andnot(&cd->tmp_cmask.mask, &cd->tmp_cmask.mask); // use tmp cmask to store candidate shards
     bool partial_exists = false;
     bpf_for(i, 0, aa.topo.nr_shards) {
-      if (unlikely(i >= SCX_FFP_MAX_CPUS)) break; // for verifier, should not happen
+      if (unlikely(i >= SCX_JLFP_MAX_CPUS)) break; // for verifier, should not happen
 
       // check if full overlapped
-      if (!cmask_subset(&aa.shard_cids[order[i] & (SCX_FFP_MAX_CPUS - 1)].mask, &tctx->cpus_allowed)) {
+      if (!cmask_subset(&aa.shard_cids[order[i] & (SCX_JLFP_MAX_CPUS - 1)].mask, &tctx->cpus_allowed)) {
         continue;
       }
 
-      u32 shard = order[i] & (SCX_FFP_MAX_CPUS - 1);
+      u32 shard = order[i] & (SCX_JLFP_MAX_CPUS - 1);
       struct shard_ctx *sctx = bpf_map_lookup_elem(&shard_ctx_map, &shard);
       if (unlikely(!sctx)) continue; // for verifier, should not happen
 
@@ -1267,7 +1272,7 @@ static void __always_inline pick_cid(struct task_struct *p, u32 prev_cid, u64 en
 
   dispatch:
   // SCX_ENQ_PREEMPT handles the kicking
-  scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | (target_cid & (SCX_FFP_MAX_CPUS - 1)), slice, SCX_ENQ_PREEMPT | SCX_ENQ_IMMED);
+  scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | (target_cid & (SCX_JLFP_MAX_CPUS - 1)), slice, SCX_ENQ_PREEMPT | SCX_ENQ_IMMED);
 
   u32 cid = scx_bpf_this_cid();
   lstat_record(&lctx, dispatch_type == 0 ? &aa.stats[cid].pick_cid_prev : dispatch_type == 1 ? &aa.stats[cid].pick_cid_idle : &aa.stats[cid].pick_cid_search);
@@ -1277,7 +1282,7 @@ static void __always_inline pick_cid(struct task_struct *p, u32 prev_cid, u64 en
   // NO DISPATCH
   dispatch_fail:
 
-  target_cid = SCX_FFP_MAX_CPUS;
+  target_cid = SCX_JLFP_MAX_CPUS;
 
   // enqueue to global dsq instead
   u64 vtime = WT_VTIME_FROM_LOWER(WT_LOWER(task_weight));
@@ -1316,13 +1321,13 @@ static void __always_inline pick_cid(struct task_struct *p, u32 prev_cid, u64 en
     e->tid = p->pid;
     e->enq_flags = enq_flags;
     e->prev_cid = prev_cid;
-    e->target_cid = target_cid == SCX_FFP_MAX_CPUS ? -1 : target_cid;
+    e->target_cid = target_cid == SCX_JLFP_MAX_CPUS ? -1 : target_cid;
   );
 }
 
-s32 BPF_STRUCT_OPS(ffp_select_cid, struct task_struct *p, s32 prev_cid, u64 wake_flags)
+s32 BPF_STRUCT_OPS(jlfp_select_cid, struct task_struct *p, s32 prev_cid, u64 wake_flags)
 {
-  // bpf_printk("[INFO] [FP] [SELECT_CID] cgroup=%d pid=%d comm=%s prev_cid=%d wake_flags=%llu", cgroup_id, p->pid, p->comm, prev_cid, wake_flags);
+  // bpf_printk("[INFO] [JLFP] [SELECT_CID] cgroup=%d pid=%d comm=%s prev_cid=%d wake_flags=%llu", cgroup_id, p->pid, p->comm, prev_cid, wake_flags);
   TRACE_FUNC_START("select_cid");
 
   struct latency_ctx lctx;
@@ -1335,9 +1340,9 @@ s32 BPF_STRUCT_OPS(ffp_select_cid, struct task_struct *p, s32 prev_cid, u64 wake
   return prev_cid; // should be ignored since enqueue shouldn't run
 }
 
-void BPF_STRUCT_OPS(ffp_enqueue, struct task_struct *p, u64 enq_flags)
+void BPF_STRUCT_OPS(jlfp_enqueue, struct task_struct *p, u64 enq_flags)
 {
-  // bpf_printk("[INFO] [FP] [ENQUEUE] cgroup=%d pid=%d comm=%s enq_flags=%llu", cgroup_id, p->pid, p->comm, enq_flags);
+  // bpf_printk("[INFO] [JLFP] [ENQUEUE] cgroup=%d pid=%d comm=%s enq_flags=%llu", cgroup_id, p->pid, p->comm, enq_flags);
   TRACE_FUNC_START("enqueue");
 
   HOTPATH_TRACE_EVENT(struct sched_trace_event_enqueue_args, SCHED_TRACE_ENQUEUE_ARGS,
@@ -1364,7 +1369,7 @@ void BPF_STRUCT_OPS(ffp_enqueue, struct task_struct *p, u64 enq_flags)
   TRACE_FUNC_END("enqueue", "");
 }
 
-void BPF_STRUCT_OPS(ffp_running, struct task_struct *p)
+void BPF_STRUCT_OPS(jlfp_running, struct task_struct *p)
 {
   struct latency_ctx lctx;
   lstat_start(&lctx);
@@ -1379,7 +1384,7 @@ void BPF_STRUCT_OPS(ffp_running, struct task_struct *p)
   weight_tuple_t wt;
   task_ctx_t *tctx = get_task_ctx(p);
   if (policy != SCHED_EXT) {
-    bpf_printk("[WARN] [FP] [RUNNING] Task %d has policy %d", p->pid, policy);
+    bpf_printk("[WARN] [JLFP] [RUNNING] Task %d has policy %d", p->pid, policy);
     wt = (policy == SCHED_FIFO || policy == SCHED_RR) ? U128_MAX : 0;
   } else {
     if (unlikely(!tctx)) { // should not happen but just incase
@@ -1390,7 +1395,7 @@ void BPF_STRUCT_OPS(ffp_running, struct task_struct *p)
   }
 
   // update running weight and clear pending weight
-  u32 shard = aa.topo.cids[cid & (SCX_FFP_MAX_CPUS - 1)].shard_idx;
+  u32 shard = aa.topo.cids[cid & (SCX_JLFP_MAX_CPUS - 1)].shard_idx;
   struct shard_ctx *sctx = bpf_map_lookup_elem(&shard_ctx_map, &shard);
   if (unlikely(!sctx)) return; // for verifier, should not happen
 
@@ -1418,7 +1423,7 @@ void BPF_STRUCT_OPS(ffp_running, struct task_struct *p)
   
   // SHARD LOCK CS END
   
-  if (likely(tctx)) tctx->pending_cid = SCX_FFP_MAX_CPUS;
+  if (likely(tctx)) tctx->pending_cid = SCX_JLFP_MAX_CPUS;
   lstat_record(&lctx, &aa.stats[cid].running);
 
   HOTPATH_TRACE_EVENT(struct sched_trace_event_running, SCHED_TRACE_RUNNING,
@@ -1427,7 +1432,7 @@ void BPF_STRUCT_OPS(ffp_running, struct task_struct *p)
   );
 }
 
-void BPF_STRUCT_OPS(ffp_stopping, struct task_struct *p, bool runnable)
+void BPF_STRUCT_OPS(jlfp_stopping, struct task_struct *p, bool runnable)
 {
   if (unlikely(!p)) { // for verifier, should not happen
     scx_bpf_error("Stopping task is NULL");
@@ -1439,7 +1444,7 @@ void BPF_STRUCT_OPS(ffp_stopping, struct task_struct *p, bool runnable)
   u32 cid = scx_bpf_this_cid();
 
   // update running weight only
-  u32 shard = aa.topo.cids[cid & (SCX_FFP_MAX_CPUS - 1)].shard_idx;
+  u32 shard = aa.topo.cids[cid & (SCX_JLFP_MAX_CPUS - 1)].shard_idx;
   struct shard_ctx *sctx = bpf_map_lookup_elem(&shard_ctx_map, &shard);
   if (unlikely(!sctx)) { // for verifier, should not happen
     scx_bpf_error("Failed to lookup sctx");
@@ -1475,7 +1480,7 @@ void BPF_STRUCT_OPS(ffp_stopping, struct task_struct *p, bool runnable)
 // can probably improve this by loading a new instance per FP scheduler
 // SEC("syscall")
 // int BPF_PROG(update_weight, u64 pid, u64 weight) {
-//   // bpf_printk("[INFO] [FP] [UPDATE_WEIGHT] Updating weight of task %d to %llu\n", pid, weight);
+//   // bpf_printk("[INFO] [JLFP] [UPDATE_WEIGHT] Updating weight of task %d to %llu\n", pid, weight);
 //   // update weight in map
 //   struct task_struct *p = bpf_task_from_pid(pid);
 //   if (unlikely(!p)) {
@@ -1501,7 +1506,7 @@ void BPF_STRUCT_OPS(ffp_stopping, struct task_struct *p, bool runnable)
 //   return 0;
 // }
 
-void BPF_STRUCT_OPS(ffp_update_idle, s32 cid, bool idle)
+void BPF_STRUCT_OPS(jlfp_update_idle, s32 cid, bool idle)
 {
 	if (idle)
 		cmask_set(cid, &aa.idle_cids.mask);
@@ -1512,7 +1517,7 @@ void BPF_STRUCT_OPS(ffp_update_idle, s32 cid, bool idle)
 // from qmap
 // TODO: change to if SWITCH_PARTIAL then only allocate if SCX policy or when switches to SCX policy
 // because cid-form removes enable/disable can only be done in enqueue
-s32 BPF_STRUCT_OPS_SLEEPABLE(ffp_init_task, struct task_struct *p, struct scx_init_task_args *args)
+s32 BPF_STRUCT_OPS_SLEEPABLE(jlfp_init_task, struct task_struct *p, struct scx_init_task_args *args)
 {
   TRACE_FUNC_START("init_task");
   
@@ -1523,7 +1528,7 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(ffp_init_task, struct task_struct *p, struct scx_in
   struct latency_ctx lctx;
   lstat_start(&lctx);
 
-  // bpf_printk("[INFO] [FP] [INIT_TASK] cgroup=%d pid=%d comm=%s", cgroup_id, p->pid, p->comm);
+  // bpf_printk("[INFO] [JLFP] [INIT_TASK] cgroup=%d pid=%d comm=%s", cgroup_id, p->pid, p->comm);
 
   /* pop a slab entry off the free list */
 	if (unlikely(bpf_res_spin_lock(&aa_task_lock))) {
@@ -1541,7 +1546,7 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(ffp_init_task, struct task_struct *p, struct scx_in
 
   tctx->tid = p->scx.tid;
   tctx->weight = DEFAULT_TASK_WEIGHT; // will be overwritten in pick_cid anyways no reason to set here
-  tctx->pending_cid = SCX_FFP_MAX_CPUS;
+  tctx->pending_cid = SCX_JLFP_MAX_CPUS;
 	cmask_init(&tctx->cpus_allowed, 0, aa.topo.nr_cids);
   
 	bpf_rcu_read_lock();
@@ -1571,7 +1576,7 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(ffp_init_task, struct task_struct *p, struct scx_in
 }
 
 // from qmap
-void BPF_STRUCT_OPS(ffp_exit_task, struct task_struct *p)
+void BPF_STRUCT_OPS(jlfp_exit_task, struct task_struct *p)
 {
   TRACE_FUNC_START("exit_task");
 
@@ -1579,7 +1584,7 @@ void BPF_STRUCT_OPS(ffp_exit_task, struct task_struct *p)
     e->tid = p->pid;
   );
   
-  // bpf_printk("[INFO] [FP] [EXIT_TASK] cgroup=%d pid=%d comm=%s", cgroup_id, p->pid, p->comm);
+  // bpf_printk("[INFO] [JLFP] [EXIT_TASK] cgroup=%d pid=%d comm=%s", cgroup_id, p->pid, p->comm);
   struct latency_ctx lctx;
   lstat_start(&lctx);
 
@@ -1605,7 +1610,7 @@ void BPF_STRUCT_OPS(ffp_exit_task, struct task_struct *p)
 }
 
 // from qmap
-void BPF_STRUCT_OPS(ffp_set_cmask, struct task_struct *p, const struct scx_cmask *cmask_in)
+void BPF_STRUCT_OPS(jlfp_set_cmask, struct task_struct *p, const struct scx_cmask *cmask_in)
 {
   TRACE_FUNC_START("set_cmask");
   struct latency_ctx lctx;
@@ -1617,7 +1622,7 @@ void BPF_STRUCT_OPS(ffp_set_cmask, struct task_struct *p, const struct scx_cmask
 	struct scx_cmask __arena *cmask = (struct scx_cmask __arena *)(long)cmask_in;
   // u64 old = cmask_to_u64(&tctx->cpus_allowed);
 	cmask_copy(&tctx->cpus_allowed, cmask);
-  // bpf_printk("[INFO] [FP] [SET_CMASK] cgroup=%d pid=%d comm=%s nmig=%d cmask: %06llx ->%06llx", cgroup_id, p->pid, p->comm, is_migration_disabled(p), old, cmask_to_u64(&tctx->cpus_allowed));
+  // bpf_printk("[INFO] [JLFP] [SET_CMASK] cgroup=%d pid=%d comm=%s nmig=%d cmask: %06llx ->%06llx", cgroup_id, p->pid, p->comm, is_migration_disabled(p), old, cmask_to_u64(&tctx->cpus_allowed));
 
   u32 cid = scx_bpf_this_cid();
   lstat_record(&lctx, &aa.stats[cid].set_cmask);
@@ -1629,7 +1634,7 @@ void BPF_STRUCT_OPS(ffp_set_cmask, struct task_struct *p, const struct scx_cmask
   );
 }
 
-void BPF_STRUCT_OPS(ffp_tick, struct task_struct *p) {
+void BPF_STRUCT_OPS(jlfp_tick, struct task_struct *p) {
   // measure overhead of latency tracking
   struct latency_ctx lctx;
   u32 cid = scx_bpf_this_cid();
@@ -1639,22 +1644,22 @@ void BPF_STRUCT_OPS(ffp_tick, struct task_struct *p) {
 
 // ops
 
-SCX_OPS_CID_DEFINE(ffp_ops,
-  .name               = "ffp",
-  .init               = (void *)ffp_init,
-  .exit               = (void *)ffp_exit,
+SCX_OPS_CID_DEFINE(jlfp_ops,
+  .name               = "jlfp",
+  .init               = (void *)jlfp_init,
+  .exit               = (void *)jlfp_exit,
   .flags              = SCX_OPS_SWITCH_PARTIAL | SCX_OPS_ENQ_LAST | SCX_OPS_KEEP_BUILTIN_IDLE | SCX_OPS_BUILTIN_IDLE_PER_NODE | SCX_OPS_ENQ_MIGRATION_DISABLED | SCX_OPS_ENQ_EXITING | SCX_OPS_TID_TO_TASK,
-  .select_cid         = (void *)ffp_select_cid,
-  .enqueue            = (void *)ffp_enqueue,
-  .running            = (void *)ffp_running,
-  .stopping           = (void *)ffp_stopping,
-  .init_task          = (void *)ffp_init_task,
-  .exit_task          = (void *)ffp_exit_task,
-  .set_cmask          = (void *)ffp_set_cmask,
-  .dispatch           = (void *)ffp_dispatch,
-  .cpuctl_set_weight  = (void *)ffp_cpuctl_set_weight,
-  .sub_attach         = (void *)ffp_sub_attach,
-  .sub_detach         = (void *)ffp_sub_detach,
-  .update_idle        = (void *)ffp_update_idle,
-  .tick               = (void *)ffp_tick
+  .select_cid         = (void *)jlfp_select_cid,
+  .enqueue            = (void *)jlfp_enqueue,
+  .running            = (void *)jlfp_running,
+  .stopping           = (void *)jlfp_stopping,
+  .init_task          = (void *)jlfp_init_task,
+  .exit_task          = (void *)jlfp_exit_task,
+  .set_cmask          = (void *)jlfp_set_cmask,
+  .dispatch           = (void *)jlfp_dispatch,
+  .cpuctl_set_weight  = (void *)jlfp_cpuctl_set_weight,
+  .sub_attach         = (void *)jlfp_sub_attach,
+  .sub_detach         = (void *)jlfp_sub_detach,
+  .update_idle        = (void *)jlfp_update_idle,
+  .tick               = (void *)jlfp_tick
 );

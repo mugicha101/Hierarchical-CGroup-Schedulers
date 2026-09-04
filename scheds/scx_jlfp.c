@@ -19,12 +19,12 @@
 #include <sys/syscall.h>
 #include <linux/sched.h>
 #include <time.h>
-#include "scx_ffp.h"
+#include "scx_jlfp.h"
 
-#include "scx_ffp.bpf.skel.h"
-#include "scx_ffp.bpf.skel.h"
+#include "scx_jlfp.bpf.skel.h"
+#include "scx_jlfp.bpf.skel.h"
 
-#define SUB_CG_BASE "/sys/fs/cgroup/scx_ffp"
+#define SUB_CG_BASE "/sys/fs/cgroup/scx_jlfp"
 
 const char help_fmt[] =
 "A clustered job-level fixed priority sched_ext hierarchical scheduler.\n"
@@ -88,13 +88,13 @@ void write_stat(FILE *fd, struct latency_stat *lstat, const char *name, bool las
 
 int main(int argc, char **argv)
 {
-	struct scx_ffp *skel;
+	struct scx_jlfp *skel;
 	struct bpf_link *link;
 	#if TRACING
 	struct ring_buffer *rb_manager;
 	#endif
 	struct bpf_program *syscall_prog = NULL;
-	struct ffp_arena *aa = NULL;
+	struct jlfp_arena *aa = NULL;
 
 	bool search_locking = false;
 	bool global_search = false;
@@ -170,7 +170,7 @@ restart:
 	LIBBPF_OPTS(bpf_object_open_opts, opts,
 		.pin_root_path = "/sys/fs/bpf/scx",
 	);
-	skel = scx_ffp__open_opts(&opts);
+	skel = scx_jlfp__open_opts(&opts);
 	if (!skel) {
 		fprintf(stderr, "Error: failed to open skel\n");
 		goto cleanup;
@@ -183,18 +183,18 @@ restart:
 			fprintf(stderr, "Error: failed to stat cgroup %s\n", cg_path);
 			goto cleanup;
 		}
-		skel->struct_ops.ffp_ops->sub_cgroup_id = st.st_ino;
+		skel->struct_ops.jlfp_ops->sub_cgroup_id = st.st_ino;
 		skel->rodata->cgroup_id = st.st_ino;
 	}
-	skel->struct_ops.ffp_ops->cid_shard_size = max_shard_size;
+	skel->struct_ops.jlfp_ops->cid_shard_size = max_shard_size;
 	skel->rodata->max_tasks = max_tasks;
 	skel->rodata->trace_enabled = trace_path != NULL;
 	skel->rodata->lockless = !search_locking;
 	skel->rodata->global_search = global_search;
 	
 	// load scheduler
-	SCX_OPS_LOAD(skel, ffp_ops, scx_ffp, uei);
-	link = SCX_OPS_ATTACH(skel, ffp_ops, scx_ffp);
+	SCX_OPS_LOAD(skel, jlfp_ops, scx_jlfp, uei);
+	link = SCX_OPS_ATTACH(skel, jlfp_ops, scx_jlfp);
 	if (!link) {
 		fprintf(stderr, "Error: failed to attach scheduler\n");
 		goto cleanup;
@@ -301,7 +301,7 @@ cleanup:
 		}
 	}
 
-	if (skel) scx_ffp__destroy(skel);
+	if (skel) scx_jlfp__destroy(skel);
 
 	if (trace_fd && trace_path) {
 		fclose(trace_fd);
