@@ -190,7 +190,7 @@ struct {
   __type(key, u32);
   __type(value, struct shard_ctx);
   __uint(pinning, LIBBPF_PIN_BY_NAME);
-} ffp_shard_ctx_map SEC(".maps");
+} shard_ctx_map SEC(".maps");
 
 static __always_inline weight_tuple_t sctx_get_effective_weight(struct shard_ctx *sctx, u32 shard_offset) {
   // may be stale if shard lock not acquired
@@ -201,7 +201,7 @@ static __always_inline weight_tuple_t sctx_get_effective_weight(struct shard_ctx
 
 static __always_inline weight_tuple_t get_effective_weight(u32 cid) {
   u32 shard = aa.topo.cids[cid & (SCX_FFP_MAX_CPUS - 1)].shard_idx;
-  struct shard_ctx *sctx = bpf_map_lookup_elem(&ffp_shard_ctx_map, &shard);
+  struct shard_ctx *sctx = bpf_map_lookup_elem(&shard_ctx_map, &shard);
   u32 shard_offset = cid - aa.topo.shards[shard].base_cid;
   if (unlikely(!sctx || shard_offset >= SCX_CID_SHARD_MAX_CPUS)) return 0; // for verifier, should not happen
 
@@ -382,7 +382,7 @@ static __always_inline void root_init() {
     bpf_printk("[INFO] [FP] [INIT] new shard: %lld", t.shard_idx);
 
     // clear new shard context in case junk from prior scheduler
-    struct shard_ctx *sctx = bpf_map_lookup_elem(&ffp_shard_ctx_map, &t.shard_idx);
+    struct shard_ctx *sctx = bpf_map_lookup_elem(&shard_ctx_map, &t.shard_idx);
     if (unlikely(!sctx)) { // for verifier, should not happen
       scx_bpf_error("Failed to lookup shard %d", t.shard_idx);
       return;
@@ -1092,7 +1092,7 @@ static void __always_inline pick_cid(struct task_struct *p, u32 prev_cid, u64 en
       scx_bpf_error("Failed to fetch pending cid %u or pending shard %u", pending_cid, pending_shard);
       return;
     }
-    struct shard_ctx *sctx = bpf_map_lookup_elem(&ffp_shard_ctx_map, &pending_shard);
+    struct shard_ctx *sctx = bpf_map_lookup_elem(&shard_ctx_map, &pending_shard);
     if (unlikely(!sctx)) {
       scx_bpf_error("Failed to lookup pending shard %u", pending_shard);
       return;
@@ -1197,7 +1197,7 @@ static void __always_inline pick_cid(struct task_struct *p, u32 prev_cid, u64 en
       }
 
       u32 shard = order[i] & (SCX_FFP_MAX_CPUS - 1);
-      struct shard_ctx *sctx = bpf_map_lookup_elem(&ffp_shard_ctx_map, &shard);
+      struct shard_ctx *sctx = bpf_map_lookup_elem(&shard_ctx_map, &shard);
       if (unlikely(!sctx)) continue; // for verifier, should not happen
 
       // since min running can become stale anyways during this search without global lock, we can instead atomically read the min running weight
@@ -1220,7 +1220,7 @@ static void __always_inline pick_cid(struct task_struct *p, u32 prev_cid, u64 en
     }
   }
 
-  struct shard_ctx *sctx = bpf_map_lookup_elem(&ffp_shard_ctx_map, &target_shard);
+  struct shard_ctx *sctx = bpf_map_lookup_elem(&shard_ctx_map, &target_shard);
   if (unlikely(!sctx)) goto dispatch_fail; // for verifier, should not happen
   
   if (unlikely(bpf_res_spin_lock(&sctx->lock))) {
@@ -1391,7 +1391,7 @@ void BPF_STRUCT_OPS(ffp_running, struct task_struct *p)
 
   // update running weight and clear pending weight
   u32 shard = aa.topo.cids[cid & (SCX_FFP_MAX_CPUS - 1)].shard_idx;
-  struct shard_ctx *sctx = bpf_map_lookup_elem(&ffp_shard_ctx_map, &shard);
+  struct shard_ctx *sctx = bpf_map_lookup_elem(&shard_ctx_map, &shard);
   if (unlikely(!sctx)) return; // for verifier, should not happen
 
   u32 shard_offset = cid - aa.topo.shards[shard].base_cid;
@@ -1440,7 +1440,7 @@ void BPF_STRUCT_OPS(ffp_stopping, struct task_struct *p, bool runnable)
 
   // update running weight only
   u32 shard = aa.topo.cids[cid & (SCX_FFP_MAX_CPUS - 1)].shard_idx;
-  struct shard_ctx *sctx = bpf_map_lookup_elem(&ffp_shard_ctx_map, &shard);
+  struct shard_ctx *sctx = bpf_map_lookup_elem(&shard_ctx_map, &shard);
   if (unlikely(!sctx)) { // for verifier, should not happen
     scx_bpf_error("Failed to lookup sctx");
     return;
