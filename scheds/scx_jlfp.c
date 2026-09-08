@@ -39,7 +39,6 @@ const char help_fmt[] =
 "\n"
 "Scheduler Configuration:\n"
 "  -c, --cgroup PATH          Attach the scheduler to an existing cgroup located at PATH (default: /sys/fs/cgroup/ i.e. the root cgroup)\n"
-"  -l, --search-locking       Enable shard locking in pick_cid min priority search (by default, pick_cid does not lock target shard to ensure running priorities are accurate)\n"
 "  -g, --global-search        Enable Global Shard Search (by default, pick_cid only searches local shard if no idle CPU found)\n"
 "  -S, --max-shard-size N         Sets the maximum shard size (i.e. cluster size) to N (default: 8, however each shard must be within a single LLC)\n"
 "  -T, --max-tasks N          Sets the maximum number of tasks supported by the scheduler to N (default: 16384, must be at least the tasks in the scheduler's cgroup including non-scx tasks)"
@@ -96,7 +95,6 @@ int main(int argc, char **argv)
 	struct bpf_program *syscall_prog = NULL;
 	struct jlfp_arena *aa = NULL;
 
-	bool search_locking = false;
 	bool global_search = false;
 	uint32_t max_shard_size = 8;
 	uint32_t max_tasks = 16384;
@@ -126,9 +124,6 @@ restart:
 			cg_path = strdup(optarg);
 			sched_name = cg_path;
       		break;
-		case 'l':
-			search_locking = true;
-			break;
 		case 'g':
 			global_search = true;
 			break;
@@ -189,7 +184,6 @@ restart:
 	skel->struct_ops.jlfp_ops->cid_shard_size = max_shard_size;
 	skel->rodata->max_tasks = max_tasks;
 	skel->rodata->trace_enabled = trace_path != NULL;
-	skel->rodata->lockless = !search_locking;
 	skel->rodata->global_search = global_search;
 	
 	// load scheduler

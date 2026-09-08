@@ -67,7 +67,6 @@ char _license[] SEC("license") = "GPL";
 
 const volatile u64 cgroup_id; // id of this cgroup, 0 if root
 const volatile u32 max_tasks; // max tasks allowed in the cgroup (include non-scx, stores a cmask for all tasks)
-const volatile bool lockless; // avoid locking in min weight search at cost of higher likelihood of priority inversions
 const volatile bool global_search; // search all fully-overlapped shards (fallback on prev shard if no fully-overlapped shards)
 u64 self_cgroup_weight;
 u64 slice = 1000000ULL; // 1ms
