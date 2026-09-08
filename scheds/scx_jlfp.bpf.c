@@ -1155,15 +1155,8 @@ void BPF_STRUCT_OPS(jlfp_enqueue, struct task_struct *p, u64 enq_flags)
   struct latency_ctx lctx;
   lstat_start(&lctx);
 
-  // // handle SCX_ENQ_LAST
-  // if (enq_flags & SCX_ENQ_LAST) {
-  //   scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, slice, 0);
-  //   goto skip_pick_cid;
-  // }
-
   pick_cid(p, (u32)scx_bpf_task_cid(p), enq_flags);
   
-  // skip_pick_cid:
   u32 cid = scx_bpf_this_cid();
   lstat_record(&lctx, &aa.stats[cid].enqueue);
 

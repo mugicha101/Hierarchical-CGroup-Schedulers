@@ -9,10 +9,12 @@ BPFTOOL := bpftool
 ARCH := x86
 
 CFLAGS := -O2 -g -Wall \
+	-MMD -MP \
 	-Iinclude \
 	-I$(BUILD)
 
 BPF_CFLAGS := -O2 -g \
+	-MMD -MP \
 	-target bpf \
 	-D__TARGET_ARCH_$(ARCH) \
 	-mcpu=v3 \
@@ -23,6 +25,9 @@ BPF_CFLAGS := -O2 -g \
 LDLIBS := -lbpf -lelf -lz -lpthread
 
 BINARIES := $(addprefix $(BUILD)/,$(TARGETS))
+
+DEPS := $(addprefix $(BUILD)/,$(addsuffix .d,$(TARGETS))) \
+	$(addprefix $(BUILD)/,$(addsuffix .bpf.d,$(TARGETS)))
 
 all: $(BINARIES)
 
@@ -40,6 +45,8 @@ $(BUILD)/%.bpf.skel.h: $(BUILD)/%.bpf.o
 
 $(BUILD)/%: %.c $(BUILD)/%.bpf.skel.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDLIBS)
+
+-include $(DEPS)
 
 clean:
 	rm -rf $(BUILD)
