@@ -6,7 +6,6 @@
 #ifndef __SCX_JLFP_H
 #define __SCX_JLFP_H
 
-#include "trace_events.h"
 
 #ifdef __BPF__
 #include <scx/bpf_arena_common.bpf.h>
@@ -15,7 +14,8 @@
 #include <scx/bpf_arena_common.h>
 #endif
 
-#define u128 unsigned __int128
+#include "trace_events.h"
+#include "scx_root.h"
 
 // weight tuple consists of 2 64 bit halves
 // upper: misc data [127..80], cgrp_weight [79..64]
@@ -51,82 +51,8 @@ const u128 U128_MAX = (((u128)(~0ULL)) << 64) | (u128)(~0ULL);
 #define WT_VTIME_FROM_LOWER(lower) (~0ULL - (u64)(lower))
 #define WT_LOWER_FROM_VTIME(vtime) (~0ULL - (u64)(vtime))
 
-#define SCX_JLFP_MAX_CPUS 1024 // >= NR_CPUS
-#define MAX_SUB_SCHEDS 64 // must be power of 2
 #define DEFAULT_CGROUP_WEIGHT 100 // should match default weight in kernel
 #define DEFAULT_TASK_WEIGHT (~0ULL)
-#define NTRIALS 10000 // enough trials to be functionally infinite for rare race-conditioned events
-
-// from qmap
-#define JLFP_CMASK_WORDS	(((SCX_JLFP_MAX_CPUS) + 63) / 64 + 1)
-struct jlfp_cmask {
-#ifdef __BPF__
-	union {
-		struct scx_cmask mask;
-		u64 words[JLFP_CMASK_WORDS + 2];
-	};
-#else
-	u64 words[JLFP_CMASK_WORDS + 2];
-#endif
-};
-
-// topology data
-struct cid_topo_data {
-  u32 cpu;
-
-  s32 shard_idx;
-  s32 core_idx;
-  s32 llc_idx;
-  s32 node_idx;
-};
-struct core_topo_data {
-  u32 base_cid;
-  u32 nr_cids;
-  
-  s32 shard_idx;
-  s32 llc_idx;
-  s32 node_idx;
-};
-struct shard_topo_data {
-  u32 base_cid;
-  u32 nr_cids;
-
-  s32 llc_idx;
-  s32 node_idx;
-
-  // shard indices ordered by distance from this shard (index 0 is this shard)
-  // sorted by same node then same ll3 then shard index
-  u32 shard_dist_order[SCX_JLFP_MAX_CPUS];
-};
-struct llc_topo_data {
-  u32 base_cid;
-  u32 nr_cids;
-
-  u32 base_shard;
-  u32 nr_shards;
-
-  s32 node_idx;
-};
-struct node_topo_data {
-  u32 base_cid;
-  u32 nr_cids;
-  
-  u32 base_shard;
-  u32 nr_shards;
-};
-struct topo_data {
-  u32 nr_cids;
-  u32 nr_shards;
-  u32 nr_cores;
-  u32 nr_llcs;
-  u32 nr_nodes;
-
-  struct cid_topo_data cids[SCX_JLFP_MAX_CPUS];
-  struct shard_topo_data shards[SCX_JLFP_MAX_CPUS];
-  struct core_topo_data cores[SCX_JLFP_MAX_CPUS];
-  struct llc_topo_data llcs[SCX_JLFP_MAX_CPUS];
-  struct node_topo_data nodes[SCX_JLFP_MAX_CPUS];
-};
 
 // seqlock implementation
 // single writer multiple reader lock-free structure
@@ -185,7 +111,7 @@ struct task_ctx {
   struct scx_cmask cpus_allowed;	/* per-task affinity in cid space */
   u64 tid;
   weight_tuple_t weight; // weight tuple of task at enqueue time
-  u32 pending_cid; // target of incomplete task dispatch (SCX_JLFP_MAX_CPUS if none)
+  u32 pending_cid; // target of incomplete task dispatch (SCX_MAX_CPUS if none)
 };
 /*
  * Slab stride for task_ctx. cpus_allowed's flex array bits[] overlaps the
@@ -194,7 +120,7 @@ struct task_ctx {
  */
 #define TASK_CTX_STRIDE							\
 	struct_size_t(struct task_ctx, cpus_allowed.bits,		\
-		      CMASK_NR_WORDS(SCX_JLFP_MAX_CPUS))
+		      CMASK_NR_WORDS(NR_CPUS))
 
 #else
 
@@ -211,8 +137,8 @@ struct sub_sched_ctx {
   u32 weight;
 
   // TODO: if cid partitioning needed, can use these
-  // struct jlfp_cmask granted_cids; // cids granted excl to this child
-  // struct jlfp_cmask prev_granted; // last grant, for delta calculation
+  // struct scx_cmask_wrapper granted_cids; // cids granted excl to this child
+  // struct scx_cmask_wrapper prev_granted; // last grant, for delta calculation
 };
 
 // stats stored per-cid to avoid race conditions
@@ -242,14 +168,14 @@ struct stats_data {
 struct cid_data {
   // scheduling state
   u32 curr_idx; // index of currently running subscheduler
-  int can_run[SCX_JLFP_MAX_CPUS]; // whether current enqueued task can run on each CPU
+  int can_run[SCX_MAX_CPUS]; // whether current enqueued task can run on each CPU
 
   u32 porder[MAX_SUB_SCHEDS]; // cached indices of global porder
   u32 porder_sync_buff[MAX_SUB_SCHEDS]; // buffer for syncing porder
   struct seqlock_local porder_lock;
 
   // scratch memory
-  struct jlfp_cmask tmp_cmask;
+  struct scx_cmask_wrapper tmp_cmask;
 };
 
 // per scheduler instance arena memory
@@ -257,7 +183,7 @@ struct jlfp_arena {
   // SCHEDULING STATE
   
   // per-cid data
-  struct cid_data cid_data[SCX_JLFP_MAX_CPUS];
+  struct cid_data cid_data[SCX_MAX_CPUS];
 
   // subscheduler state
   struct sub_sched_ctx sub_scheds[MAX_SUB_SCHEDS];
@@ -277,15 +203,15 @@ struct jlfp_arena {
 	task_ctx_t *task_free_head;
 
   // from qmap
-  /* bpf-internal cmasks (embedded, see struct jlfp_cmask) */
-	struct jlfp_cmask self_cids;	/* cids this node runs its own tasks on */
-	struct jlfp_cmask idle_cids;	/* idle state of all cids regardless of delegation */
+  /* bpf-internal cmasks (embedded, see struct scx_cmask_wrapper) */
+	struct scx_cmask_wrapper self_cids;	/* cids this node runs its own tasks on */
+	struct scx_cmask_wrapper idle_cids;	/* idle state of all cids regardless of delegation */
 
   // per-shard cmasks
-  struct jlfp_cmask shard_cids[SCX_JLFP_MAX_CPUS];
+  struct scx_cmask_wrapper shard_cids[SCX_MAX_CPUS];
 
   // latency stats
-  struct stats_data stats[SCX_JLFP_MAX_CPUS];
+  struct stats_data stats[SCX_MAX_CPUS];
 };
 
 #endif
