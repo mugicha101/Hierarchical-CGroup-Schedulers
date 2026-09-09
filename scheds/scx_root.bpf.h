@@ -1,6 +1,3 @@
-// BPF only code for scx_root.h
-// scheds should not include this header directly
-
 #ifndef __SCX_ROOT_BPF_H
 #define __SCX_ROOT_BPF_H
 
@@ -11,6 +8,34 @@
 #ifndef __SCX_ROOT_H
 #error "This file must be included from scx_root.h"
 #endif
+
+_Static_assert(SCX_MAX_CPUS >= NR_CPUS, "SCX_MAX_CPUS must be >= NR_CPUS");
+_Static_assert(SCX_CMASK_WORDS == CMASK_NR_WORDS(NR_CPUS), "SCX_CMASK_WORDS must equal CMASK_NR_WORDS(NR_CPUS)");
+_Static_assert(sizeof(struct scx_cmask_wrapper) == struct_size_t(struct scx_cmask, bits, SCX_CMASK_WORDS), "scx_full_cmask must be exactly sized to back a full scx_cmask");
+
+// from qmap
+struct {
+	__uint(type, BPF_MAP_TYPE_ARENA);
+	__uint(map_flags, BPF_F_MMAPABLE);
+	__uint(max_entries, 1 << 16);		/* upper bound in pages */
+#if defined(__TARGET_ARCH_arm64) || defined(__aarch64__)
+	__ulong(map_extra, 0x1ull << 32);	/* user/BPF mmap base */
+#else
+	__ulong(map_extra, 0x1ull << 44);
+#endif
+} arena SEC(".maps");
+
+// dump helper
+static __always_inline u64 cmask_to_u64(struct scx_cmask __arena *cmask) {
+  u64 out = 0;
+  u32 i;
+  bpf_for(i, cmask->base, cmask->nr_cids + cmask->base) {
+    if (cmask_test(i, cmask)) {
+      out |= (1ULL << i);
+    }
+  }
+  return out;
+}
 
 // topology data shared by all schedulers
 // initialized by root init
@@ -26,6 +51,65 @@ struct {
 static __always_inline struct topo_data *fetch_global_topo() {
   const u32 idx = 0;
   return bpf_map_lookup_elem(&topo, &idx);
+}
+
+// per task state for the scheduler
+// stored on arena memory, allocated via slab allocator (from qmap)
+// policy_task_ctx needs to be large enough to support all policies
+union policy_task_ctx {
+  u64 __align;
+  u8 data[SCX_POLICY_TASK_CTX_SIZE];
+};
+
+struct task_ctx {
+  struct task_ctx __arena	*next_free;	/* only valid on free list */
+
+  // policy specific fields
+  union policy_task_ctx ptctx;
+
+  // affinity max needs to be after fields due to cmask size being variable
+  struct scx_cmask cpus_allowed;
+};
+
+struct scx_task_ctx {
+  u64 tid;
+};
+typedef struct scx_task_ctx __arena scx_task_ctx_t;
+_Static_assert(sizeof(struct scx_task_ctx) <= SCX_POLICY_TASK_CTX_SIZE, "scx_task_ctx larger than SCX_POLICY_TASK_CTX_SIZE");
+_Static_assert(_Alignof(struct scx_task_ctx) <= _Alignof(union policy_task_ctx), "scx_task_ctx requires greater alignment");
+
+static __always_inline scx_task_ctx_t *get_scx_task_ctx(task_ctx_t *tctx) {
+  return likely(tctx) ? (scx_task_ctx_t *)tctx->ptctx.data : (scx_task_ctx_t *)0;
+}
+
+/*
+ * Slab stride for task_ctx. cpus_allowed's flex array bits[] overlaps the
+ * tail bytes appended per entry; struct_size() gives the actual per-entry
+ * footprint.
+ */
+#define TASK_CTX_STRIDE							\
+	struct_size_t(struct task_ctx, cpus_allowed.bits,		\
+		      CMASK_NR_WORDS(NR_CPUS))
+
+// points to task_ctx on arena memory for each task
+struct task_ctx_ptr {
+  task_ctx_t *tctx;
+};
+struct {
+  __uint(type, BPF_MAP_TYPE_TASK_STORAGE);
+  __uint(map_flags, BPF_F_NO_PREALLOC);
+  __type(key, int);
+  __type(value, struct task_ctx_ptr);
+} task_ctx_ptr_map SEC(".maps");
+
+// since task slab allocator needs a lock, and arena can't store locks, define it here
+__hidden struct bpf_res_spin_lock scx_arena_task_ctx_slab_lock SEC(".data.scx_arena_task_ctx_slab_lock");
+
+
+static __always_inline task_ctx_t *get_task_ctx(struct task_struct *p) {
+	SCX_TOUCH_ARENA();
+  struct task_ctx_ptr *ptr = bpf_task_storage_get(&task_ctx_ptr_map, p, 0, 0);
+  return ptr ? ptr->tctx : NULL;
 }
 
 // init global structures
@@ -198,6 +282,203 @@ static __always_inline void root_init() {
     
     bpf_printk("[INFO] [JLFP] [INIT] shard[%u] shard_dist_order: %u %u %u", i, shard_td->shard_dist_order[0], shard_td->shard_dist_order[1], shard_td->shard_dist_order[2]);
   }
+}
+
+// init scx_arena
+static __always_inline s32 scx_init(struct scx_arena __arena *a, u64 cgroup_id, u32 max_tasks) {
+  a->cgroup_id = cgroup_id;
+  a->max_tasks = max_tasks;
+  if (cgroup_id == 0) {
+    root_init();
+  }
+
+  // copy global topology into arena
+  struct topo_data *global_topo = fetch_global_topo();
+  a->topo.nr_cids = global_topo->nr_cids;
+  a->topo.nr_shards = global_topo->nr_shards;
+  a->topo.nr_cores = global_topo->nr_cores;
+  a->topo.nr_llcs = global_topo->nr_llcs;
+  a->topo.nr_nodes = global_topo->nr_nodes;
+  u32 i;
+  bpf_for(i, 0, a->topo.nr_cids) {
+    struct cid_topo_data __arena *dst = &a->topo.cids[i & (NR_CPUS-1)];
+    struct cid_topo_data *src = &global_topo->cids[i & (NR_CPUS-1)];
+
+    dst->cpu = src->cpu;
+    dst->shard_idx = src->shard_idx;
+    dst->core_idx = src->core_idx;
+    dst->llc_idx = src->llc_idx;
+    dst->node_idx = src->node_idx;
+  }
+  bpf_for(i, 0, a->topo.nr_cores) {
+    struct core_topo_data __arena *dst = &a->topo.cores[i & (NR_CPUS-1)];
+    struct core_topo_data *src = &global_topo->cores[i & (NR_CPUS-1)];
+
+    
+    dst->base_cid = src->base_cid;
+    dst->nr_cids = src->nr_cids;
+    dst->shard_idx = src->shard_idx;
+    dst->llc_idx = src->llc_idx;
+    dst->node_idx = src->node_idx;
+  }
+  bpf_for(i, 0, a->topo.nr_shards) {
+    struct shard_topo_data __arena *dst = &a->topo.shards[i & (NR_CPUS-1)];
+    struct shard_topo_data *src = &global_topo->shards[i & (NR_CPUS-1)];
+    
+    dst->base_cid = src->base_cid;
+    dst->nr_cids = src->nr_cids;
+    dst->llc_idx = src->llc_idx;
+    dst->node_idx = src->node_idx;
+    u32 j;
+    bpf_for(j, 0, a->topo.nr_shards) {
+      if (unlikely(j >= NR_CPUS)) break;
+      dst->shard_dist_order[j] = src->shard_dist_order[j];
+    }
+  }
+  bpf_for(i, 0, a->topo.nr_llcs) {
+    struct llc_topo_data __arena *dst = &a->topo.llcs[i & (NR_CPUS-1)];
+    struct llc_topo_data *src = &global_topo->llcs[i & (NR_CPUS-1)];
+    
+    dst->base_cid = src->base_cid;
+    dst->nr_cids = src->nr_cids;
+    dst->base_shard = src->base_shard;
+    dst->nr_shards = src->nr_shards;
+    dst->node_idx = src->node_idx;
+  }
+  bpf_for(i, 0, a->topo.nr_nodes) {
+    struct node_topo_data __arena *dst = &a->topo.nodes[i & (NR_CPUS-1)];
+    struct node_topo_data *src = &global_topo->nodes[i & (NR_CPUS-1)];
+
+    dst->base_cid = src->base_cid;
+    dst->nr_cids = src->nr_cids;
+    dst->base_shard = src->base_shard;
+    dst->nr_shards = src->nr_shards;
+  }
+
+  // init task_ctx slab
+	if (!max_tasks) {
+		scx_bpf_error("max_tasks must be > 0");
+		return -EINVAL;
+	}
+  u32 nr_pages = (max_tasks * TASK_CTX_STRIDE + PAGE_SIZE - 1) / PAGE_SIZE;
+	u8 __arena *slab = bpf_arena_alloc_pages(&arena, NULL, nr_pages, NUMA_NO_NODE, 0);
+	if (!slab) {
+		scx_bpf_error("failed to allocate task_ctx slab");
+		return -ENOMEM;
+	}
+	a->task_ctxs = (task_ctx_t *)slab;
+  
+	bpf_for(i, 0, max_tasks) {
+		task_ctx_t *curr = (task_ctx_t *)(slab + i * TASK_CTX_STRIDE);
+		task_ctx_t *next = (i + 1 < max_tasks) ?
+			(task_ctx_t *)(slab + (i + 1) * TASK_CTX_STRIDE) : NULL;
+		curr->next_free = next;
+	}
+	a->task_free_head = (task_ctx_t *)slab;
+  
+  // init static cmasks
+	cmask_init(&a->self_cids.mask, 0, a->topo.nr_cids);
+  cmask_init(&a->idle_cids.mask, 0, a->topo.nr_cids);
+
+  // init shard cmasks
+  bpf_for(i, 0, a->topo.nr_shards) {
+    struct shard_topo_data __arena *shard_td = &a->topo.shards[i & (NR_CPUS-1)];
+    struct scx_cmask __arena *mask = &a->shard_cids[i & (NR_CPUS-1)].mask;
+    cmask_init(mask, shard_td->base_cid, shard_td->nr_cids);
+    u32 j;
+    bpf_for(j, 0, shard_td->nr_cids) {
+      cmask_set(shard_td->base_cid + j, mask);
+    }
+    bpf_printk("[INFO] [JLFP] [INIT] shard[%u] shard_td->nr_cids=%llu base=%llu nr_cids=%llu cmask=%06llx", i, shard_td->nr_cids, mask->base, mask->nr_cids, cmask_to_u64(mask));
+  }
+
+  // TODO: handle subschedulers in capabilities ops
+  // currently just assuming subscheduler has access to all CPUs
+  bpf_for(i, 0, a->topo.nr_cids) {
+    cmask_set(i, &a->self_cids.mask);
+  }
+
+  return 0;
+}
+
+static __always_inline task_ctx_t *scx_init_task(struct scx_arena __arena *a, struct task_struct *p, struct scx_init_task_args *args) {
+  // allocate new task_ctx_t (from qmap)
+  /* pop a slab entry off the free list */
+	if (unlikely(bpf_res_spin_lock(&scx_arena_task_ctx_slab_lock))) {
+    scx_bpf_error("failed to acquire task_ctx slab lock");
+		return (task_ctx_t *)0;
+  }
+	task_ctx_t *tctx = a->task_free_head;
+	if (tctx) a->task_free_head = tctx->next_free;
+	bpf_res_spin_unlock(&scx_arena_task_ctx_slab_lock);
+
+  if (!tctx) {
+    scx_bpf_error("task_ctx slab exhausted (max_tasks=%llu)", a->max_tasks);
+    return tctx;
+  }
+
+  struct task_ctx_ptr *ctx_ptr = bpf_task_storage_get(&task_ctx_ptr_map, p, 0, BPF_LOCAL_STORAGE_GET_F_CREATE);
+  if (unlikely(!ctx_ptr)) {
+		/* push back to the free list */
+		if (unlikely(bpf_res_spin_lock(&scx_arena_task_ctx_slab_lock))) {
+      scx_bpf_error("failed to acquire task_ctx slab lock");
+    } else {
+			tctx->next_free = a->task_free_head;
+			a->task_free_head = tctx;
+			bpf_res_spin_unlock(&scx_arena_task_ctx_slab_lock);
+		}
+		return (task_ctx_t *)0;
+	}
+  
+  ctx_ptr->tctx = tctx;
+
+  // init cpus allowed
+	cmask_init(&tctx->cpus_allowed, 0, a->topo.nr_cids);
+	bpf_rcu_read_lock();
+	cmask_from_cpumask(&tctx->cpus_allowed, p->cpus_ptr);
+	bpf_rcu_read_unlock();
+
+  // init scx_task_ctx fields
+  scx_task_ctx_t *scx_tctx = get_scx_task_ctx(tctx);
+  scx_tctx->tid = p->scx.tid;
+
+  return tctx;
+}
+
+// returns true if successful
+static __always_inline bool scx_exit_task(struct scx_arena __arena *a, struct task_struct *p) {
+  // don't need to free task_ctx_ptr since kernel manages it
+  // need to free task_ctx since it is allocated from arena memory
+	struct task_ctx_ptr *ptr = bpf_task_storage_get(&task_ctx_ptr_map, p, NULL, 0);
+  if (unlikely(!ptr || !ptr->tctx)) return false; // for verifier, should not happen
+
+	task_ctx_t *tctx = ptr->tctx;
+	ptr->tctx = NULL;
+
+	if (bpf_res_spin_lock(&scx_arena_task_ctx_slab_lock)) {
+    scx_bpf_error("failed to acquire task_ctx slab lock");
+    return false;
+  }
+	tctx->next_free = a->task_free_head;
+	a->task_free_head = tctx;
+	bpf_res_spin_unlock(&scx_arena_task_ctx_slab_lock);
+  return true;
+}
+
+static __always_inline task_ctx_t *scx_set_cmask(struct task_struct *p, const struct scx_cmask *cmask_in) {
+  task_ctx_t *tctx = get_task_ctx(p);
+  if (unlikely(!tctx)) return NULL;
+
+  struct scx_cmask __arena *cmask = (struct scx_cmask __arena *)(long)cmask_in;
+  cmask_copy(&tctx->cpus_allowed, cmask);
+  return tctx;
+}
+
+static __always_inline void scx_update_idle(struct scx_arena __arena *a, s32 cid, bool idle) {
+  if (idle)
+    cmask_set(cid, &a->idle_cids.mask);
+  else
+    cmask_clear(cid, &a->idle_cids.mask);
 }
 
 #endif

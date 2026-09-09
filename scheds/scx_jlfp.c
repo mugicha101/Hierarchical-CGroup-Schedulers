@@ -87,10 +87,10 @@ void write_stat(FILE *fd, struct latency_stat *lstat, const char *name, bool las
 
 int main(int argc, char **argv)
 {
-	struct scx_jlfp *skel;
-	struct bpf_link *link;
+	struct scx_jlfp *skel = NULL;
+	struct bpf_link *link = NULL;
 	#if TRACING
-	struct ring_buffer *rb_manager;
+	struct ring_buffer *rb_manager = NULL;
 	#endif
 	struct bpf_program *syscall_prog = NULL;
 	struct jlfp_arena *aa = NULL;
@@ -263,7 +263,7 @@ cleanup:
 		} else {
 			// write stats as json
 			fprintf(stats_fd, "[");
-			for (__u32 cid = 0; cid < aa->topo.nr_cids; ++cid) {
+			for (__u32 cid = 0; cid < aa->scx.topo.nr_cids; ++cid) {
 				if (cid) fprintf(stats_fd, ",");
 				fprintf(stats_fd, "{");
 				struct stats_data *s = &aa->stats[cid];

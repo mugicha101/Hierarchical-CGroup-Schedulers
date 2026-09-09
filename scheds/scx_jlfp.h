@@ -1,11 +1,5 @@
-// shared definitions between scx_qmap.bpf.c and scx_qmap.c
-// defines arena memory layout and shared data structures
-// locks should be stored in a separate bpf map, arena memory has no locking primitives
-// shared data should be stored in pinned maps for now (TODO: split arena into shared and private sections)
-
 #ifndef __SCX_JLFP_H
 #define __SCX_JLFP_H
-
 
 #ifdef __BPF__
 #include <scx/bpf_arena_common.bpf.h>
@@ -100,37 +94,6 @@ static __always_inline void seqlock_update_end(struct seqlock_global __arena *g)
 #endif
 
 // from qmap
-// per task state for the scheduler
-// copy of weight stored as well to reduce map lookups (copied from task_weights during enqueue)
-// opaque to userspace
-// stored on arena memory, allocated via slab allocator
-#ifdef __BPF__
-
-struct task_ctx {
-	struct task_ctx __arena	*next_free;	/* only valid on free list */
-  struct scx_cmask cpus_allowed;	/* per-task affinity in cid space */
-  u64 tid;
-  weight_tuple_t weight; // weight tuple of task at enqueue time
-  u32 pending_cid; // target of incomplete task dispatch (SCX_MAX_CPUS if none)
-};
-/*
- * Slab stride for task_ctx. cpus_allowed's flex array bits[] overlaps the
- * tail bytes appended per entry; struct_size() gives the actual per-entry
- * footprint.
- */
-#define TASK_CTX_STRIDE							\
-	struct_size_t(struct task_ctx, cpus_allowed.bits,		\
-		      CMASK_NR_WORDS(NR_CPUS))
-
-#else
-
-struct task_ctx;
-
-#endif
-
-typedef struct task_ctx __arena task_ctx_t;
-
-// from qmap
 // per subscheduler state
 struct sub_sched_ctx {
   u64 cgroup_id;
@@ -180,6 +143,12 @@ struct cid_data {
 
 // per scheduler instance arena memory
 struct jlfp_arena {
+  struct scx_arena scx;
+
+  // global task dsq: cgroup_id for children, 1 for the root instance
+  u64 dsq_id;
+  u64 self_cgroup_weight;
+
   // SCHEDULING STATE
   
   // per-cid data
@@ -192,26 +161,12 @@ struct jlfp_arena {
   u32 porder[MAX_SUB_SCHEDS]; // sub indices in decreasing priority order
   struct seqlock_global porder_lock;
 
-  // copy of topology
-  struct topo_data topo;
-
-  // CMASK MANAGEMENT
-  
-  // from qmap
-	/* task_ctx slab; allocated and threaded by qmap_init() */
-	task_ctx_t *task_ctxs;
-	task_ctx_t *task_free_head;
-
-  // from qmap
-  /* bpf-internal cmasks (embedded, see struct scx_cmask_wrapper) */
-	struct scx_cmask_wrapper self_cids;	/* cids this node runs its own tasks on */
-	struct scx_cmask_wrapper idle_cids;	/* idle state of all cids regardless of delegation */
-
-  // per-shard cmasks
-  struct scx_cmask_wrapper shard_cids[SCX_MAX_CPUS];
-
   // latency stats
   struct stats_data stats[SCX_MAX_CPUS];
 };
+
+#ifdef __BPF__
+#include "scx_jlfp.bpf.h"
+#endif
 
 #endif

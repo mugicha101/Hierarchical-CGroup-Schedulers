@@ -1,14 +1,10 @@
-// header file for generic root setup
-// this header can be shared with userspace
-// includes scx_root.bpf.h if targeting BPF
-
 #ifndef __SCX_ROOT_H
 #define __SCX_ROOT_H
 
 #define SCX_MAX_CPUS 1024  // >= NR_CPUS
 #define MAX_SUB_SCHEDS 64 // must be power of 2
 #define NTRIALS 10000 // enough trials to be functionally infinite for rare race-conditioned events
-
+#define SCX_POLICY_TASK_CTX_SIZE 1024 // >= largest policy's task context
 #define u128 unsigned __int128
 #define bpf_assert(cond) if (!(cond)) scx_bpf_error(#cond);
 
@@ -27,14 +23,6 @@ struct scx_cmask_wrapper {
 	u64 words[SCX_CMASK_WORDS + 2];
 #endif
 };
-
-// ensure that SCX_MAX_CPUS >= NR_CPUS
-// ensure that BPF and userspace are seeing the same size for qmap_cmask
-#define SCX_ROOT_ASSERTIONS \
-_Static_assert(SCX_MAX_CPUS >= NR_CPUS, "SCX_MAX_CPUS must be >= NR_CPUS"); \
-_Static_assert(SCX_CMASK_WORDS == CMASK_NR_WORDS(NR_CPUS), "SCX_CMASK_WORDS must equal CMASK_NR_WORDS(NR_CPUS)"); \
-_Static_assert(sizeof(struct scx_cmask_wrapper) ==s truct_size_t(struct scx_cmask, bits, SCX_CMASK_WORDS), "scx_full_cmask must be exactly sized to back a full scx_cmask");
-
 
 // topology data
 struct cid_topo_data {
@@ -92,6 +80,33 @@ struct topo_data {
   struct core_topo_data cores[SCX_MAX_CPUS];
   struct llc_topo_data llcs[SCX_MAX_CPUS];
   struct node_topo_data nodes[SCX_MAX_CPUS];
+};
+
+struct task_ctx;
+typedef struct task_ctx __arena task_ctx_t;
+
+// per scheduler instance arena memory
+struct scx_arena {
+  u64 cgroup_id;
+
+  // local copy of topology
+  struct topo_data topo;
+
+  // CMASK MANAGEMENT
+	
+  // initialized in scx_init()
+  // pushed/popped in scx_init_task() and scx_task_exit_task()
+  // protected by scx_arena_task_ctx_slab_lock
+  u64 max_tasks;
+	task_ctx_t *task_ctxs;
+	task_ctx_t *task_free_head;
+
+  /* bpf-internal cmasks (embedded, see struct scx_cmask_wrapper) */
+	struct scx_cmask_wrapper self_cids;	/* cids this node runs its own tasks on */
+	struct scx_cmask_wrapper idle_cids;	/* idle state of all cids regardless of delegation */
+
+  // per-shard cmasks
+  struct scx_cmask_wrapper shard_cids[SCX_MAX_CPUS];
 };
 
 #ifdef __BPF__
