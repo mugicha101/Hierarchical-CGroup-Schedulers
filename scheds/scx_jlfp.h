@@ -45,7 +45,6 @@ const u128 U128_MAX = (((u128)(~0ULL)) << 64) | (u128)(~0ULL);
 #define WT_VTIME_FROM_LOWER(lower) (~0ULL - (u64)(lower))
 #define WT_LOWER_FROM_VTIME(vtime) (~0ULL - (u64)(vtime))
 
-#define DEFAULT_CGROUP_WEIGHT 100 // should match default weight in kernel
 #define DEFAULT_TASK_WEIGHT (~0ULL)
 
 // seqlock implementation

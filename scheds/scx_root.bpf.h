@@ -401,6 +401,41 @@ static __always_inline s32 scx_init(struct scx_arena __arena *a, u64 cgroup_id, 
   return 0;
 }
 
+// looks for a cgroup in sub_scheds
+// if cgroup_id is 0, returns first free location
+// returns NULL if not found or no free location
+static __always_inline struct sub_sched_ctx __arena *sub_lookup(struct scx_arena __arena *a, u64 cgroup_id) {
+  for (u32 i = 0; i < MAX_SUB_SCHEDS; ++i) {
+    if (a->sub_scheds[i].cgroup_id == cgroup_id) {
+      return &a->sub_scheds[i];
+    }
+  }
+  return NULL;
+}
+
+// from qmap
+// gets weight of cgroup before attach
+static u32 cgroup_curr_weight(u64 cgid) {
+  struct cgroup_subsys_state *css;
+  struct cgroup *cgrp;
+  u32 weight = DEFAULT_CGROUP_WEIGHT;
+
+  cgrp = bpf_cgroup_from_id(cgid);
+  if (!cgrp)
+    return weight;
+
+  css = BPF_CORE_READ(cgrp, subsys[cpu_cgrp_id]);
+  if (css) {
+    struct task_group *tg = container_of(css, struct task_group, css);
+    u32 w = BPF_CORE_READ(tg, scx.weight);
+
+    if (w)
+      weight = w;
+  }
+  bpf_cgroup_release(cgrp);
+  return weight;
+}
+
 static __always_inline task_ctx_t *scx_init_task(struct scx_arena __arena *a, struct task_struct *p, struct scx_init_task_args *args) {
   // allocate new task_ctx_t (from qmap)
   /* pop a slab entry off the free list */

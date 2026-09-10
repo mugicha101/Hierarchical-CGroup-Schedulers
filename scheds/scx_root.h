@@ -3,6 +3,7 @@
 
 #define SCX_MAX_CPUS 1024  // >= NR_CPUS
 #define MAX_SUB_SCHEDS 64 // must be power of 2
+#define DEFAULT_CGROUP_WEIGHT 100 // should match default weight in kernel
 #define NTRIALS 10000 // enough trials to be functionally infinite for rare race-conditioned events
 #define SCX_POLICY_TASK_CTX_SIZE 1024 // >= largest policy's task context
 #define u128 unsigned __int128

@@ -39,7 +39,7 @@ const char help_fmt[] =
 "\n"
 "Scheduler Configuration:\n"
 "  -c, --cgroup PATH          Attach the scheduler to an existing cgroup located at PATH (default: /sys/fs/cgroup/ i.e. the root cgroup)\n"
-"  -g, --global-search        Enable Global Shard Search (by default, pick_cid only searches local shard if no idle CPU found)\n"
+"  -g, --global-search        Enable Global Shard Search (by default, jlfp_pick_cid only searches local shard if no idle CPU found)\n"
 "  -S, --max-shard-size N         Sets the maximum shard size (i.e. cluster size) to N (default: 8, however each shard must be within a single LLC)\n"
 "  -T, --max-tasks N          Sets the maximum number of tasks supported by the scheduler to N (default: 16384, must be at least the tasks in the scheduler's cgroup including non-scx tasks)"
 "\n"

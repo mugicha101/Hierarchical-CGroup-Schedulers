@@ -28,7 +28,7 @@ static __always_inline bool init_jlfp_task_ctx(struct scx_arena __arena *a, stru
   jlfp_task_ctx_t *tctx = get_jlfp_task_ctx(scx_init_task(a, p, args));
   if (unlikely(!tctx)) return false;
 
-  // placeholder until pick_cid constructs the full priority tuple
+  // placeholder until jlfp_pick_cid constructs the full priority tuple
   tctx->weight = DEFAULT_TASK_WEIGHT;
   tctx->pending_cid = NR_CPUS;
   return true;
@@ -52,7 +52,7 @@ static __always_inline bool init_jlfp_task_ctx(struct scx_arena __arena *a, stru
 // runtime updates to shard weights, pending owners, and minima hold the shard lock
 // unlocked search reads are hints; the selected shard is checked again under its lock
 
-// pick_cid(A):
+// jlfp_pick_cid(A):
 //     clear A's old pending reservation on re-enqueue if A still owns it
 //     on the min-weight preemption path, reserve the target cid for A before releasing the lock
 //     idle and pinned/migration-disabled direct-dispatch paths do not create a reservation
@@ -245,43 +245,6 @@ static __always_inline s32 jlfp_init_core(struct jlfp_arena __arena *a, u64 cgro
   return err;
 }
 
-// looks for a cgroup in sub_scheds
-// if cgroup_id is 0, returns first free location
-// returns NULL if not found or no free location
-static __always_inline struct sub_sched_ctx __arena *sub_lookup(struct jlfp_arena __arena *a, u64 cgroup_id) {
-  for (u32 i = 0; i < MAX_SUB_SCHEDS; ++i) {
-    if (a->scx.sub_scheds[i].cgroup_id == cgroup_id) {
-      return &a->scx.sub_scheds[i];
-    }
-  }
-  return NULL;
-}
-
-// NOTE: assume sub_attach, sub_detach, and cpuctl_set_weight are done sequentially
-
-// from qmap
-// gets weight of cgroup before attach
-static u32 cgroup_curr_weight(u64 cgid) {
-	struct cgroup_subsys_state *css;
-	struct cgroup *cgrp;
-	u32 weight = DEFAULT_CGROUP_WEIGHT;
-
-	cgrp = bpf_cgroup_from_id(cgid);
-	if (!cgrp)
-		return weight;
-
-	css = BPF_CORE_READ(cgrp, subsys[cpu_cgrp_id]);
-	if (css) {
-		struct task_group *tg = container_of(css, struct task_group, css);
-		u32 w = BPF_CORE_READ(tg, scx.weight);
-
-		if (w)
-			weight = w;
-	}
-	bpf_cgroup_release(cgrp);
-	return weight;
-}
-
 static __always_inline void copy_porder(u32 __arena *src, u32 __arena *dst) {
   u32 i;
   bpf_for(i, 0, MAX_SUB_SCHEDS) {
@@ -292,12 +255,12 @@ static __always_inline void copy_porder(u32 __arena *src, u32 __arena *dst) {
 // only call in attach/detach/set_weights so that we know no other cgroups are changing weights at the same time
 static __always_inline void update_porder(struct jlfp_arena __arena *a, u32 cid, u32 sub_index) {
   u32 weight = a->scx.sub_scheds[sub_index & (MAX_SUB_SCHEDS - 1)].weight;
-
+  
   // use local porder to sort subs by weight in decreasing order
   // can just copy global porder since no updates are happening at the same time
   struct cid_data __arena *cd = &a->cid_data[cid];
   copy_porder(a->porder, cd->porder);
-
+  
   // find index of sub_index in porder
   u32 porder_idx = MAX_SUB_SCHEDS;
   u32 i;
@@ -307,7 +270,7 @@ static __always_inline void update_porder(struct jlfp_arena __arena *a, u32 cid,
     break;
   }
   if (unlikely(porder_idx == MAX_SUB_SCHEDS)) return; // for verifier, should not happen
-
+  
   // bubble the sub in porder to sort
   // note: want higher weight at lower index
   bpf_repeat(MAX_SUB_SCHEDS) {
@@ -327,7 +290,7 @@ static __always_inline void update_porder(struct jlfp_arena __arena *a, u32 cid,
       // in correct position, done
       break;
     }
-
+    
     #if JLFP_DEBUG
     bpf_for(i, 1, MAX_SUB_SCHEDS) {
       if (unlikely(a->scx.sub_scheds[cd->porder[i-1] & (MAX_SUB_SCHEDS - 1)].weight < a->scx.sub_scheds[cd->porder[i] & (MAX_SUB_SCHEDS - 1)].weight)) {
@@ -347,10 +310,10 @@ static __always_inline void update_porder(struct jlfp_arena __arena *a, u32 cid,
   seqlock_update_start(&a->porder_lock);
   copy_porder(cd->porder, a->porder);
   seqlock_update_end(&a->porder_lock);
-
+  
   // update local lock to match global lock
   cd->porder_lock.gen = a->porder_lock.gen_fin;
-
+  
   return;
 }
 
@@ -363,47 +326,49 @@ static __always_inline void update_porder(struct jlfp_arena __arena *a, u32 cid,
 // fine since dispatches to invalid cgroups just return false and newly attached cgroups should be picked up eventually if weight updates are infrequent enough
 static __always_inline bool sync_porder(struct jlfp_arena __arena *a, u32 cid) {
   if (unlikely(cid >= NR_CPUS)) return false; // for verifier, should not happen
-
+  
   struct latency_ctx lctx;
   lstat_start(&lctx);
-
+  
   struct cid_data __arena *cd = &a->cid_data[cid];
   u64 gen_fin = READ_ONCE(a->porder_lock.gen_fin);
   if (gen_fin == cd->porder_lock.gen) { // already synced
     lstat_record(&lctx, &a->stats[cid].sync_porder_cached);
     return false;
   }
-
+  
   // copy data from global to local
   smp_rmb();
   copy_porder(a->porder, cd->porder_sync_buff);
   smp_rmb();
-
+  
   u64 gen_beg = READ_ONCE(a->porder_lock.gen_beg);
   if (gen_beg != gen_fin) { // update failed due to write during copy
     lstat_record(&lctx, &a->stats[cid].sync_porder_fail);
     return false;
   }
-
+  
   // copied data is consistent, update local porder
   copy_porder(cd->porder_sync_buff, cd->porder);
   cd->porder_lock.gen = gen_fin;
-
+  
   lstat_record(&lctx, &a->stats[cid].sync_porder_update);
   return true;
 }
 
+// NOTE: assume sub_attach, sub_detach, and cpuctl_set_weight are done sequentially
+
 static __always_inline s32 jlfp_sub_attach_core(struct jlfp_arena __arena *a, struct scx_sub_attach_args *args) {
   TRACE_FUNC_START("sub_attach");
-
+  
   struct latency_ctx lctx;
   lstat_start(&lctx);
-
+  
   u32 cid = scx_bpf_this_cid();
   u64 sub_cgroup_id = args->ops->sub_cgroup_id;
 
   // kernel should not call sub_attach on attached cgroup so no need to check for duplicates
-  struct sub_sched_ctx __arena *sub = sub_lookup(a, 0);
+  struct sub_sched_ctx __arena *sub = sub_lookup(&a->scx, 0);
   if (unlikely(!sub)) {
     scx_bpf_error("sub attach: MAX SUBS EXCEEDED");
     return -ENOMEM;
@@ -437,7 +402,7 @@ static __always_inline void jlfp_sub_detach_core(struct jlfp_arena __arena *a, s
 
   u32 cid = scx_bpf_this_cid();
   u64 sub_cgroup_id = args->ops->sub_cgroup_id;
-  struct sub_sched_ctx __arena *sub = sub_lookup(a, sub_cgroup_id);
+  struct sub_sched_ctx __arena *sub = sub_lookup(&a->scx, sub_cgroup_id);
   if (unlikely(!sub)) { // for verifier, should not happen
     TRACE_FUNC_END("sub_detach", "NOT ATTACHED");
     return;
@@ -477,7 +442,7 @@ static __always_inline void jlfp_cpuctl_set_weight_core(struct jlfp_arena __aren
     return; // self not in subs
   }
 
-  struct sub_sched_ctx __arena *sub = sub_lookup(a, sub_cgroup_id);
+  struct sub_sched_ctx __arena *sub = sub_lookup(&a->scx, sub_cgroup_id);
   if (!sub) {
     TRACE_FUNC_END("cpuctl_set_weight", "NOT ATTACHED");
     return;
@@ -498,8 +463,8 @@ static __always_inline void jlfp_cpuctl_set_weight_core(struct jlfp_arena __aren
 
 // try an eligible global dsq task that beats prev, otherwise resume runnable prev
 // returns the chosen task pid, or zero when no task can run
-static __always_inline u64 try_task_dispatch(struct jlfp_arena __arena *a, u32 cid, struct task_struct *prev, u64 slice, u64 prev_priority) {
-  TRACE_FUNC_START("try_task_dispatch")
+static __always_inline u64 jlfp_try_task_dispatch(struct jlfp_arena __arena *a, u32 cid, struct task_struct *prev, u64 slice, u64 prev_priority) {
+  TRACE_FUNC_START("jlfp_try_task_dispatch")
   if (unlikely(cid >= NR_CPUS)) return false; // for verifier, should not happen
 
   // if prev task has a weight and is runnable, need to consider it
@@ -573,7 +538,7 @@ static __always_inline u64 try_task_dispatch(struct jlfp_arena __arena *a, u32 c
     scx_bpf_task_set_slice(prev, slice);
   }
 
-  TRACE_FUNC_END("try_task_dispatch", moved ? "MOVED" : "NOT MOVED");
+  TRACE_FUNC_END("jlfp_try_task_dispatch", moved ? "MOVED" : "NOT MOVED");
 
   if (moved) {
     HOTPATH_TRACE_EVENT(struct sched_trace_event_dispatch_result, SCHED_TRACE_DISPATCH_RESULT,
@@ -600,7 +565,7 @@ static __always_inline void jlfp_dispatch_core(struct jlfp_arena __arena *a, s32
   cid = cid & (NR_CPUS - 1); // for verifier
 
   // dispatch task
-  u64 tid = try_task_dispatch(a, cid, prev, slice, prev_priority);
+  u64 tid = jlfp_try_task_dispatch(a, cid, prev, slice, prev_priority);
   if (tid) {
     lstat_record(&lctx, &a->stats[cid].dispatch);
     TRACE_FUNC_END("dispatch", prev && tid == prev->pid ? "DISPATCHED PREV" : "DISPATCHED TASK");
@@ -651,11 +616,11 @@ static __always_inline void jlfp_dispatch_core(struct jlfp_arena __arena *a, s32
   }
 }
 
-// caller supplies task priority; pick_cid adds migration and cgroup priority fields
+// caller supplies task priority; jlfp_pick_cid adds migration and cgroup priority fields
 // inserts directly into a local or global dsq from select_cid or enqueue
 // insertion from select_cid skips the enqueue callback
-static void __always_inline pick_cid(struct jlfp_arena __arena *a, struct task_struct *p, u32 prev_cid, u64 enq_flags, u64 priority, u64 slice, bool global_search) {
-  TRACE_FUNC_START("pick_cid");
+static void __always_inline jlfp_pick_cid(struct jlfp_arena __arena *a, struct task_struct *p, u32 prev_cid, u64 enq_flags, u64 priority, u64 slice, bool global_search) {
+  TRACE_FUNC_START("jlfp_pick_cid");
 
   struct latency_ctx lctx;
   lstat_start(&lctx);
@@ -870,7 +835,7 @@ static void __always_inline pick_cid(struct jlfp_arena __arena *a, struct task_s
 
   u32 cid = scx_bpf_this_cid();
   lstat_record(&lctx, dispatch_type == 0 ? &a->stats[cid].pick_cid_prev : dispatch_type == 1 ? &a->stats[cid].pick_cid_idle : &a->stats[cid].pick_cid_search);
-  TRACE_FUNC_END("pick_cid", "");
+  TRACE_FUNC_END("jlfp_pick_cid", "");
   goto pick_cid_end;
 
   // NO DISPATCH
@@ -884,7 +849,7 @@ static void __always_inline pick_cid(struct jlfp_arena __arena *a, struct task_s
 
   cid = scx_bpf_this_cid();
   lstat_record(&lctx, dispatch_type == 0 ? &a->stats[cid].pick_cid_prev : dispatch_type == 1 ? &a->stats[cid].pick_cid_idle : &a->stats[cid].pick_cid_search);
-  TRACE_FUNC_END("pick_cid", "GLOBAL DSQ");
+  TRACE_FUNC_END("jlfp_pick_cid", "GLOBAL DSQ");
 
   pick_cid_end:
 
@@ -940,7 +905,7 @@ static __always_inline void jlfp_running_core(struct jlfp_arena __arena *a, stru
   if (sctx->cid_pending_owner[shard_offset] == p->scx.tid) {
     // only clear pending if this is the pending owner
     // case where its not owner: this task won the race to local dsq and pending owner got re-enqueued
-    // in this case, pending owner will clear its pending status in pick_cid
+    // in this case, pending owner will clear its pending status in jlfp_pick_cid
     sctx->cid_pending_weight[shard_offset] = 0;
     sctx->cid_pending_owner[shard_offset] = 0;
   }
