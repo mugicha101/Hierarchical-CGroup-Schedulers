@@ -135,15 +135,11 @@ struct jlfp_arena {
 
   // global task dsq: cgroup_id for children, 1 for the root instance
   u64 dsq_id;
-  u64 self_cgroup_weight;
 
   // SCHEDULING STATE
   
   // per-cid data
   struct cid_data cid_data[SCX_MAX_CPUS];
-
-  // subscheduler state
-  u64 nr_sub_scheds;
 
   u32 porder[MAX_SUB_SCHEDS]; // sub indices in decreasing priority order
   struct seqlock_global porder_lock;

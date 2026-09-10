@@ -100,9 +100,11 @@ typedef struct task_ctx __arena task_ctx_t;
 // per scheduler instance arena memory
 struct scx_arena {
   u64 cgroup_id;
+  u64 self_cgroup_weight;
 
   // subscheduler state
   struct sub_sched_ctx sub_scheds[MAX_SUB_SCHEDS];
+  u64 nr_sub_scheds;
 
   // local copy of topology
   struct topo_data topo;

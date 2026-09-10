@@ -213,7 +213,7 @@ static __always_inline s32 jlfp_init_core(struct jlfp_arena __arena *a, u64 cgro
   }
 
   // init cgroup data structs
-  a->self_cgroup_weight = DEFAULT_CGROUP_WEIGHT;
+  a->scx.self_cgroup_weight = DEFAULT_CGROUP_WEIGHT;
   u32 cid;
   u32 i;
   u32 nr_cids = scx_bpf_nr_cids();
@@ -237,7 +237,7 @@ static __always_inline s32 jlfp_init_core(struct jlfp_arena __arena *a, u64 cgro
   } else {
     // root cgroup
     a->dsq_id = 1;
-    a->self_cgroup_weight = WT_CGRP_WEIGHT_MASK;
+    a->scx.self_cgroup_weight = WT_CGRP_WEIGHT_MASK;
   }
   scx_bpf_create_dsq(a->dsq_id, -1);
 
@@ -437,7 +437,7 @@ static __always_inline void jlfp_cpuctl_set_weight_core(struct jlfp_arena __aren
   u32 cid = scx_bpf_this_cid();
 
   if (sub_cgroup_id == a->scx.cgroup_id) {
-    a->self_cgroup_weight = weight;
+    a->scx.self_cgroup_weight = weight;
     TRACE_FUNC_END("cpuctl_set_weight", "SELF");
     return; // self not in subs
   }
@@ -475,7 +475,7 @@ static __always_inline u64 jlfp_try_task_dispatch(struct jlfp_arena __arena *a, 
     pctx = get_task_ctx(prev);
     if (likely(pctx)) {
       // refresh before comparison so weight changes also apply when prev resumes directly
-      prev_weight = WT_FROM_FIELDS(prev_priority, is_migration_disabled(prev), a->self_cgroup_weight, 0);
+      prev_weight = WT_FROM_FIELDS(prev_priority, is_migration_disabled(prev), a->scx.self_cgroup_weight, 0);
       get_jlfp_task_ctx(pctx)->weight = prev_weight;
     }
   }
@@ -637,7 +637,7 @@ static void __always_inline jlfp_pick_cid(struct jlfp_arena __arena *a, struct t
   // setup
   u32 target_cid = prev_cid;
   bool nmig = is_migration_disabled(p);
-  weight_tuple_t task_weight = WT_FROM_FIELDS(priority, nmig, a->self_cgroup_weight, 0);
+  weight_tuple_t task_weight = WT_FROM_FIELDS(priority, nmig, a->scx.self_cgroup_weight, 0);
   task_ctx_t *tctx = get_task_ctx(p);
   bool weight_changed = get_jlfp_task_ctx(tctx)->weight != task_weight;
   get_jlfp_task_ctx(tctx)->weight = task_weight;
