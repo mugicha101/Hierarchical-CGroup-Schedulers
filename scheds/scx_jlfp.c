@@ -7,6 +7,7 @@
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <unistd.h>
+#include <getopt.h>
 #include <signal.h>
 #include <libgen.h>
 #include <bpf/bpf.h>
@@ -21,7 +22,6 @@
 #include <time.h>
 #include "scx_jlfp.h"
 
-#include "scx_jlfp.bpf.skel.h"
 #include "scx_jlfp.bpf.skel.h"
 
 #define SUB_CG_BASE "/sys/fs/cgroup/scx_jlfp"
@@ -94,7 +94,8 @@ int main(int argc, char **argv)
 	#endif
 	struct bpf_program *syscall_prog = NULL;
 	struct jlfp_arena *aa = NULL;
-
+	
+	u64 cgroup_id = 0;
 	bool global_search = false;
 	uint32_t max_shard_size = 8;
 	uint32_t max_tasks = 16384;
@@ -105,17 +106,27 @@ int main(int argc, char **argv)
 	const char *pin_path = "/sys/fs/bpf/update_weight";
 	const char *stats_path = NULL;
 
-	__u32 opt;
+	static const struct option long_opts[] = {
+		{ "cgroup", required_argument, NULL, 'c' },
+		{ "verbose", no_argument, NULL, 'v' },
+		{ "global-search", no_argument, NULL, 'g' },
+		{ "max-shard-size", required_argument, NULL, 'S' },
+		{ "max-tasks", required_argument, NULL, 'T' },
+		{ "trace", required_argument, NULL, 't' },
+		{ "stats", required_argument, NULL, 's' },
+		{ "help", no_argument, NULL, 'h' },
+		{ NULL, 0, NULL, 0 },
+	};
+	int opt;
+	int ret;
 	__u64 ecode;
 
 	libbpf_set_print(libbpf_print_fn);
 	signal(SIGINT, sigint_handler);
 	signal(SIGTERM, sigint_handler);
 
-restart:
-
 	// parse arguments
-	while ((opt = getopt(argc, argv, "c:v:t:s:h")) != -1) {
+	while ((opt = getopt_long(argc, argv, "c:vgS:T:t:s:h", long_opts, NULL)) != -1) {
 		switch (opt) {
 		case 'v':
 			verbose = true;
@@ -145,6 +156,19 @@ restart:
 			return opt != 'h';
 		}
 	}
+restart:
+	// reset resources before each scheduler instance
+	cgroup_id = 0;
+	skel = NULL;
+	link = NULL;
+	syscall_prog = NULL;
+	aa = NULL;
+	#if TRACING
+	rb_manager = NULL;
+	#endif
+	ecode = 0;
+	ret = 1;
+
 	fprintf(stdout, "Initializing %s\n", sched_name);
 
 	// open trace fd
@@ -179,21 +203,22 @@ restart:
 			goto cleanup;
 		}
 		skel->struct_ops.jlfp_ops->sub_cgroup_id = st.st_ino;
-		skel->rodata->cgroup_id = st.st_ino;
+		cgroup_id = st.st_ino;
 	}
 	skel->struct_ops.jlfp_ops->cid_shard_size = max_shard_size;
-	skel->rodata->max_tasks = max_tasks;
 	skel->rodata->trace_enabled = trace_path != NULL;
-	skel->rodata->global_search = global_search;
 	
 	// load scheduler
 	SCX_OPS_LOAD(skel, jlfp_ops, scx_jlfp, uei);
+	aa = &skel->arena->aa;
+	aa->base.cgroup_id = cgroup_id;
+	aa->base.max_tasks = max_tasks;
+	aa->global_search = global_search;
 	link = SCX_OPS_ATTACH(skel, jlfp_ops, scx_jlfp);
 	if (!link) {
 		fprintf(stderr, "Error: failed to attach scheduler\n");
 		goto cleanup;
 	}
-	aa = &skel->arena->aa;
 
 	// pin syscall program if no prior instances of it exist
 	// if (access(pin_path, F_OK)) {
@@ -224,12 +249,17 @@ restart:
 	}
 	#endif
 
+	ret = 0;
+
 	// sleep while running
 	while (!exit_req && !UEI_EXITED(skel, uei)) {
 		#if TRACING
 		int err = ring_buffer__poll(rb_manager, 100);
 		if (err < 0) {
-			fprintf(stderr, "Error polling ring buffer: %d\n", err);
+			if (err != -EINTR) {
+				fprintf(stderr, "Error polling ring buffer: %d\n", err);
+				ret = 1;
+			}
 			break;
 		}
 		#else
@@ -243,8 +273,10 @@ cleanup:
 		bpf_program__unpin(syscall_prog, pin_path);
 	}
 
-	if (link) bpf_link__destroy(link);
-	ecode = UEI_REPORT(skel, uei);
+	if (link) {
+		bpf_link__destroy(link);
+		ecode = UEI_REPORT(skel, uei);
+	}
 
 	#if TRACING
 	// read exit event
@@ -253,6 +285,7 @@ cleanup:
 		if (err < 0) {
 			fprintf(stderr, "Error polling ring buffer: %d\n", err);
 		}
+		ring_buffer__free(rb_manager);
 	}
 	#endif
 
@@ -263,7 +296,7 @@ cleanup:
 		} else {
 			// write stats as json
 			fprintf(stats_fd, "[");
-			for (__u32 cid = 0; cid < aa->scx.topo.nr_cids; ++cid) {
+			for (__u32 cid = 0; cid < aa->base.topo.nr_cids; ++cid) {
 				if (cid) fprintf(stats_fd, ",");
 				fprintf(stats_fd, "{");
 				struct stats_data *s = &aa->stats[cid];
@@ -292,6 +325,7 @@ cleanup:
 				fprintf(stats_fd, "}");
 			}
 			fprintf(stats_fd, "]");
+			fclose(stats_fd);
 		}
 	}
 
@@ -306,5 +340,5 @@ cleanup:
 
 	if (UEI_ECODE_RESTART(ecode))
 		goto restart;
-	return 0;
+	return ret;
 }

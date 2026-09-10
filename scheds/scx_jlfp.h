@@ -9,7 +9,7 @@
 #endif
 
 #include "trace_events.h"
-#include "scx_root.h"
+#include "scx_base.h"
 
 // weight tuple consists of 2 64 bit halves
 // upper: misc data [127..80], cgrp_weight [79..64]
@@ -119,33 +119,36 @@ struct stats_data {
 struct cid_data {
   // scheduling state
   u32 curr_idx; // index of currently running subscheduler
-  int can_run[SCX_MAX_CPUS]; // whether current enqueued task can run on each CPU
+  int can_run[BASE_MAX_CPUS]; // whether current enqueued task can run on each CPU
 
   u32 porder[MAX_SUB_SCHEDS]; // cached indices of global porder
   u32 porder_sync_buff[MAX_SUB_SCHEDS]; // buffer for syncing porder
   struct seqlock_local porder_lock;
 
   // scratch memory
-  struct scx_cmask_wrapper tmp_cmask;
+  struct base_cmask_wrapper tmp_cmask;
 };
 
 // per scheduler instance arena memory
 struct jlfp_arena {
-  struct scx_arena scx;
+  struct base_arena base;
 
-  // global task dsq: cgroup_id for children, 1 for the root instance
+  // userspace opts
+  bool global_search; // search all fully-overlapped shards (fallback on prev shard if no fully-overlapped shards)
+
+  // global task dsq
   u64 dsq_id;
 
   // SCHEDULING STATE
   
   // per-cid data
-  struct cid_data cid_data[SCX_MAX_CPUS];
+  struct cid_data cid_data[BASE_MAX_CPUS];
 
   u32 porder[MAX_SUB_SCHEDS]; // sub indices in decreasing priority order
   struct seqlock_global porder_lock;
 
   // latency stats
-  struct stats_data stats[SCX_MAX_CPUS];
+  struct stats_data stats[BASE_MAX_CPUS];
 };
 
 #ifdef __BPF__

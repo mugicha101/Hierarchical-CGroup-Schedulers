@@ -5,8 +5,6 @@
 #include "trace_events.h"
 #include "scx_jlfp.h"
 
-CREATE_TRACE_BUFF();
-
 char _license[] SEC("license") = "GPL";
 
 // concrete job-level fixed-priority scheduler using the shared JLFP engine
@@ -15,9 +13,6 @@ char _license[] SEC("license") = "GPL";
 // select_cid, enqueue, and dispatch reconsidering runnable prev read the map
 // changing a map entry does not reorder queued tasks or preempt running tasks by itself
 
-const volatile u64 cgroup_id; // id of this cgroup, 0 if root
-const volatile u32 max_tasks; // max tasks allowed in the cgroup (include non-scx, stores a cmask for all tasks)
-const volatile bool global_search; // search all fully-overlapped shards (fallback on prev shard if no fully-overlapped shards)
 u64 slice = 1000000ULL; // 1ms
 
 UEI_DEFINE(uei);
@@ -35,15 +30,15 @@ struct {
 
 s32 BPF_STRUCT_OPS_SLEEPABLE(jlfp_init)
 {
-  return jlfp_init_core(&aa, cgroup_id, max_tasks);
+  return jlfp_init_core(&aa);
 }
 
 void BPF_STRUCT_OPS(jlfp_exit, struct scx_exit_info *ei)
 {
   TRACE_EVENT(struct sched_trace_event_exit, SCHED_TRACE_EXIT,
-    e->cgrp_id = cgroup_id;
+    e->cgrp_id = aa.base.cgroup_id;
   );
-  bpf_printk("[INFO] [JLFP] [EXIT] cgroup=%llu\n", cgroup_id);
+  bpf_printk("[INFO] [JLFP] [EXIT] cgroup=%llu\n", aa.base.cgroup_id);
   UEI_RECORD(uei, ei);
 }
 
@@ -92,7 +87,7 @@ s32 BPF_STRUCT_OPS(jlfp_select_cid, struct task_struct *p, s32 prev_cid, u64 wak
 
   struct latency_ctx lctx;
   lstat_start(&lctx);
-  jlfp_pick_cid(&aa, p, (u32)prev_cid, SCX_ENQ_WAKEUP | wake_flags, get_task_weight(p), slice, global_search);
+  jlfp_pick_cid(&aa, p, (u32)prev_cid, SCX_ENQ_WAKEUP | wake_flags, get_task_weight(p), slice);
   u32 cid = scx_bpf_this_cid();
   lstat_record(&lctx, &aa.stats[cid].select_cid);
 
@@ -114,7 +109,7 @@ void BPF_STRUCT_OPS(jlfp_enqueue, struct task_struct *p, u64 enq_flags)
   struct latency_ctx lctx;
   lstat_start(&lctx);
 
-  jlfp_pick_cid(&aa, p, (u32)scx_bpf_task_cid(p), enq_flags, get_task_weight(p), slice, global_search);
+  jlfp_pick_cid(&aa, p, (u32)scx_bpf_task_cid(p), enq_flags, get_task_weight(p), slice);
   
   u32 cid = scx_bpf_this_cid();
   lstat_record(&lctx, &aa.stats[cid].enqueue);
@@ -139,7 +134,7 @@ void BPF_STRUCT_OPS(jlfp_running, struct task_struct *p)
     wt = (policy == SCHED_FIFO || policy == SCHED_RR) ? U128_MAX : 0;
   } else {
     if (unlikely(!tctx)) { // should not happen but just incase
-      wt = WT_FROM_FIELDS(get_task_weight(p), is_migration_disabled(p), aa.scx.self_cgroup_weight, 0);
+      wt = WT_FROM_FIELDS(get_task_weight(p), is_migration_disabled(p), aa.base.self_cgroup_weight, 0);
     } else {
       wt = get_jlfp_task_ctx(tctx)->weight;
     }
@@ -187,7 +182,7 @@ void BPF_STRUCT_OPS(jlfp_stopping, struct task_struct *p, bool runnable)
 
 void BPF_STRUCT_OPS(jlfp_update_idle, s32 cid, bool idle)
 {
-  scx_update_idle(&aa.scx, cid, idle);
+  base_update_idle(&aa.base, cid, idle);
 }
 
 // from qmap
@@ -206,7 +201,7 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(jlfp_init_task, struct task_struct *p, struct scx_i
 
   // bpf_printk("[INFO] [JLFP] [INIT_TASK] cgroup=%d pid=%d comm=%s", cgroup_id, p->pid, p->comm);
 
-  if (unlikely(!init_jlfp_task_ctx(&aa.scx, p, args))) {
+  if (unlikely(!init_jlfp_task_ctx(&aa.base, p, args))) {
     return -ENOMEM;
   }
 
@@ -227,7 +222,7 @@ void BPF_STRUCT_OPS(jlfp_exit_task, struct task_struct *p)
   struct latency_ctx lctx;
   lstat_start(&lctx);
 
-  if (!scx_exit_task(&aa.scx, p)) return;
+  if (!base_exit_task(&aa.base, p)) return;
 
   u32 cid = scx_bpf_this_cid();
   lstat_record(&lctx, &aa.stats[cid].exit_task);
@@ -241,7 +236,7 @@ void BPF_STRUCT_OPS(jlfp_set_cmask, struct task_struct *p, const struct scx_cmas
   struct latency_ctx lctx;
   lstat_start(&lctx);
 
-  task_ctx_t *tctx = scx_set_cmask(p, cmask_in);
+  task_ctx_t *tctx = base_set_cmask(p, cmask_in);
   if (unlikely(!tctx)) return;
 
   u32 cid = scx_bpf_this_cid();

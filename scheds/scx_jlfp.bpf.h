@@ -10,7 +10,7 @@
 #endif
 
 struct jlfp_task_ctx {
-  struct scx_task_ctx scx;
+  struct base_task_ctx base;
 
   // cached tuple from selection/enqueue or dispatch reconsidering runnable prev
   weight_tuple_t weight;
@@ -18,14 +18,14 @@ struct jlfp_task_ctx {
   u32 pending_cid;
 };
 typedef struct jlfp_task_ctx __arena jlfp_task_ctx_t;
-_Static_assert(sizeof(struct jlfp_task_ctx) <= SCX_POLICY_TASK_CTX_SIZE, "jlfp_task_ctx larger than SCX_POLICY_TASK_CTX_SIZE");
-_Static_assert(offsetof(struct jlfp_task_ctx, scx) == 0, "scx_task_ctx must be prefix");
+_Static_assert(sizeof(struct jlfp_task_ctx) <= BASE_POLICY_TASK_CTX_SIZE, "jlfp_task_ctx larger than BASE_POLICY_TASK_CTX_SIZE");
+_Static_assert(offsetof(struct jlfp_task_ctx, base) == 0, "base_task_ctx must be prefix");
 static __always_inline jlfp_task_ctx_t *get_jlfp_task_ctx(task_ctx_t *tctx) {
   return likely(tctx) ? (jlfp_task_ctx_t *)tctx->ptctx.data : (jlfp_task_ctx_t *)0;
 }
 
-static __always_inline bool init_jlfp_task_ctx(struct scx_arena __arena *a, struct task_struct *p, struct scx_init_task_args *args) {
-  jlfp_task_ctx_t *tctx = get_jlfp_task_ctx(scx_init_task(a, p, args));
+static __always_inline bool init_jlfp_task_ctx(struct base_arena __arena *a, struct task_struct *p, struct scx_init_task_args *args) {
+  jlfp_task_ctx_t *tctx = get_jlfp_task_ctx(base_init_task(a, p, args));
   if (unlikely(!tctx)) return false;
 
   // placeholder until jlfp_pick_cid constructs the full priority tuple
@@ -113,16 +113,16 @@ static __always_inline weight_tuple_t sctx_get_effective_weight(struct shard_ctx
 };
 
 static __always_inline weight_tuple_t get_effective_weight(struct jlfp_arena __arena *a, u32 cid) {
-  u32 shard = a->scx.topo.cids[cid & (NR_CPUS - 1)].shard_idx;
+  u32 shard = a->base.topo.cids[cid & (NR_CPUS - 1)].shard_idx;
   struct shard_ctx *sctx = bpf_map_lookup_elem(&shard_ctx_map, &shard);
-  u32 shard_offset = cid - a->scx.topo.shards[shard].base_cid;
+  u32 shard_offset = cid - a->base.topo.shards[shard].base_cid;
   if (unlikely(!sctx || shard_offset >= SCX_CID_SHARD_MAX_CPUS)) return 0; // for verifier, should not happen
 
   return sctx_get_effective_weight(sctx, shard_offset);
 }
 
 static __always_inline void update_min_effective_locked(struct jlfp_arena __arena *a, u32 cid, u32 shard, struct shard_ctx *sctx) {
-  u32 shard_offset = cid - a->scx.topo.shards[shard].base_cid;
+  u32 shard_offset = cid - a->base.topo.shards[shard].base_cid;
   if (unlikely(!sctx || shard_offset >= SCX_CID_SHARD_MAX_CPUS)) return; // for verifier, should not happen
 
   weight_tuple_t new_weight = sctx_get_effective_weight(sctx, shard_offset);
@@ -141,10 +141,10 @@ static __always_inline void update_min_effective_locked(struct jlfp_arena __aren
   }
 
   // need to search shard for new min
-  u32 base_cid = a->scx.topo.shards[shard].base_cid;
+  u32 base_cid = a->base.topo.shards[shard].base_cid;
   curr_min_weight = sctx_get_effective_weight(sctx, 0);
   curr_min_cid = base_cid;
-  u32 end = a->scx.topo.shards[shard].nr_cids;
+  u32 end = a->base.topo.shards[shard].nr_cids;
   if (unlikely(end > SCX_CID_SHARD_MAX_CPUS)) end = SCX_CID_SHARD_MAX_CPUS; // for verifier, should not happen
 
   u32 i;
@@ -164,7 +164,7 @@ static __always_inline void update_min_effective_locked(struct jlfp_arena __aren
 }
 
 static __always_inline void set_running_weight_locked(struct jlfp_arena __arena *a, u32 cid, u32 shard, weight_tuple_t wt, struct shard_ctx *sctx) {
-  u32 shard_offset = cid - a->scx.topo.shards[shard].base_cid;
+  u32 shard_offset = cid - a->base.topo.shards[shard].base_cid;
   if (unlikely(!sctx || shard_offset >= SCX_CID_SHARD_MAX_CPUS)) return; // for verifier, should not happen
 
   sctx->cid_running_weight[shard_offset] = wt;
@@ -172,7 +172,7 @@ static __always_inline void set_running_weight_locked(struct jlfp_arena __arena 
 }
 
 static __always_inline void set_pending_weight_locked(struct jlfp_arena __arena *a, u32 cid, u32 shard, weight_tuple_t wt, struct shard_ctx *sctx, u64 scx_tid) {
-  u32 shard_offset = cid - a->scx.topo.shards[shard].base_cid;
+  u32 shard_offset = cid - a->base.topo.shards[shard].base_cid;
   if (unlikely(!sctx || shard_offset >= SCX_CID_SHARD_MAX_CPUS)) return; // for verifier, should not happen
 
   sctx->cid_pending_weight[shard_offset] = wt;
@@ -180,18 +180,18 @@ static __always_inline void set_pending_weight_locked(struct jlfp_arena __arena 
   update_min_effective_locked(a, cid, shard, sctx);
 }
 
-static __always_inline s32 jlfp_init_core(struct jlfp_arena __arena *a, u64 cgroup_id, u32 max_tasks) {
+static __always_inline s32 jlfp_init_core(struct jlfp_arena __arena *a) {
   TRACE_FUNC_START("init");
-  bpf_printk("[INFO] [JLFP] [INIT] cgroup=%llu", cgroup_id);
+  bpf_printk("[INFO] [JLFP] [INIT] cgroup=%llu", a->base.cgroup_id);
   bpf_printk("[INFO] [JLFP] [INIT] SCX_TASK_QUEUED=%u", SCX_TASK_QUEUED);
   TRACE_EVENT(struct sched_trace_event_init, SCHED_TRACE_INIT,
-    e->cgrp_id = cgroup_id;
+    e->cgrp_id = a->base.cgroup_id;
   );
-
-  s32 err = scx_init(&a->scx, cgroup_id, max_tasks);
+  
+  s32 err = base_init(&a->base);
   if (err) return err;
 
-  if (cgroup_id == 0) {
+  if (a->base.cgroup_id == 0) {
     // clear new shard context in case junk from prior scheduler
     struct topo_data *topo = fetch_global_topo();
     u32 shard;
@@ -213,7 +213,7 @@ static __always_inline s32 jlfp_init_core(struct jlfp_arena __arena *a, u64 cgro
   }
 
   // init cgroup data structs
-  a->scx.self_cgroup_weight = DEFAULT_CGROUP_WEIGHT;
+  a->base.self_cgroup_weight = DEFAULT_CGROUP_WEIGHT;
   u32 cid;
   u32 i;
   u32 nr_cids = scx_bpf_nr_cids();
@@ -232,13 +232,8 @@ static __always_inline s32 jlfp_init_core(struct jlfp_arena __arena *a, u64 cgro
   }
 
   // init task data structs
-  if (cgroup_id) {
-    a->dsq_id = cgroup_id;
-  } else {
-    // root cgroup
-    a->dsq_id = 1;
-    a->scx.self_cgroup_weight = WT_CGRP_WEIGHT_MASK;
-  }
+  a->dsq_id = 1;
+  a->base.self_cgroup_weight = a->base.cgroup_id ? DEFAULT_CGROUP_WEIGHT : WT_CGRP_WEIGHT_MASK;
   scx_bpf_create_dsq(a->dsq_id, -1);
 
   TRACE_FUNC_END("init", "");
@@ -254,7 +249,7 @@ static __always_inline void copy_porder(u32 __arena *src, u32 __arena *dst) {
 
 // only call in attach/detach/set_weights so that we know no other cgroups are changing weights at the same time
 static __always_inline void update_porder(struct jlfp_arena __arena *a, u32 cid, u32 sub_index) {
-  u32 weight = a->scx.sub_scheds[sub_index & (MAX_SUB_SCHEDS - 1)].weight;
+  u32 weight = a->base.sub_scheds[sub_index & (MAX_SUB_SCHEDS - 1)].weight;
   
   // use local porder to sort subs by weight in decreasing order
   // can just copy global porder since no updates are happening at the same time
@@ -274,13 +269,13 @@ static __always_inline void update_porder(struct jlfp_arena __arena *a, u32 cid,
   // bubble the sub in porder to sort
   // note: want higher weight at lower index
   bpf_repeat(MAX_SUB_SCHEDS) {
-    if (porder_idx > 0 && a->scx.sub_scheds[cd->porder[porder_idx-1] & (MAX_SUB_SCHEDS - 1)].weight < weight) {
+    if (porder_idx > 0 && a->base.sub_scheds[cd->porder[porder_idx-1] & (MAX_SUB_SCHEDS - 1)].weight < weight) {
       // bubble down
       u32 t = cd->porder[porder_idx];
       cd->porder[porder_idx] = cd->porder[porder_idx-1];
       cd->porder[porder_idx-1] = t;
       porder_idx--;
-    } else if (porder_idx+1 < MAX_SUB_SCHEDS && a->scx.sub_scheds[cd->porder[porder_idx+1] & (MAX_SUB_SCHEDS - 1)].weight > weight) {
+    } else if (porder_idx+1 < MAX_SUB_SCHEDS && a->base.sub_scheds[cd->porder[porder_idx+1] & (MAX_SUB_SCHEDS - 1)].weight > weight) {
       // bubble up
       u32 t = cd->porder[porder_idx];
       cd->porder[porder_idx] = cd->porder[porder_idx+1];
@@ -293,11 +288,11 @@ static __always_inline void update_porder(struct jlfp_arena __arena *a, u32 cid,
     
     #if JLFP_DEBUG
     bpf_for(i, 1, MAX_SUB_SCHEDS) {
-      if (unlikely(a->scx.sub_scheds[cd->porder[i-1] & (MAX_SUB_SCHEDS - 1)].weight < a->scx.sub_scheds[cd->porder[i] & (MAX_SUB_SCHEDS - 1)].weight)) {
+      if (unlikely(a->base.sub_scheds[cd->porder[i-1] & (MAX_SUB_SCHEDS - 1)].weight < a->base.sub_scheds[cd->porder[i] & (MAX_SUB_SCHEDS - 1)].weight)) {
         u32 j;
         bpf_printk("[ERROR] [JLFP] [UPDATE_PORDER] porder not sorted after update for cid %u", cid);
         bpf_for(j, 0, MAX_SUB_SCHEDS) {
-          bpf_printk("[ERROR] [JLFP] [UPDATE_PORDER] porder[%u]=%u weight=%u", j, cd->porder[j], a->scx.sub_scheds[cd->porder[j] & (MAX_SUB_SCHEDS - 1)].weight);
+          bpf_printk("[ERROR] [JLFP] [UPDATE_PORDER] porder[%u]=%u weight=%u", j, cd->porder[j], a->base.sub_scheds[cd->porder[j] & (MAX_SUB_SCHEDS - 1)].weight);
         }
         scx_bpf_error("Error in porder sorting");
         break;
@@ -368,7 +363,7 @@ static __always_inline s32 jlfp_sub_attach_core(struct jlfp_arena __arena *a, st
   u64 sub_cgroup_id = args->ops->sub_cgroup_id;
 
   // kernel should not call sub_attach on attached cgroup so no need to check for duplicates
-  struct sub_sched_ctx __arena *sub = sub_lookup(&a->scx, 0);
+  struct sub_sched_ctx __arena *sub = sub_lookup(&a->base, 0);
   if (unlikely(!sub)) {
     scx_bpf_error("sub attach: MAX SUBS EXCEEDED");
     return -ENOMEM;
@@ -377,17 +372,17 @@ static __always_inline s32 jlfp_sub_attach_core(struct jlfp_arena __arena *a, st
   sub->cgroup_id = sub_cgroup_id;
   sub->weight = cgroup_curr_weight(sub_cgroup_id);
   TRACE_EVENT(struct sched_trace_sub_params_update, SCHED_TRACE_SUB_PARAMS_UPDATE,
-    e->idx = sub - a->scx.sub_scheds;
+    e->idx = sub - a->base.sub_scheds;
     e->cgrp_id = sub->cgroup_id;
     e->weight = sub->weight;
   );
 
-  update_porder(a, cid, sub - a->scx.sub_scheds);
+  update_porder(a, cid, sub - a->base.sub_scheds);
 
   // debug output cmask
-  // bpf_printk("[INFO] [JLFP] [SUB_ATTACH] cgroup=%llu weight=%llu cmask=%016llx", sub_cgroup_id, sub->weight, cmask_to_u64(&a->scx.self_cids.mask));
+  // bpf_printk("[INFO] [JLFP] [SUB_ATTACH] cgroup=%llu weight=%llu cmask=%016llx", sub_cgroup_id, sub->weight, cmask_to_u64(&a->base.self_cids.mask));
 
-  scx_bpf_sub_grant(sub_cgroup_id, SCX_CAP_ENQ_IMMED | SCX_CAP_ENQ | SCX_CAP_PREEMPT, (void *)(long)&a->scx.self_cids.mask, NULL);
+  scx_bpf_sub_grant(sub_cgroup_id, SCX_CAP_ENQ_IMMED | SCX_CAP_ENQ | SCX_CAP_PREEMPT, (void *)(long)&a->base.self_cids.mask, NULL);
 
   lstat_record(&lctx, &a->stats[cid].sub_attach);
   TRACE_FUNC_END("sub_attach", "");
@@ -402,7 +397,7 @@ static __always_inline void jlfp_sub_detach_core(struct jlfp_arena __arena *a, s
 
   u32 cid = scx_bpf_this_cid();
   u64 sub_cgroup_id = args->ops->sub_cgroup_id;
-  struct sub_sched_ctx __arena *sub = sub_lookup(&a->scx, sub_cgroup_id);
+  struct sub_sched_ctx __arena *sub = sub_lookup(&a->base, sub_cgroup_id);
   if (unlikely(!sub)) { // for verifier, should not happen
     TRACE_FUNC_END("sub_detach", "NOT ATTACHED");
     return;
@@ -410,10 +405,10 @@ static __always_inline void jlfp_sub_detach_core(struct jlfp_arena __arena *a, s
 
   sub->cgroup_id = 0;
   sub->weight = 0;
-  update_porder(a, cid, sub - a->scx.sub_scheds);
+  update_porder(a, cid, sub - a->base.sub_scheds);
 
   TRACE_EVENT(struct sched_trace_sub_params_update, SCHED_TRACE_SUB_PARAMS_UPDATE,
-    e->idx = sub - a->scx.sub_scheds;
+    e->idx = sub - a->base.sub_scheds;
     e->cgrp_id = 0;
     e->weight = 0;
   );
@@ -436,13 +431,13 @@ static __always_inline void jlfp_cpuctl_set_weight_core(struct jlfp_arena __aren
 
   u32 cid = scx_bpf_this_cid();
 
-  if (sub_cgroup_id == a->scx.cgroup_id) {
-    a->scx.self_cgroup_weight = weight;
+  if (sub_cgroup_id == a->base.cgroup_id) {
+    a->base.self_cgroup_weight = weight;
     TRACE_FUNC_END("cpuctl_set_weight", "SELF");
     return; // self not in subs
   }
 
-  struct sub_sched_ctx __arena *sub = sub_lookup(&a->scx, sub_cgroup_id);
+  struct sub_sched_ctx __arena *sub = sub_lookup(&a->base, sub_cgroup_id);
   if (!sub) {
     TRACE_FUNC_END("cpuctl_set_weight", "NOT ATTACHED");
     return;
@@ -450,11 +445,11 @@ static __always_inline void jlfp_cpuctl_set_weight_core(struct jlfp_arena __aren
 
   sub->weight = weight;
   TRACE_EVENT(struct sched_trace_sub_params_update, SCHED_TRACE_SUB_PARAMS_UPDATE,
-    e->idx = sub - a->scx.sub_scheds;
+    e->idx = sub - a->base.sub_scheds;
     e->cgrp_id = sub->cgroup_id;
     e->weight = sub->weight;
   );
-  update_porder(a, cid, sub - a->scx.sub_scheds);
+  update_porder(a, cid, sub - a->base.sub_scheds);
 
   lstat_record(&lctx, &a->stats[cid].cpuctl_weight_update);
 
@@ -475,7 +470,7 @@ static __always_inline u64 jlfp_try_task_dispatch(struct jlfp_arena __arena *a, 
     pctx = get_task_ctx(prev);
     if (likely(pctx)) {
       // refresh before comparison so weight changes also apply when prev resumes directly
-      prev_weight = WT_FROM_FIELDS(prev_priority, is_migration_disabled(prev), a->scx.self_cgroup_weight, 0);
+      prev_weight = WT_FROM_FIELDS(prev_priority, is_migration_disabled(prev), a->base.self_cgroup_weight, 0);
       get_jlfp_task_ctx(pctx)->weight = prev_weight;
     }
   }
@@ -581,7 +576,7 @@ static __always_inline void jlfp_dispatch_core(struct jlfp_arena __arena *a, s32
   u32 i;
   bpf_for(i, 0, MAX_SUB_SCHEDS) {
     u32 idx = cd->porder[i] & (MAX_SUB_SCHEDS - 1);
-    u64 sub_cgroup_id = a->scx.sub_scheds[idx].cgroup_id;
+    u64 sub_cgroup_id = a->base.sub_scheds[idx].cgroup_id;
 
     if (sub_cgroup_id == 0) { // empty slots at lowest priority
       break;
@@ -597,7 +592,7 @@ static __always_inline void jlfp_dispatch_core(struct jlfp_arena __arena *a, s32
         e->sub_dispatch = true;
         e->prev_tid = prev ? prev->pid : 0;
         e->next_tid = idx;
-        e->next_weight = a->scx.sub_scheds[idx].weight;
+        e->next_weight = a->base.sub_scheds[idx].weight;
       );
       return;
     }
@@ -619,7 +614,7 @@ static __always_inline void jlfp_dispatch_core(struct jlfp_arena __arena *a, s32
 // caller supplies task priority; jlfp_pick_cid adds migration and cgroup priority fields
 // inserts directly into a local or global dsq from select_cid or enqueue
 // insertion from select_cid skips the enqueue callback
-static void __always_inline jlfp_pick_cid(struct jlfp_arena __arena *a, struct task_struct *p, u32 prev_cid, u64 enq_flags, u64 priority, u64 slice, bool global_search) {
+static void __always_inline jlfp_pick_cid(struct jlfp_arena __arena *a, struct task_struct *p, u32 prev_cid, u64 enq_flags, u64 priority, u64 slice) {
   TRACE_FUNC_START("jlfp_pick_cid");
 
   struct latency_ctx lctx;
@@ -637,7 +632,7 @@ static void __always_inline jlfp_pick_cid(struct jlfp_arena __arena *a, struct t
   // setup
   u32 target_cid = prev_cid;
   bool nmig = is_migration_disabled(p);
-  weight_tuple_t task_weight = WT_FROM_FIELDS(priority, nmig, a->scx.self_cgroup_weight, 0);
+  weight_tuple_t task_weight = WT_FROM_FIELDS(priority, nmig, a->base.self_cgroup_weight, 0);
   task_ctx_t *tctx = get_task_ctx(p);
   bool weight_changed = get_jlfp_task_ctx(tctx)->weight != task_weight;
   get_jlfp_task_ctx(tctx)->weight = task_weight;
@@ -646,13 +641,13 @@ static void __always_inline jlfp_pick_cid(struct jlfp_arena __arena *a, struct t
   // this happens when its pending_cid is still set
   if (get_jlfp_task_ctx(tctx)->pending_cid < NR_CPUS) {
     u32 pending_cid = get_jlfp_task_ctx(tctx)->pending_cid;
-    u32 pending_shard = a->scx.topo.cids[pending_cid].shard_idx;
+    u32 pending_shard = a->base.topo.cids[pending_cid].shard_idx;
     if (unlikely(pending_shard >= NR_CPUS)) {
       scx_bpf_error("Invalid pending shard %u", pending_shard);
       return;
     }
-    u32 shard_offset = pending_cid - a->scx.topo.shards[pending_shard].base_cid;
-    if (unlikely(pending_cid < a->scx.topo.shards[pending_shard].base_cid || shard_offset >= SCX_CID_SHARD_MAX_CPUS)) {
+    u32 shard_offset = pending_cid - a->base.topo.shards[pending_shard].base_cid;
+    if (unlikely(pending_cid < a->base.topo.shards[pending_shard].base_cid || shard_offset >= SCX_CID_SHARD_MAX_CPUS)) {
       scx_bpf_error("Failed to fetch pending cid %u or pending shard %u", pending_cid, pending_shard);
       return;
     }
@@ -681,7 +676,7 @@ static void __always_inline jlfp_pick_cid(struct jlfp_arena __arena *a, struct t
 
   // prev cid
   if (likely(cmask_test(prev_cid, &tctx->cpus_allowed))) {
-    if (likely(cmask_test_and_clear(prev_cid, &a->scx.idle_cids.mask))) {
+    if (likely(cmask_test_and_clear(prev_cid, &a->base.idle_cids.mask))) {
       goto dispatch;
     }
 
@@ -705,25 +700,25 @@ static void __always_inline jlfp_pick_cid(struct jlfp_arena __arena *a, struct t
   dispatch_type = 1;
 
   // nearest idle cpu in numa topology
-  u32 prev_shard = a->scx.topo.cids[prev_cid].shard_idx & (NR_CPUS - 1);
-  u32 __arena *order = a->scx.topo.shards[prev_shard].shard_dist_order;
+  u32 prev_shard = a->base.topo.cids[prev_cid].shard_idx & (NR_CPUS - 1);
+  u32 __arena *order = a->base.topo.shards[prev_shard].shard_dist_order;
   u32 i;
-  bpf_for(i, 0, a->scx.topo.nr_shards) {
+  bpf_for(i, 0, a->base.topo.nr_shards) {
     if (unlikely(i >= NR_CPUS)) break; // for verifier, should not happen
 
     u32 shard = order[i] & (NR_CPUS - 1);
-    u32 cid = a->scx.topo.shards[shard].base_cid;
+    u32 cid = a->base.topo.shards[shard].base_cid;
 
     // from qmap
     bpf_repeat(IDLE_PICK_RETRIES) {
       cid = cmask_next_and2_set_wrap(&tctx->cpus_allowed,
-                  &a->scx.idle_cids.mask,
-                  &a->scx.self_cids.mask, cid);
+                  &a->base.idle_cids.mask,
+                  &a->base.self_cids.mask, cid);
 
       barrier_var(cid);
 
-      if (cid >= a->scx.topo.shards[shard].base_cid + a->scx.topo.shards[shard].nr_cids) break; // no idle
-      if (likely(cmask_test_and_clear(cid, &a->scx.idle_cids.mask))) {
+      if (cid >= a->base.topo.shards[shard].base_cid + a->base.topo.shards[shard].nr_cids) break; // no idle
+      if (likely(cmask_test_and_clear(cid, &a->base.idle_cids.mask))) {
         target_cid = cid;
         goto dispatch;
       }
@@ -746,17 +741,17 @@ static void __always_inline jlfp_pick_cid(struct jlfp_arena __arena *a, struct t
   // find min weight shard (no locking)
   // tiebreak based on shard distance from prev_cid by traversing using shard_dist_order
   u32 target_shard = prev_shard;
-  if (global_search) {
+  if (a->global_search) {
     u32 cid = scx_bpf_this_cid() & (NR_CPUS - 1);
     struct cid_data __arena *cd = &a->cid_data[cid];
     weight_tuple_t min_effective = U128_MAX; // min over full overlap shards
     cmask_andnot(&cd->tmp_cmask.mask, &cd->tmp_cmask.mask); // use tmp cmask to store candidate shards
     bool partial_exists = false;
-    bpf_for(i, 0, a->scx.topo.nr_shards) {
+    bpf_for(i, 0, a->base.topo.nr_shards) {
       if (unlikely(i >= NR_CPUS)) break; // for verifier, should not happen
 
       // check if full overlapped
-      if (!cmask_subset(&a->scx.shard_cids[order[i] & (NR_CPUS - 1)].mask, &tctx->cpus_allowed)) {
+      if (!cmask_subset(&a->base.shard_cids[order[i] & (NR_CPUS - 1)].mask, &tctx->cpus_allowed)) {
         continue;
       }
 
@@ -799,7 +794,7 @@ static void __always_inline jlfp_pick_cid(struct jlfp_arena __arena *a, struct t
 
   if (prev_shard == target_shard) {
     // if min weight matches prev cid's weight, prefer it even if min_cid is different (tie break)
-    u32 shard_offset = prev_cid - a->scx.topo.shards[target_shard].base_cid;
+    u32 shard_offset = prev_cid - a->base.topo.shards[target_shard].base_cid;
     if (unlikely(shard_offset >= SCX_CID_SHARD_MAX_CPUS)) { // for verifier, should not happen
       bpf_res_spin_unlock(&sctx->lock);
       goto dispatch_fail;
@@ -887,11 +882,11 @@ static void __always_inline jlfp_pick_cid(struct jlfp_arena __arena *a, struct t
 static __always_inline void jlfp_running_core(struct jlfp_arena __arena *a, struct task_struct *p, task_ctx_t *tctx, weight_tuple_t wt, struct latency_ctx *lctx) {
   u32 cid = scx_bpf_this_cid();
   // update running weight and clear pending weight
-  u32 shard = a->scx.topo.cids[cid & (NR_CPUS - 1)].shard_idx;
+  u32 shard = a->base.topo.cids[cid & (NR_CPUS - 1)].shard_idx;
   struct shard_ctx *sctx = bpf_map_lookup_elem(&shard_ctx_map, &shard);
   if (unlikely(!sctx)) return; // for verifier, should not happen
 
-  u32 shard_offset = cid - a->scx.topo.shards[shard].base_cid;
+  u32 shard_offset = cid - a->base.topo.shards[shard].base_cid;
   if (unlikely(shard_offset >= SCX_CID_SHARD_MAX_CPUS)) return; // for verifier, should not happen
 
   if (unlikely(bpf_res_spin_lock(&sctx->lock))) {
@@ -935,14 +930,14 @@ static __always_inline void jlfp_stopping_core(struct jlfp_arena __arena *a, str
   u32 cid = scx_bpf_this_cid();
 
   // update running weight only
-  u32 shard = a->scx.topo.cids[cid & (NR_CPUS - 1)].shard_idx;
+  u32 shard = a->base.topo.cids[cid & (NR_CPUS - 1)].shard_idx;
   struct shard_ctx *sctx = bpf_map_lookup_elem(&shard_ctx_map, &shard);
   if (unlikely(!sctx)) { // for verifier, should not happen
     scx_bpf_error("Failed to lookup sctx");
     return;
   }
 
-  u32 shard_offset = cid - a->scx.topo.shards[shard].base_cid;
+  u32 shard_offset = cid - a->base.topo.shards[shard].base_cid;
   if (unlikely(shard_offset >= SCX_CID_SHARD_MAX_CPUS)) return; // for verifier, should not happen
 
   if (unlikely(bpf_res_spin_lock(&sctx->lock))) {
