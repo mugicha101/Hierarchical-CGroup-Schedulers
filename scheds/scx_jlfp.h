@@ -93,17 +93,6 @@ static __always_inline void seqlock_update_end(struct seqlock_global __arena *g)
 
 #endif
 
-// from qmap
-// per subscheduler state
-struct sub_sched_ctx {
-  u64 cgroup_id;
-  u32 weight;
-
-  // TODO: if cid partitioning needed, can use these
-  // struct scx_cmask_wrapper granted_cids; // cids granted excl to this child
-  // struct scx_cmask_wrapper prev_granted; // last grant, for delta calculation
-};
-
 // stats stored per-cid to avoid race conditions
 struct stats_data {
   struct latency_stat no_op;
@@ -155,7 +144,6 @@ struct jlfp_arena {
   struct cid_data cid_data[SCX_MAX_CPUS];
 
   // subscheduler state
-  struct sub_sched_ctx sub_scheds[MAX_SUB_SCHEDS];
   u64 nr_sub_scheds;
 
   u32 porder[MAX_SUB_SCHEDS]; // sub indices in decreasing priority order

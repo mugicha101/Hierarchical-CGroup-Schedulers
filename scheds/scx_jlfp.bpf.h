@@ -250,8 +250,8 @@ static __always_inline s32 jlfp_init_core(struct jlfp_arena __arena *a, u64 cgro
 // returns NULL if not found or no free location
 static __always_inline struct sub_sched_ctx __arena *sub_lookup(struct jlfp_arena __arena *a, u64 cgroup_id) {
   for (u32 i = 0; i < MAX_SUB_SCHEDS; ++i) {
-    if (a->sub_scheds[i].cgroup_id == cgroup_id) {
-      return &a->sub_scheds[i];
+    if (a->scx.sub_scheds[i].cgroup_id == cgroup_id) {
+      return &a->scx.sub_scheds[i];
     }
   }
   return NULL;
@@ -291,7 +291,7 @@ static __always_inline void copy_porder(u32 __arena *src, u32 __arena *dst) {
 
 // only call in attach/detach/set_weights so that we know no other cgroups are changing weights at the same time
 static __always_inline void update_porder(struct jlfp_arena __arena *a, u32 cid, u32 sub_index) {
-  u32 weight = a->sub_scheds[sub_index & (MAX_SUB_SCHEDS - 1)].weight;
+  u32 weight = a->scx.sub_scheds[sub_index & (MAX_SUB_SCHEDS - 1)].weight;
 
   // use local porder to sort subs by weight in decreasing order
   // can just copy global porder since no updates are happening at the same time
@@ -311,13 +311,13 @@ static __always_inline void update_porder(struct jlfp_arena __arena *a, u32 cid,
   // bubble the sub in porder to sort
   // note: want higher weight at lower index
   bpf_repeat(MAX_SUB_SCHEDS) {
-    if (porder_idx > 0 && a->sub_scheds[cd->porder[porder_idx-1] & (MAX_SUB_SCHEDS - 1)].weight < weight) {
+    if (porder_idx > 0 && a->scx.sub_scheds[cd->porder[porder_idx-1] & (MAX_SUB_SCHEDS - 1)].weight < weight) {
       // bubble down
       u32 t = cd->porder[porder_idx];
       cd->porder[porder_idx] = cd->porder[porder_idx-1];
       cd->porder[porder_idx-1] = t;
       porder_idx--;
-    } else if (porder_idx+1 < MAX_SUB_SCHEDS && a->sub_scheds[cd->porder[porder_idx+1] & (MAX_SUB_SCHEDS - 1)].weight > weight) {
+    } else if (porder_idx+1 < MAX_SUB_SCHEDS && a->scx.sub_scheds[cd->porder[porder_idx+1] & (MAX_SUB_SCHEDS - 1)].weight > weight) {
       // bubble up
       u32 t = cd->porder[porder_idx];
       cd->porder[porder_idx] = cd->porder[porder_idx+1];
@@ -330,11 +330,11 @@ static __always_inline void update_porder(struct jlfp_arena __arena *a, u32 cid,
 
     #if JLFP_DEBUG
     bpf_for(i, 1, MAX_SUB_SCHEDS) {
-      if (unlikely(a->sub_scheds[cd->porder[i-1] & (MAX_SUB_SCHEDS - 1)].weight < a->sub_scheds[cd->porder[i] & (MAX_SUB_SCHEDS - 1)].weight)) {
+      if (unlikely(a->scx.sub_scheds[cd->porder[i-1] & (MAX_SUB_SCHEDS - 1)].weight < a->scx.sub_scheds[cd->porder[i] & (MAX_SUB_SCHEDS - 1)].weight)) {
         u32 j;
         bpf_printk("[ERROR] [JLFP] [UPDATE_PORDER] porder not sorted after update for cid %u", cid);
         bpf_for(j, 0, MAX_SUB_SCHEDS) {
-          bpf_printk("[ERROR] [JLFP] [UPDATE_PORDER] porder[%u]=%u weight=%u", j, cd->porder[j], a->sub_scheds[cd->porder[j] & (MAX_SUB_SCHEDS - 1)].weight);
+          bpf_printk("[ERROR] [JLFP] [UPDATE_PORDER] porder[%u]=%u weight=%u", j, cd->porder[j], a->scx.sub_scheds[cd->porder[j] & (MAX_SUB_SCHEDS - 1)].weight);
         }
         scx_bpf_error("Error in porder sorting");
         break;
@@ -412,12 +412,12 @@ static __always_inline s32 jlfp_sub_attach_core(struct jlfp_arena __arena *a, st
   sub->cgroup_id = sub_cgroup_id;
   sub->weight = cgroup_curr_weight(sub_cgroup_id);
   TRACE_EVENT(struct sched_trace_sub_params_update, SCHED_TRACE_SUB_PARAMS_UPDATE,
-    e->idx = sub - a->sub_scheds;
+    e->idx = sub - a->scx.sub_scheds;
     e->cgrp_id = sub->cgroup_id;
     e->weight = sub->weight;
   );
 
-  update_porder(a, cid, sub - a->sub_scheds);
+  update_porder(a, cid, sub - a->scx.sub_scheds);
 
   // debug output cmask
   // bpf_printk("[INFO] [JLFP] [SUB_ATTACH] cgroup=%llu weight=%llu cmask=%016llx", sub_cgroup_id, sub->weight, cmask_to_u64(&a->scx.self_cids.mask));
@@ -445,10 +445,10 @@ static __always_inline void jlfp_sub_detach_core(struct jlfp_arena __arena *a, s
 
   sub->cgroup_id = 0;
   sub->weight = 0;
-  update_porder(a, cid, sub - a->sub_scheds);
+  update_porder(a, cid, sub - a->scx.sub_scheds);
 
   TRACE_EVENT(struct sched_trace_sub_params_update, SCHED_TRACE_SUB_PARAMS_UPDATE,
-    e->idx = sub - a->sub_scheds;
+    e->idx = sub - a->scx.sub_scheds;
     e->cgrp_id = 0;
     e->weight = 0;
   );
@@ -485,11 +485,11 @@ static __always_inline void jlfp_cpuctl_set_weight_core(struct jlfp_arena __aren
 
   sub->weight = weight;
   TRACE_EVENT(struct sched_trace_sub_params_update, SCHED_TRACE_SUB_PARAMS_UPDATE,
-    e->idx = sub - a->sub_scheds;
+    e->idx = sub - a->scx.sub_scheds;
     e->cgrp_id = sub->cgroup_id;
     e->weight = sub->weight;
   );
-  update_porder(a, cid, sub - a->sub_scheds);
+  update_porder(a, cid, sub - a->scx.sub_scheds);
 
   lstat_record(&lctx, &a->stats[cid].cpuctl_weight_update);
 
@@ -616,7 +616,7 @@ static __always_inline void jlfp_dispatch_core(struct jlfp_arena __arena *a, s32
   u32 i;
   bpf_for(i, 0, MAX_SUB_SCHEDS) {
     u32 idx = cd->porder[i] & (MAX_SUB_SCHEDS - 1);
-    u64 sub_cgroup_id = a->sub_scheds[idx].cgroup_id;
+    u64 sub_cgroup_id = a->scx.sub_scheds[idx].cgroup_id;
 
     if (sub_cgroup_id == 0) { // empty slots at lowest priority
       break;
@@ -632,7 +632,7 @@ static __always_inline void jlfp_dispatch_core(struct jlfp_arena __arena *a, s32
         e->sub_dispatch = true;
         e->prev_tid = prev ? prev->pid : 0;
         e->next_tid = idx;
-        e->next_weight = a->sub_scheds[idx].weight;
+        e->next_weight = a->scx.sub_scheds[idx].weight;
       );
       return;
     }

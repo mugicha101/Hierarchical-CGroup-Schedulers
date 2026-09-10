@@ -24,6 +24,17 @@ struct scx_cmask_wrapper {
 #endif
 };
 
+// from qmap
+// per subscheduler state
+struct sub_sched_ctx {
+  u64 cgroup_id;
+  u32 weight;
+
+  // TODO: if cid partitioning needed, can use these
+  // struct scx_cmask_wrapper granted_cids; // cids granted excl to this child
+  // struct scx_cmask_wrapper prev_granted; // last grant, for delta calculation
+};
+
 // topology data
 struct cid_topo_data {
   u32 cpu;
@@ -88,6 +99,9 @@ typedef struct task_ctx __arena task_ctx_t;
 // per scheduler instance arena memory
 struct scx_arena {
   u64 cgroup_id;
+
+  // subscheduler state
+  struct sub_sched_ctx sub_scheds[MAX_SUB_SCHEDS];
 
   // local copy of topology
   struct topo_data topo;
