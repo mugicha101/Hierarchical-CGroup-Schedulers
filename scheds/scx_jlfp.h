@@ -153,6 +153,8 @@ struct jlfp_arena {
 
 #ifdef __BPF__
 #include "scx_jlfp.bpf.h"
+#else
+#include "scx_jlfp_cli.h"
 #endif
 
 #endif

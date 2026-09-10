@@ -132,7 +132,7 @@ struct base_arena {
 #ifdef __BPF__
 #include "scx_base.bpf.h"
 #else
-// #include "scx_base_cli.h"
+#include "scx_base_cli.h"
 #endif
 
 #endif

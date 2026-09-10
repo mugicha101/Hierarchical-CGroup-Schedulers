@@ -35,4 +35,6 @@ Implementation of various sched_ext cgroup schedulers for Linux 7.3.
 
 - `scx_<policy>.h` files define shared userspace and BPF structures.
 - `scx_<policy>.bpf.h` files define BPF specific logic that can be reused by sub-policies.
-- `scx_<policy>.bpf.c` files implement the `sched_ops` for a scheduler. If the policy is abstract only (such as `scx_root`) there is no corresponding `.bpf.c` file.
+- `scx_<policy>_cli.h` files define userspace only logic and structures used in the userspace CLI program that can be reused by sub-policies
+- `scx_<policy>.bpf.c` files implement the `sched_ops` for a scheduler. If the policy is abstract only (such as `scx_base`) there is no corresponding `.bpf.c` file.
+- `scx_<policy>.c` files implement a userspace CLI program for managing the scheduler implemented in `scx_<policy>.bpf.c`.

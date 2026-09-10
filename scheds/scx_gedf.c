@@ -20,14 +20,14 @@
 #include <sys/syscall.h>
 #include <linux/sched.h>
 #include <time.h>
-#include "scx_jlfp.h"
+#include "scx_gedf.h"
 
-#include "scx_jlfp.bpf.skel.h"
+#include "scx_gedf.bpf.skel.h"
 
-#define SUB_CG_BASE "/sys/fs/cgroup/scx_jlfp"
+#define SUB_CG_BASE "/sys/fs/cgroup/scx_gedf"
 
 const char help_fmt[] =
-"A clustered job-level fixed priority sched_ext hierarchical scheduler.\n"
+"A global earliest deadline first sched_ext hierarchical scheduler.\n"
 "\n"
 "See the top-level comment in .bpf.c for more details.\n"
 "\n"
@@ -65,15 +65,15 @@ static void sigint_handler(int simple)
 
 int main(int argc, char **argv)
 {
-  struct scx_jlfp *skel = NULL;
+  struct scx_gedf *skel = NULL;
   struct bpf_link *link = NULL;
   #if TRACING
   struct ring_buffer *rb_manager = NULL;
   #endif
-  struct jlfp_arena *aa = NULL;
+  struct gedf_arena *aa = NULL;
   
-  struct jlfp_cli_opts cli_opts;
-  jlfp_init_opts(&cli_opts);
+  struct gedf_cli_opts cli_opts;
+  gedf_init_opts(&cli_opts);
 
   static const struct option long_opts[] = {
     { "cgroup", required_argument, NULL, 'c' },
@@ -96,7 +96,7 @@ int main(int argc, char **argv)
 
   // parse arguments
   while ((opt = getopt_long(argc, argv, "c:vgS:T:t:s:h", long_opts, NULL)) != -1) {
-    int err = jlfp_parse_opt(&cli_opts, opt, optarg);
+    int err = gedf_parse_opt(&cli_opts, opt, optarg);
     if (err == 0) continue;
 
     if (err == 1) {
@@ -110,11 +110,11 @@ int main(int argc, char **argv)
     fprintf(stderr, "Unexpected argument: %s\n", argv[optind]);
     return 1;
   }
-  verbose = cli_opts.base.verbose;
-  const char *cg_path = cli_opts.base.cgroup_path;
+  verbose = cli_opts.jlfp.base.verbose;
+  const char *cg_path = cli_opts.jlfp.base.cgroup_path;
   const char *sched_name = cg_path ? cg_path : "<root>";
-  const char *trace_path = cli_opts.base.trace_path;
-  const char *stats_path = cli_opts.base.stats_path;
+  const char *trace_path = cli_opts.jlfp.base.trace_path;
+  const char *stats_path = cli_opts.jlfp.base.stats_path;
 restart:
   // reset resources before each scheduler instance
   skel = NULL;
@@ -146,24 +146,24 @@ restart:
   LIBBPF_OPTS(bpf_object_open_opts, opts,
     .pin_root_path = "/sys/fs/bpf/scx",
   );
-  skel = scx_jlfp__open_opts(&opts);
+  skel = scx_gedf__open_opts(&opts);
   if (!skel) {
     fprintf(stderr, "Error: failed to open skel\n");
     goto cleanup;
   }
 
   // set struct_ops fields
-  if (cli_opts.base.cgroup_id) {
-    skel->struct_ops.jlfp_ops->sub_cgroup_id = cli_opts.base.cgroup_id;
+  if (cli_opts.jlfp.base.cgroup_id) {
+    skel->struct_ops.jlfp_ops->sub_cgroup_id = cli_opts.jlfp.base.cgroup_id;
   }
-  skel->struct_ops.jlfp_ops->cid_shard_size = cli_opts.base.max_shard_size;
+  skel->struct_ops.jlfp_ops->cid_shard_size = cli_opts.jlfp.base.max_shard_size;
   skel->rodata->trace_enabled = trace_path != NULL;
   
   // load scheduler
-  SCX_OPS_LOAD(skel, jlfp_ops, scx_jlfp, uei);
+  SCX_OPS_LOAD(skel, jlfp_ops, scx_gedf, uei);
   aa = &skel->arena->aa;
-  jlfp_apply_opts(&cli_opts, aa);
-  link = SCX_OPS_ATTACH(skel, jlfp_ops, scx_jlfp);
+  gedf_apply_opts(&cli_opts, aa);
+  link = SCX_OPS_ATTACH(skel, jlfp_ops, scx_gedf);
   if (!link) {
     fprintf(stderr, "Error: failed to attach scheduler\n");
     goto cleanup;
@@ -227,11 +227,11 @@ cleanup:
     } else {
       // write stats as json
       fprintf(stats_fd, "[");
-      for (__u32 cid = 0; cid < aa->base.topo.nr_cids; ++cid) {
+      for (__u32 cid = 0; cid < aa->jlfp.base.topo.nr_cids; ++cid) {
         if (cid) fprintf(stats_fd, ",");
         fprintf(stats_fd, "{");
         fprintf(stats_fd, "\"cid\":%u,", cid);
-        jlfp_write_cid_stats(stats_fd, aa, cid);
+        gedf_write_cid_stats(stats_fd, aa, cid);
         fprintf(stats_fd, "}");
       }
       fprintf(stats_fd, "]");
@@ -239,7 +239,7 @@ cleanup:
     }
   }
 
-  if (skel) scx_jlfp__destroy(skel);
+  if (skel) scx_gedf__destroy(skel);
 
   if (trace_fd && trace_path) {
     fclose(trace_fd);
