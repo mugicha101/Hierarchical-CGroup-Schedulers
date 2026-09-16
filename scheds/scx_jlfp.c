@@ -40,7 +40,8 @@ const char help_fmt[] =
 "Scheduler Configuration:\n"
 "  -c, --cgroup PATH          Attach the scheduler to an existing cgroup located at PATH (default: /sys/fs/cgroup/ i.e. the root cgroup)\n"
 "  -g, --global-search        Enable Global Shard Search (by default, jlfp_pick_cid only searches local shard if no idle CPU found)\n"
-"  -S, --max-shard-size N         Sets the maximum shard size (i.e. cluster size) to N (default: 8, however each shard must be within a single LLC)\n"
+"  -S, --max-shard-size N     Sets the maximum shard size (i.e. cluster size) to N (default: 8, however each shard must be within a single LLC)\n"
+"  -l, --slice-length N       Sets the slice length (max time tasks get to run before reconsidered by scheduler) to N ns (default: 1000000, must be positive)\n"
 "  -T, --max-tasks N          Sets the maximum number of tasks supported by the scheduler to N (default: 16384, must be at least the tasks in the scheduler's cgroup including non-scx tasks)"
 "\n"
 "Diagnostics:\n"
@@ -79,6 +80,7 @@ int main(int argc, char **argv)
     { "cgroup", required_argument, NULL, 'c' },
     { "verbose", no_argument, NULL, 'v' },
     { "global-search", no_argument, NULL, 'g' },
+    { "slice-length", required_argument, NULL, 'l' },
     { "max-shard-size", required_argument, NULL, 'S' },
     { "max-tasks", required_argument, NULL, 'T' },
     { "trace", required_argument, NULL, 't' },
@@ -95,7 +97,7 @@ int main(int argc, char **argv)
   signal(SIGTERM, sigint_handler);
 
   // parse arguments
-  while ((opt = getopt_long(argc, argv, "c:vgS:T:t:s:h", long_opts, NULL)) != -1) {
+  while ((opt = getopt_long(argc, argv, "c:vgl:S:T:t:s:h", long_opts, NULL)) != -1) {
     int err = jlfp_parse_opt(&cli_opts, opt, optarg);
     if (err == 0) continue;
 

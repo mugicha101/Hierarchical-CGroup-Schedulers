@@ -12,11 +12,13 @@
 struct jlfp_cli_opts {
   struct base_cli_opts base;
 	bool global_search;
+  u64 slice;
 };
 
 static inline void jlfp_init_opts(struct jlfp_cli_opts *opts) {
   base_init_opts(&opts->base);
   opts->global_search = false;
+  opts->slice = 1000000ULL; // 1ms
 }
 
 // returns 1 if invalid, 0 if valid, -1 if unknown
@@ -25,6 +27,17 @@ static inline int jlfp_parse_opt(struct jlfp_cli_opts *opts, int opt, const char
   if (err != -1) return err;
   
   switch (opt) {
+    case 'l': {
+      char *endptr;
+      if (!arg || arg[0] < '0' || arg[0] > '9')
+        return 1;
+      errno = 0;
+      unsigned long long slice = strtoull(arg, &endptr, 10);
+      if (errno || *endptr != '\0' || slice == 0 || slice > UINT64_MAX)
+        return 1;
+      opts->slice = slice;
+      return 0;
+    }
     case 'g':
       opts->global_search = true;
       return 0;
@@ -36,6 +49,7 @@ static inline int jlfp_parse_opt(struct jlfp_cli_opts *opts, int opt, const char
 static inline void jlfp_apply_opts(struct jlfp_cli_opts *opts, struct jlfp_arena *a) {
   base_apply_opts(&opts->base, &a->base);
   a->global_search = opts->global_search;
+  a->slice = opts->slice;
 }
 
 static inline void jlfp_write_cid_stats(FILE *stats_fd, struct jlfp_arena *a, uint32_t cid) {

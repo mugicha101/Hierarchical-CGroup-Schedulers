@@ -13,8 +13,6 @@ char _license[] SEC("license") = "GPL";
 // select_cid, enqueue, and dispatch reconsidering runnable prev read the map
 // changing a map entry does not reorder queued tasks or preempt running tasks by itself
 
-u64 slice = 1000000ULL; // 1ms
-
 UEI_DEFINE(uei);
 
 struct jlfp_arena __arena_global aa;
@@ -77,7 +75,7 @@ void BPF_STRUCT_OPS(jlfp_dispatch, s32 cid, struct task_struct *prev)
   if (prev && (BPF_CORE_READ(prev, scx.flags) & SCX_TASK_QUEUED)) {
     prev_priority = get_task_weight(prev);
   }
-  jlfp_dispatch_core(&aa, cid, prev, slice, prev_priority);
+  jlfp_dispatch_core(&aa, cid, prev, aa.slice, prev_priority);
 }
 
 s32 BPF_STRUCT_OPS(jlfp_select_cid, struct task_struct *p, s32 prev_cid, u64 wake_flags)
@@ -87,7 +85,7 @@ s32 BPF_STRUCT_OPS(jlfp_select_cid, struct task_struct *p, s32 prev_cid, u64 wak
 
   struct latency_ctx lctx;
   lstat_start(&lctx);
-  jlfp_pick_cid(&aa, p, (u32)prev_cid, SCX_ENQ_WAKEUP | wake_flags, get_task_weight(p), slice);
+  jlfp_pick_cid(&aa, p, (u32)prev_cid, SCX_ENQ_WAKEUP | wake_flags, get_task_weight(p), aa.slice);
   u32 cid = scx_bpf_this_cid();
   lstat_record(&lctx, &aa.stats[cid].select_cid);
 
@@ -109,7 +107,7 @@ void BPF_STRUCT_OPS(jlfp_enqueue, struct task_struct *p, u64 enq_flags)
   struct latency_ctx lctx;
   lstat_start(&lctx);
 
-  jlfp_pick_cid(&aa, p, (u32)scx_bpf_task_cid(p), enq_flags, get_task_weight(p), slice);
+  jlfp_pick_cid(&aa, p, (u32)scx_bpf_task_cid(p), enq_flags, get_task_weight(p), aa.slice);
   
   u32 cid = scx_bpf_this_cid();
   lstat_record(&lctx, &aa.stats[cid].enqueue);

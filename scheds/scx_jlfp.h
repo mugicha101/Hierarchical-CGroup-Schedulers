@@ -135,6 +135,7 @@ struct jlfp_arena {
 
   // userspace opts
   bool global_search; // search all fully-overlapped shards (fallback on prev shard if no fully-overlapped shards)
+  u64 slice;
 
   // global task dsq
   u64 dsq_id;
