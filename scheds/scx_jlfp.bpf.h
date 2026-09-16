@@ -40,11 +40,10 @@ static __always_inline bool init_jlfp_task_ctx(struct base_arena __arena *a, str
 // other tasks search nearby idle cids allowed by both task affinity and self_cids
 // preemption searches fully allowed shards when global_search is enabled, with prev shard as fallback
 // the selected cid must allow the task and have a lower effective weight; otherwise use the global dsq
-// partial shards are skipped by global preemption search; prev-shard fallback still checks affinity
+// partial shards are skipped by global preemption search; prev-shard fallback still checks affinity and capabilities
 // global dsq dispatch compares eligible queued tasks against runnable prev, favoring prev on equal weight
 
-// TODO: ensure search checks capabilities consistently (currently only checks in idle search)
-// TODO: replace all verifier sat checks with explicit errors
+// TODO: replace all verifier sat checks with explicit errors (across all scheds)
 
 // pending vs running
 // effective_weight[cid] = max(running_weight[cid], pending_weight[cid])
@@ -675,7 +674,9 @@ static void __always_inline jlfp_pick_cid(struct jlfp_arena __arena *a, struct t
   // IDLE SEARCH
 
   // prev cid
-  if (likely(cmask_test(prev_cid, &tctx->cpus_allowed))) {
+  bool prev_allowed = cmask_test(prev_cid, &tctx->cpus_allowed) &&
+                      cmask_test(prev_cid, &a->base.self_cids.mask);
+  if (likely(prev_allowed)) {
     if (likely(cmask_test_and_clear(prev_cid, &a->base.idle_cids.mask))) {
       goto dispatch;
     }
@@ -692,7 +693,7 @@ static void __always_inline jlfp_pick_cid(struct jlfp_arena __arena *a, struct t
 
   // NON MIGRATEABLE / CPU PINNED CASE: just need to check prev cpu
   if (unlikely(nmig) || p->nr_cpus_allowed == 1) {
-    if (task_weight <= get_effective_weight(a, prev_cid)) goto dispatch_fail;
+    if (!prev_allowed || task_weight <= get_effective_weight(a, prev_cid)) goto dispatch_fail;
 
     goto dispatch;
   }
@@ -733,7 +734,7 @@ static void __always_inline jlfp_pick_cid(struct jlfp_arena __arena *a, struct t
   // find target cid:
   // - lock target shard
   // - find min weight cid in shard
-  // - if affinity allows and task weight beats the minimum, reserve pending weight and release lock
+  // - if affinity and capabilities allow and task weight beats the minimum, reserve pending weight and release lock
   // - continue to dispatch (either to target cid or gdsq)
 
   dispatch_type = 2;
@@ -751,7 +752,8 @@ static void __always_inline jlfp_pick_cid(struct jlfp_arena __arena *a, struct t
       if (unlikely(i >= NR_CPUS)) break; // for verifier, should not happen
 
       // check if full overlapped
-      if (!cmask_subset(&a->base.shard_cids[order[i] & (NR_CPUS - 1)].mask, &tctx->cpus_allowed)) {
+      if (!cmask_subset(&a->base.shard_cids[order[i] & (NR_CPUS - 1)].mask, &tctx->cpus_allowed) ||
+          !cmask_subset(&a->base.shard_cids[order[i] & (NR_CPUS - 1)].mask, &a->base.self_cids.mask)) {
         continue;
       }
 
@@ -807,7 +809,8 @@ static void __always_inline jlfp_pick_cid(struct jlfp_arena __arena *a, struct t
   }
 
   // if outside cmask, add to gdsq instead since assuming tasks have shard aligned cpusets
-  if (!cmask_test(target_cid, &tctx->cpus_allowed) || task_weight <= min_weight) {
+  if (!cmask_test(target_cid, &tctx->cpus_allowed) ||
+      !cmask_test(target_cid, &a->base.self_cids.mask) || task_weight <= min_weight) {
     bpf_res_spin_unlock(&sctx->lock);
     goto dispatch_fail;
   }
