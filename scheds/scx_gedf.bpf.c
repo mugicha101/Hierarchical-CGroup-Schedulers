@@ -1,12 +1,13 @@
 // Global Earliest Deadline First (GEDF) scheduler for the Linux kernel
 // sub-policy of JLFP
-// Task sporadic parameters can be modified via a FIFO file at /tmp/scx/<cgroup path>/task_realtime_params
-// works by setting the slice to time until next deadline.
+// Task realtime parameters can be modified via a FIFO file at /tmp/scx/<cgroup path>/task_realtime_params
+// realtime parameters should be set before moving task into sched_ext and remain constant throughout lifetime of program
+// works by setting the slice to at most time until next deadline.
 // Note: any slice extensions from kthread interrupts are considered part of overhead and not accounted for.
 
 // TODO: main logic changes needed
 // 1 - add task_realtime_params which maps a task to its period, relative deadline, and whether its periodic or sporadic
-// 2 - add a fifo file in the cgroup directory that can update a tasks params similar to how existing cgroup pseudofiles work
+// 2 - add a fifo file that can update a tasks params similar to how existing cgroup pseudofiles work
 //     service writes to this file in userspace c program
 // 3 - handle period update inside get_task_weight
 //     if task is before its deadline, no update
@@ -23,7 +24,7 @@
 //     pick_cid when moving enqueued task to LDSQ
 //     this can be done in helper function update_task_dl which calls get_task_weight
 //     to prevent disparities from multiple timing measurements, pass the measured time as a timestamp to get_task_weight and use this same timestamp for all operations
-//     slice is updated to time until next deadline (should be positive)
+//     slice is updated to at most time until next deadline (should be positive)
 // 5 - priorities can change while a task sits in the GDSQ since their deadlines might pass
 //     its guaranteed that tasks whose deadline changed are at top of GDSQ since its ordered by increasing deadline
 //     its also guaranteed that the new priority is lower and thus the task should still be in the GDSQ
@@ -51,8 +52,6 @@
 
 char _license[] SEC("license") = "GPL";
 
-u64 slice = 1000000ULL; // 1ms
-
 UEI_DEFINE(uei);
 
 struct gedf_arena __arena_global aa;
@@ -74,21 +73,6 @@ struct {
     __type(value, struct task_rtp);
     __uint(pinning, LIBBPF_PIN_BY_NAME);
 } task_rtp_map SEC(".maps");
-
-// configured priority for selection, enqueue, and reconsidering runnable prev
-// apply period replenishment here
-u64 __always_inline get_task_weight(struct task_struct *p) {
-  u64 weight = DEFAULT_TASK_WEIGHT;
-  u64 *lookup_weight = bpf_task_storage_get(&task_weights, p, 0, 0);
-  if (lookup_weight) {
-    weight = *lookup_weight;
-  }
-  if (unlikely(weight == 0)) {
-    bpf_printk("[WARN] [GEDF] [GET_WEIGHT] Task %d has weight 0, using weight 1 instead", p->pid);
-    weight = 1;
-  }
-  return weight;
-}
 
 s32 BPF_STRUCT_OPS_SLEEPABLE(jlfp_init)
 {
@@ -125,7 +109,7 @@ void BPF_STRUCT_OPS(jlfp_dispatch, s32 cid, struct task_struct *prev)
   if (prev && (BPF_CORE_READ(prev, scx.flags) & SCX_TASK_QUEUED)) {
     prev_priority = get_task_weight(prev);
   }
-  jlfp_dispatch_core(&aa.jlfp, cid, prev, slice, prev_priority);
+  jlfp_dispatch_core(&aa.jlfp, cid, prev, aa.jlfp.slice, prev_priority);
 }
 
 s32 BPF_STRUCT_OPS(jlfp_select_cid, struct task_struct *p, s32 prev_cid, u64 wake_flags)
@@ -135,7 +119,7 @@ s32 BPF_STRUCT_OPS(jlfp_select_cid, struct task_struct *p, s32 prev_cid, u64 wak
 
   struct latency_ctx lctx;
   lstat_start(&lctx);
-  jlfp_pick_cid(&aa.jlfp, p, (u32)prev_cid, SCX_ENQ_WAKEUP | wake_flags, get_task_weight(p), slice);
+  jlfp_pick_cid(&aa.jlfp, p, (u32)prev_cid, SCX_ENQ_WAKEUP | wake_flags, get_task_weight(p), aa.jlfp.slice);
   u32 cid = scx_bpf_this_cid();
   lstat_record(&lctx, &aa.jlfp.stats[cid].select_cid);
 
@@ -157,7 +141,7 @@ void BPF_STRUCT_OPS(jlfp_enqueue, struct task_struct *p, u64 enq_flags)
   struct latency_ctx lctx;
   lstat_start(&lctx);
 
-  jlfp_pick_cid(&aa.jlfp, p, (u32)scx_bpf_task_cid(p), enq_flags, get_task_weight(p), slice);
+  jlfp_pick_cid(&aa.jlfp, p, (u32)scx_bpf_task_cid(p), enq_flags, get_task_weight(p), aa.jlfp.slice);
   
   u32 cid = scx_bpf_this_cid();
   lstat_record(&lctx, &aa.jlfp.stats[cid].enqueue);

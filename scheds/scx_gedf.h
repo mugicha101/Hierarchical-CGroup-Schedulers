@@ -6,7 +6,7 @@
 struct task_rtp {
   // static params updated by user
   u64 period;
-  u64 relative_deadline;
+  u64 rel_dl;
   bool is_periodic;
 };
 
