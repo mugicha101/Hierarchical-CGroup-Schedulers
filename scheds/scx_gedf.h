@@ -3,6 +3,13 @@
 
 #include "scx_jlfp.h"
 
+struct task_rtp {
+  // static params updated by user
+  u64 period;
+  u64 relative_deadline;
+  bool is_periodic;
+};
+
 // per scheduler instance arena memory
 struct gedf_arena {
   struct jlfp_arena jlfp;
