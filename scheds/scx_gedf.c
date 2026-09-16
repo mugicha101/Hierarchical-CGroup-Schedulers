@@ -21,6 +21,8 @@
 #include <linux/sched.h>
 #include <time.h>
 #include "scx_gedf.h"
+#include "rtp_fifo.h"
+#include <poll.h>
 
 #include "scx_gedf.bpf.skel.h"
 
@@ -63,8 +65,32 @@ static void sigint_handler(int simple)
   exit_req = 1;
 }
 
+#ifndef PIDFD_THREAD
+#define PIDFD_THREAD O_EXCL
+#endif
+
+static int update_task_rtp(void *ctx, pid_t tid, uint64_t period,
+                           uint64_t deadline, bool periodic)
+{
+  struct scx_gedf *skel = ctx;
+  struct task_rtp params = {
+    .period = period,
+    .relative_deadline = deadline,
+    .is_periodic = periodic,
+  };
+  int pidfd = syscall(SYS_pidfd_open, tid, PIDFD_THREAD);
+  if (pidfd < 0)
+    return -errno;
+  int ret = bpf_map_update_elem(bpf_map__fd(skel->maps.task_rtp_map),
+                                &pidfd, &params, BPF_ANY);
+  int err = ret < 0 ? -errno : 0;
+  close(pidfd);
+  return err;
+}
+
 int main(int argc, char **argv)
 {
+  struct rtp_fifo rtp_fifo = { .dir_fd = -1, .fd = -1 };
   struct scx_gedf *skel = NULL;
   struct bpf_link *link = NULL;
   #if TRACING
@@ -184,10 +210,25 @@ restart:
   }
   #endif
 
+  // setup named fifo for modifying task realtime params
+  int fifo_err = rtp_fifo_open(&rtp_fifo, cg_path);
+  if (fifo_err) {
+    fprintf(stderr, "Failed to open realtime parameter FIFO: %s\n", strerror(-fifo_err));
+    goto cleanup;
+  }
+  fprintf(stdout, "Realtime parameter FIFO: %s\n", rtp_fifo.path);
+  fflush(stdout);
+
   ret = 0;
 
   // sleep while running
   while (!exit_req && !UEI_EXITED(skel, uei)) {
+    fifo_err = rtp_fifo_drain(&rtp_fifo, update_task_rtp, skel);
+    if (fifo_err) {
+      fprintf(stderr, "Failed to read realtime parameter FIFO: %s\n", strerror(-fifo_err));
+      ret = 1;
+      break;
+    }
     #if TRACING
     int err = ring_buffer__poll(rb_manager, 100);
     if (err < 0) {
@@ -198,11 +239,17 @@ restart:
       break;
     }
     #else
-    usleep(100000);
+    struct pollfd pfd = { .fd = rtp_fifo.fd, .events = POLLIN };
+    if (poll(&pfd, 1, 100) < 0 && errno != EINTR) {
+      fprintf(stderr, "Error polling realtime parameter FIFO: %s\n", strerror(errno));
+      ret = 1;
+      break;
+    }
     #endif
   }
 
 cleanup:
+  rtp_fifo_close(&rtp_fifo);
 
   if (link) {
     bpf_link__destroy(link);
