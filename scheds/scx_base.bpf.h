@@ -16,6 +16,17 @@ _Static_assert(BASE_MAX_CPUS >= NR_CPUS, "BASE_MAX_CPUS must be >= NR_CPUS");
 _Static_assert(BASE_CMASK_WORDS == CMASK_NR_WORDS(NR_CPUS), "BASE_CMASK_WORDS must equal CMASK_NR_WORDS(NR_CPUS)");
 _Static_assert(sizeof(struct base_cmask_wrapper) == struct_size_t(struct scx_cmask, bits, BASE_CMASK_WORDS), "base_cmask_wrapper must be exactly sized to back a full scx_cmask");
 
+// TODO: grant subschedulers CIDs based on its cgroups cpuset.cpus.effective
+// also add ops.sub_ecaps_updated / ops.sub_caps_updated to support granting/revoking in general (currently just assumes it has all CIDs)
+// currently no scx ops to notify changes to the cgroup cpuset
+// also would allow us to detect partial shard overlap issues outside of the hotpath (still assuming task cpusets are either the cgroup cpuset or pinned)
+// may want to wait for more scx features before implementing this with userspace code
+
+// TODO: look into more intricate clustering schemes
+// while global shard locks are still needed due to synchronization between schedulers,
+// having a clustering system on top of this would be helpful
+// clusters must be shard aligned, but schedulers can use different cluster sizes
+
 // from qmap
 struct {
 	__uint(type, BPF_MAP_TYPE_ARENA);
