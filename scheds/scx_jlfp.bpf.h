@@ -28,7 +28,7 @@ static __always_inline bool init_jlfp_task_ctx(struct base_arena __arena *a, str
   jlfp_task_ctx_t *tctx = get_jlfp_task_ctx(base_init_task(a, p, args));
   if (unlikely(!tctx)) return false;
 
-  // placeholder until jlfp_pick_cid constructs the full priority tuple
+  // placeholder until jlfp_pick_cid constructs the full weight tuple
   tctx->weight = DEFAULT_TASK_WEIGHT;
   tctx->pending_cid = NR_CPUS;
   return true;
@@ -47,7 +47,7 @@ static __always_inline bool init_jlfp_task_ctx(struct base_arena __arena *a, str
 
 // pending vs running
 // effective_weight[cid] = max(running_weight[cid], pending_weight[cid])
-// pending reservations keep stopping of the old task from erasing a new preemptor's priority
+// pending reservations keep stopping of the old task from erasing a new preemptor's weight
 // runtime updates to shard weights, pending owners, and minima hold the shard lock
 // unlocked search reads are hints; the selected shard is checked again under its lock
 
@@ -56,7 +56,7 @@ static __always_inline bool init_jlfp_task_ctx(struct base_arena __arena *a, str
 //     on the min-weight preemption path, reserve the target cid for A before releasing the lock
 //     idle and pinned/migration-disabled direct-dispatch paths do not create a reservation
 // running(A):
-//     set running_weight[cid] to A's priority
+//     set running_weight[cid] to A's weight
 //     clear pending weight and owner only if A owns the reservation
 //     reset A.pending_cid to NR_CPUS
 // stopping(A):
@@ -81,13 +81,39 @@ static __always_inline bool init_jlfp_task_ctx(struct base_arena __arena *a, str
 // max number of times to try idle claim
 #define IDLE_PICK_RETRIES	16
 
-// per-cid priorities and preemption reservations, grouped by shard
+#ifndef smp_rmb
+# if defined(__TARGET_ARCH_x86)
+#  define smp_rmb() barrier()
+# else
+#  define smp_rmb() __sync_synchronize()
+# endif
+#endif
+
+#ifndef smp_wmb
+# if defined(__TARGET_ARCH_x86) || defined(__x86_64__)
+#  define smp_wmb() barrier()
+# else
+#  define smp_wmb() __sync_synchronize()
+# endif
+#endif
+
+static __always_inline void seqlock_update_start(struct seqlock_global __arena *g) {
+	WRITE_ONCE(g->gen_beg, g->gen_beg + 1);
+	smp_wmb();
+}
+
+static __always_inline void seqlock_update_end(struct seqlock_global __arena *g) {
+	smp_wmb();
+	WRITE_ONCE(g->gen_fin, g->gen_fin + 1);
+}
+
+// per-cid weights and preemption reservations, grouped by shard
 // shared by scheduler instances reusing the pinned shard_ctx_map
 struct shard_ctx {
   // shard lock
   struct bpf_res_spin_lock lock;
 
-  // shared JLFP priority state
+  // shared JLFP weight state
   weight_tuple_t cid_running_weight[SCX_CID_SHARD_MAX_CPUS];
   weight_tuple_t cid_pending_weight[SCX_CID_SHARD_MAX_CPUS];
   u64 cid_pending_owner[SCX_CID_SHARD_MAX_CPUS];
@@ -457,20 +483,20 @@ static __always_inline void jlfp_cpuctl_set_weight_core(struct jlfp_arena __aren
 
 // try an eligible global dsq task that beats prev, otherwise resume runnable prev
 // returns the chosen task pid, or zero when no task can run
-static __always_inline u64 jlfp_try_task_dispatch(struct jlfp_arena __arena *a, u32 cid, struct task_struct *prev, u64 slice, u64 prev_priority) {
+static __always_inline u64 jlfp_try_task_dispatch(struct jlfp_arena __arena *a, u32 cid, struct task_struct *prev, u64 slice, u64 prev_weight) {
   TRACE_FUNC_START("jlfp_try_task_dispatch")
   if (unlikely(cid >= NR_CPUS)) return false; // for verifier, should not happen
 
   // if prev task has a weight and is runnable, need to consider it
-  weight_tuple_t prev_weight = 0;
+  weight_tuple_t prev_wt = 0;
   u32 scx_flags = prev ? BPF_CORE_READ(prev, scx.flags) : 0;
   task_ctx_t *pctx = NULL;
   if (scx_flags & SCX_TASK_QUEUED) {
     pctx = get_task_ctx(prev);
     if (likely(pctx)) {
       // refresh before comparison so weight changes also apply when prev resumes directly
-      prev_weight = WT_FROM_FIELDS(prev_priority, is_migration_disabled(prev), a->base.self_cgroup_weight, 0);
-      get_jlfp_task_ctx(pctx)->weight = prev_weight;
+      prev_wt = WT_FROM_FIELDS(prev_weight, is_migration_disabled(prev), a->base.self_cgroup_weight, 0);
+      get_jlfp_task_ctx(pctx)->weight = prev_wt;
     }
   }
 
@@ -487,18 +513,12 @@ static __always_inline u64 jlfp_try_task_dispatch(struct jlfp_arena __arena *a, 
     if (unlikely(!tctx)) continue; // for verifier, should not happen
 
     // since tasks ordered by decreasing weight in gdsq, early exit if weight can't beat prev
-    if (prev_weight && WT_STRIP_MISC(get_jlfp_task_ctx(tctx)->weight) <= prev_weight) {
+    if (prev_wt && WT_STRIP_MISC(get_jlfp_task_ctx(tctx)->weight) <= prev_wt) {
       break;
     }
 
     // skip tasks that can't run on this cpu (either due to cmask or is non-migratable on another cpu)
-    if (!cmask_test(cid, &tctx->cpus_allowed) ||
-      (is_migration_disabled(t) && scx_bpf_task_cid(t) != cid)) {
-      // HOTPATH_TRACE_EVENT(struct sched_trace_event_dispatch_gdsq_iter, SCHED_TRACE_DISPATCH_GDSQ_ITER,
-      //   e->result = SCHED_TRACE_DISPATCH_GDSQ_ITER_CMASK_MISMATCH;
-      //   e->tid = t->pid;
-      //   e->weight = WT_LOWER_FROM_VTIME(t->scx.dsq_vtime);
-      // );
+    if (!cmask_test(cid, &tctx->cpus_allowed) || (is_migration_disabled(t) && scx_bpf_task_cid(t) != cid)) {
       continue;
     }
 
@@ -507,28 +527,17 @@ static __always_inline u64 jlfp_try_task_dispatch(struct jlfp_arena __arena *a, 
       moved = true;
       moved_pid = t->pid;
       moved_weight = get_jlfp_task_ctx(tctx)->weight;
-      // HOTPATH_TRACE_EVENT(struct sched_trace_event_dispatch_gdsq_iter, SCHED_TRACE_DISPATCH_GDSQ_ITER,
-      //   e->result = SCHED_TRACE_DISPATCH_GDSQ_ITER_SUCCESS;
-      //   e->tid = t->pid;
-      //   e->weight = WT_LOWER_FROM_VTIME(t->scx.dsq_vtime);
-      // );
       break;
     }
-
-    // HOTPATH_TRACE_EVENT(struct sched_trace_event_dispatch_gdsq_iter, SCHED_TRACE_DISPATCH_GDSQ_ITER,
-    //   e->result = SCHED_TRACE_DISPATCH_GDSQ_ITER_MOVE_FAIL;
-    //   e->tid = t->pid;
-    //   e->weight = WT_LOWER_FROM_VTIME(t->scx.dsq_vtime);
-    // );
   }
 
   lstat_record(&lctx, &a->stats[cid].task_dispatch);
 
   // rerun the previous task
-  if (!moved && prev_weight && likely(prev && pctx)) {
+  if (!moved && prev_wt && likely(prev && pctx)) {
     moved = true;
     moved_pid = prev->pid;
-    moved_weight = WT_LOWER(prev_weight);
+    moved_weight = WT_LOWER(prev_wt);
     scx_bpf_task_set_slice(prev, slice);
   }
 
@@ -538,7 +547,7 @@ static __always_inline u64 jlfp_try_task_dispatch(struct jlfp_arena __arena *a, 
     HOTPATH_TRACE_EVENT(struct sched_trace_event_dispatch_result, SCHED_TRACE_DISPATCH_RESULT,
       e->sub_dispatch = false;
       e->prev_tid = prev ? prev->pid : 0;
-      e->prev_weight = prev_weight;
+      e->prev_weight = prev_wt;
       e->next_tid = moved_pid;
       e->next_weight = moved_weight;
     );
@@ -547,26 +556,9 @@ static __always_inline u64 jlfp_try_task_dispatch(struct jlfp_arena __arena *a, 
   return moved_pid;
 }
 
-static __always_inline void jlfp_dispatch_core(struct jlfp_arena __arena *a, s32 cid, struct task_struct *prev, u64 slice, u64 prev_priority) {
-  if (unlikely(cid >= NR_CPUS)) return; // for testing limited CPUs
+static __always_inline bool jlfp_try_sub_dispatch(struct jlfp_arena __arena *a, u32 cid, struct task_struct *prev) {
+  if (unlikely(cid >= NR_CPUS)) return false;
 
-  // bpf_printk("[INFO] [JLFP] [DISPATCH] dispatching on cpu %u", cpu);
-  TRACE_FUNC_START("dispatch");
-
-  struct latency_ctx lctx;
-  lstat_start(&lctx);
-
-  cid = cid & (NR_CPUS - 1); // for verifier
-
-  // dispatch task
-  u64 tid = jlfp_try_task_dispatch(a, cid, prev, slice, prev_priority);
-  if (tid) {
-    lstat_record(&lctx, &a->stats[cid].dispatch);
-    TRACE_FUNC_END("dispatch", prev && tid == prev->pid ? "DISPATCHED PREV" : "DISPATCHED TASK");
-    return;
-  }
-
-  // dispatch cgroups if no tasks
   struct latency_ctx lctx_sub;
   lstat_start(&lctx_sub);
 
@@ -584,8 +576,6 @@ static __always_inline void jlfp_dispatch_core(struct jlfp_arena __arena *a, s32
     cd->curr_idx = idx;
     if (scx_bpf_sub_dispatch(sub_cgroup_id)) {
       lstat_record(&lctx_sub, &a->stats[cid].sub_dispatch);
-      lstat_record(&lctx, &a->stats[cid].dispatch);
-      TRACE_FUNC_END("dispatch", "DISPATCHED CGROUP");
 
       HOTPATH_TRACE_EVENT(struct sched_trace_event_dispatch_result, SCHED_TRACE_DISPATCH_RESULT,
         e->sub_dispatch = true;
@@ -593,27 +583,16 @@ static __always_inline void jlfp_dispatch_core(struct jlfp_arena __arena *a, s32
         e->next_tid = idx;
         e->next_weight = a->base.sub_scheds[idx].weight;
       );
-      return;
+      return true;
     }
   }
 
-  lstat_record(&lctx, &a->stats[cid].dispatch);
-  TRACE_FUNC_END("dispatch", "NO READY SUBS");
-  if (prev) {
-    HOTPATH_TRACE_EVENT(struct sched_trace_event_dispatch_result, SCHED_TRACE_DISPATCH_RESULT,
-      e->sub_dispatch = false;
-      e->prev_tid = prev ? prev->pid : 0;
-      e->next_tid = 0;
-      e->next_weight = 0;
-    );
-    return; // no sub schedulers
-  }
+  return false;
 }
 
-// caller supplies task priority; jlfp_pick_cid adds migration and cgroup priority fields
 // inserts directly into a local or global dsq from select_cid or enqueue
 // insertion from select_cid skips the enqueue callback
-static void __always_inline jlfp_pick_cid(struct jlfp_arena __arena *a, struct task_struct *p, u32 prev_cid, u64 enq_flags, u64 priority, u64 slice) {
+static void __always_inline jlfp_pick_cid(struct jlfp_arena __arena *a, struct task_struct *p, u32 prev_cid, u64 enq_flags, u64 task_weight, u64 slice) {
   TRACE_FUNC_START("jlfp_pick_cid");
 
   struct latency_ctx lctx;
@@ -631,10 +610,10 @@ static void __always_inline jlfp_pick_cid(struct jlfp_arena __arena *a, struct t
   // setup
   u32 target_cid = prev_cid;
   bool nmig = is_migration_disabled(p);
-  weight_tuple_t task_weight = WT_FROM_FIELDS(priority, nmig, a->base.self_cgroup_weight, 0);
+  weight_tuple_t task_wt = WT_FROM_FIELDS(task_weight, nmig, a->base.self_cgroup_weight, 0);
   task_ctx_t *tctx = get_task_ctx(p);
-  bool weight_changed = get_jlfp_task_ctx(tctx)->weight != task_weight;
-  get_jlfp_task_ctx(tctx)->weight = task_weight;
+  bool weight_changed = get_jlfp_task_ctx(tctx)->weight != task_wt;
+  get_jlfp_task_ctx(tctx)->weight = task_wt;
 
   // handle case where task was re-enqueued from enq_immed
   // this happens when its pending_cid is still set
@@ -693,7 +672,7 @@ static void __always_inline jlfp_pick_cid(struct jlfp_arena __arena *a, struct t
 
   // NON MIGRATEABLE / CPU PINNED CASE: just need to check prev cpu
   if (unlikely(nmig) || p->nr_cpus_allowed == 1) {
-    if (!prev_allowed || task_weight <= get_effective_weight(a, prev_cid)) goto dispatch_fail;
+    if (!prev_allowed || task_wt <= get_effective_weight(a, prev_cid)) goto dispatch_fail;
 
     goto dispatch;
   }
@@ -775,7 +754,7 @@ static void __always_inline jlfp_pick_cid(struct jlfp_arena __arena *a, struct t
     if (partial_exists) {
       bpf_printk("WARNING: task %d has partial shard overlap, partial shards skipped", p->pid);
     }
-    if (WT_STRIP_MISC(min_effective) >= task_weight) {
+    if (WT_STRIP_MISC(min_effective) >= task_wt) {
       // fall back on previous shard
       target_shard = prev_shard;
     }
@@ -810,13 +789,13 @@ static void __always_inline jlfp_pick_cid(struct jlfp_arena __arena *a, struct t
 
   // if outside cmask, add to gdsq instead since assuming tasks have shard aligned cpusets
   if (!cmask_test(target_cid, &tctx->cpus_allowed) ||
-      !cmask_test(target_cid, &a->base.self_cids.mask) || task_weight <= min_weight) {
+      !cmask_test(target_cid, &a->base.self_cids.mask) || task_wt <= min_weight) {
     bpf_res_spin_unlock(&sctx->lock);
     goto dispatch_fail;
   }
 
   // reserve cid
-  set_pending_weight_locked(a, target_cid, target_shard, task_weight, sctx, p->scx.tid);
+  set_pending_weight_locked(a, target_cid, target_shard, task_wt, sctx, p->scx.tid);
   get_jlfp_task_ctx(tctx)->pending_cid = target_cid;
   bpf_res_spin_unlock(&sctx->lock);
 
@@ -842,7 +821,7 @@ static void __always_inline jlfp_pick_cid(struct jlfp_arena __arena *a, struct t
   target_cid = NR_CPUS;
 
   // enqueue to global dsq instead
-  u64 vtime = WT_VTIME_FROM_LOWER(WT_LOWER(task_weight));
+  u64 vtime = WT_VTIME_FROM_LOWER(WT_LOWER(task_wt));
   scx_bpf_dsq_insert_vtime(p, a->dsq_id, slice, vtime, enq_flags);
 
   cid = scx_bpf_this_cid();
@@ -854,7 +833,7 @@ static void __always_inline jlfp_pick_cid(struct jlfp_arena __arena *a, struct t
   if (unlikely(weight_changed)) {
     TRACE_EVENT(struct sched_trace_event_set_task_weight, SCHED_TRACE_SET_TASK_WEIGHT,
       e->tid = p->pid;
-      e->weight = task_weight;
+      e->weight = task_wt;
     );
   }
 

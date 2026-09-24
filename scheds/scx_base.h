@@ -6,6 +6,7 @@
 #define DEFAULT_CGROUP_WEIGHT 100 // should match default weight in kernel
 #define NTRIALS 10000 // enough trials to be functionally infinite for rare race-conditioned events
 #define BASE_POLICY_TASK_CTX_SIZE 1024 // >= largest policy's task context
+#define TID_MAX 4194304 // max tid linux supports
 #define u128 unsigned __int128
 #define bpf_assert(cond) if (!(cond)) scx_bpf_error(#cond);
 
@@ -31,9 +32,8 @@ struct sub_sched_ctx {
   u64 cgroup_id;
   u32 weight;
 
-  // TODO: if cid partitioning needed, can use these
-  // struct base_cmask_wrapper granted_cids; // cids granted excl to this child
-  // struct base_cmask_wrapper prev_granted; // last grant, for delta calculation
+  // cid partitioning cmasks
+  // struct base_cmask_wrapper granted_cids; // cids in subsched's cpuset
 };
 
 // topology data

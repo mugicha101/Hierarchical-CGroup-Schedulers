@@ -62,36 +62,6 @@ struct seqlock_local {
 	u64 gen;
 };
 
-#ifdef __BPF__
-
-#ifndef smp_rmb
-# if defined(__TARGET_ARCH_x86)
-#  define smp_rmb() barrier()
-# else
-#  define smp_rmb() __sync_synchronize()
-# endif
-#endif
-
-#ifndef smp_wmb
-# if defined(__TARGET_ARCH_x86) || defined(__x86_64__)
-#  define smp_wmb() barrier()
-# else
-#  define smp_wmb() __sync_synchronize()
-# endif
-#endif
-
-static __always_inline void seqlock_update_start(struct seqlock_global __arena *g) {
-	WRITE_ONCE(g->gen_beg, g->gen_beg + 1);
-	smp_wmb();
-}
-
-static __always_inline void seqlock_update_end(struct seqlock_global __arena *g) {
-	smp_wmb();
-	WRITE_ONCE(g->gen_fin, g->gen_fin + 1);
-}
-
-#endif
-
 // stats stored per-cid to avoid race conditions
 struct stats_data {
   struct latency_stat no_op;

@@ -9,7 +9,7 @@ char _license[] SEC("license") = "GPL";
 
 // concrete job-level fixed-priority scheduler using the shared JLFP engine
 // task weights come from the pinned task_weights map under /sys/fs/bpf/scx
-// larger task weights mean higher priority within the tuple's task-priority field
+// larger task weights rank ahead within the tuple's task-weight field
 // select_cid, enqueue, and dispatch reconsidering runnable prev read the map
 // changing a map entry does not reorder queued tasks or preempt running tasks by itself
 
@@ -55,7 +55,7 @@ void BPF_STRUCT_OPS(jlfp_cpuctl_set_weight, struct cgroup *cgrp, u32 weight)
   jlfp_cpuctl_set_weight_core(&aa, cgrp, weight);
 }
 
-// configured priority for selection, enqueue, and reconsidering runnable prev
+// configured weight for selection, enqueue, and reconsidering runnable prev
 u64 __always_inline get_task_weight(struct task_struct *p) {
   u64 weight = DEFAULT_TASK_WEIGHT;
   u64 *lookup_weight = bpf_task_storage_get(&task_weights, p, 0, 0);
@@ -71,11 +71,47 @@ u64 __always_inline get_task_weight(struct task_struct *p) {
 
 void BPF_STRUCT_OPS(jlfp_dispatch, s32 cid, struct task_struct *prev)
 {
-  u64 prev_priority = 0;
-  if (prev && (BPF_CORE_READ(prev, scx.flags) & SCX_TASK_QUEUED)) {
-    prev_priority = get_task_weight(prev);
+  struct jlfp_arena __arena *a = &aa;
+  u64 prev_weight = 0;
+  if (prev && (BPF_CORE_READ(prev, scx.flags) & SCX_TASK_QUEUED))
+    prev_weight = get_task_weight(prev);
+
+  if (unlikely(cid >= NR_CPUS)) return; // for testing limited CPUs
+
+  // bpf_printk("[INFO] [JLFP] [DISPATCH] dispatching on cpu %u", cpu);
+  TRACE_FUNC_START("dispatch");
+
+  struct latency_ctx lctx;
+  lstat_start(&lctx);
+
+  cid = cid & (NR_CPUS - 1); // for verifier
+
+  // dispatch task
+  u64 tid = jlfp_try_task_dispatch(a, cid, prev, a->slice, prev_weight);
+  if (tid) {
+    lstat_record(&lctx, &a->stats[cid].dispatch);
+    TRACE_FUNC_END("dispatch", prev && tid == prev->pid ? "DISPATCHED PREV" : "DISPATCHED TASK");
+    return;
   }
-  jlfp_dispatch_core(&aa, cid, prev, aa.slice, prev_priority);
+
+  // dispatch cgroups if no tasks
+  if (jlfp_try_sub_dispatch(a, cid, prev)) {
+    lstat_record(&lctx, &a->stats[cid].dispatch);
+    TRACE_FUNC_END("dispatch", "DISPATCHED CGROUP");
+    return;
+  }
+
+  lstat_record(&lctx, &a->stats[cid].dispatch);
+  TRACE_FUNC_END("dispatch", "NO READY SUBS");
+  if (prev) {
+    HOTPATH_TRACE_EVENT(struct sched_trace_event_dispatch_result, SCHED_TRACE_DISPATCH_RESULT,
+      e->sub_dispatch = false;
+      e->prev_tid = prev ? prev->pid : 0;
+      e->next_tid = 0;
+      e->next_weight = 0;
+    );
+    return; // no sub schedulers
+  }
 }
 
 s32 BPF_STRUCT_OPS(jlfp_select_cid, struct task_struct *p, s32 prev_cid, u64 wake_flags)
