@@ -9,50 +9,105 @@
 #error "This file must be included from scx_gedf.h"
 #endif
 
-// returns new weight of task based on dl
-// note: weight = U64_MAX - abs_dl
-static __always_inline u64 update_task_dl(struct task_struct *p, u64 now_ts) {
-  const struct task_rtp *lookup_rtp = bpf_task_storage_get(&task_rtp_map, p, 0, 0);
-  if (!lookup_rtp) return 1; // non-realtime tasks have minimal weight
+// configured task weights, shared through the pinned map across JLFP instances
+struct {
+  __uint(type, BPF_MAP_TYPE_TASK_STORAGE);
+  __uint(map_flags, BPF_F_NO_PREALLOC);
+  __type(key, int);
+  __type(value, u64);
+  __uint(pinning, LIBBPF_PIN_BY_NAME);
+} task_weights SEC(".maps");
 
-  // TODO: small race possible due to non-atomic updates to rtp
-  // avoided by user setting rtps before moving task to scx
+// global realtime params map
+struct {
+    __uint(type, BPF_MAP_TYPE_TASK_STORAGE);
+    __uint(map_flags, BPF_F_NO_PREALLOC);
+    __type(key, int);
+    __type(value, struct task_rtp);
+    __uint(pinning, LIBBPF_PIN_BY_NAME);
+} task_rtp_map SEC(".maps");
 
-  struct task_rtp rtp = *lookup_rtp;
+// global memmappable job completion flag array
+// size: 2^22 * 1 byte = ~4MB
+// due to BPF entries requiring minimum 8 bytes, we store 8 1 byte flags per entry
+// the userspace program can treat the array as a u8 array and simply index with its tid
+// no need for atomic operations since each flag gets a byte
+// task sets flag to 1 when job completes, scheduler clears flag to 0 when period advanced
+// if flag still 1 after task sets and sleeps, then something went wrong and the task's deadline was not advanced
+struct {
+  __uint(type, BPF_MAP_TYPE_ARRAY);
+  __uint(max_entries, (TID_MAX + 8) / 8);
+  __type(key, u32);
+  __type(value, u64);
+  __uint(map_flags, BPF_F_MMAPABLE);
+  __uint(pinning, LIBBPF_PIN_BY_NAME);
+} job_completion_flags SEC(".maps");
 
-  u64 weight = ~0ULL; // new task dl set to time 0
-  u64 *lookup_weight = bpf_task_storage_get(&task_weights, p, &weight, BPF_LOCAL_STORAGE_GET_F_CREATE);
-  if (unlikely(!lookup_weight)) return 1; // for verifier, should not happen
-
-  weight = *lookup_weight;
-  u64 abs_dl = ~0ULL - weight;
-  if (likely(now_ts < abs_dl)) return weight; // dl not reached, no dl update needed
-  
-  if (abs_dl == 0) {
-    // new tasks abs dl set to now + rel_dl
-    abs_dl = now_ts + rtp.rel_dl;
-  } else if (rtp.is_periodic) {
-    // periodic tasks increment their abs dl by period until abs dl in the future
-    // can do this in const time by using ceil division
-    u64 incr_periods = 1ULL + (now_ts - abs_dl) / rtp.period;
-    abs_dl += incr_periods * rtp.period;
-  } else {
-    // sporadic task abs dls set to max(now, period end) + rel dl
-    u64 period_end = abs_dl + rtp.period - rtp.rel_dl;
-    abs_dl = (now_ts > period_end ? now_ts : period_end) + rtp.rel_dl;
+// get and clear job completion flag for task
+// we assume the task is not running at this point (should happen in enqueue), so no need for atomic operations
+// advances deadline if set
+static __always_inline bool check_completion(struct task_struct *p) {
+  u32 tid = p->pid;
+  u32 idx = tid >> 3;
+  u32 off = tid & 0b111;
+  u64 *flag_entry = bpf_map_lookup_elem(&job_completion_flags, &idx);
+  if (unlikely(!flag_entry)) {
+    scx_bpf_error("[GEDF] [CHECK_COMPLETION] Failed to lookup job completion flag for task %d", p->pid);
+    return false;
   }
-  
-  return *lookup_weight = weight = ~0ULL - abs_dl;
+
+  u8 *flag_byte = (u8 *)flag_entry + off;
+  if (*flag_byte == 0) {
+    return false;
+  }
+
+  // advance deadline
+  struct task_rtp *rtp = bpf_task_storage_get(&task_rtp_map, p, 0, 0);
+  if (unlikely(!rtp)) {
+    // user program probably forgot to set the task_rtp for this task, ignore completion flag
+    bpf_printk("[GEDF] [CHECK_COMPLETION] Warning: Failed to lookup realtime params for task %d with job completion flag set", p->pid);
+    return false;
+  }
+
+  // check curr abs dl
+  u64 init_weight = ~0ULL; // abs_dl of 0
+  u64 *lookup_weight = bpf_task_storage_get(&task_weights, p, &init_weight, BPF_LOCAL_STORAGE_GET_F_CREATE);
+  if (unlikely(!lookup_weight)) { // should only happen if OOM
+    scx_bpf_error("[GEDF] [CHECK_COMPLETION] Failed to lookup weight for task %d", p->pid);
+    return false;
+  }
+  u64 abs_dl = ~0ULL - *lookup_weight;
+  if (abs_dl == 0) {
+    // no prior dl, so this is the first job completion, set dl to now + rel_dl
+    u64 now = bpf_ktime_get_ns();
+    abs_dl = now + rtp->rel_dl;
+  } else if (rtp->is_periodic) {
+    // periodic task
+    abs_dl += rtp->period;
+  } else {
+    // sporadic task
+    u64 now = bpf_ktime_get_ns();
+    abs_dl = (now < abs_dl ? abs_dl : now) + rtp->rel_dl;
+  }
+
+  *lookup_weight = ~0ULL - abs_dl;
+  *flag_byte = 0;
+  return true;
 }
 
-// calculate slice based on task_weight
-static __always_inline u64 get_slice(struct gedf_arena __arena *a, u64 task_weight, u64 now_ts) {
-  if (task_weight <= 1) return a->jlfp.slice; // non-realtime 
-
-  u64 abs_dl = ~0ULL - task_weight;
-  bpf_assert(abs_dl > now_ts);
-  u64 dt = abs_dl - now_ts;
-  return dt > a->jlfp.slice ? a->jlfp.slice : dt;
+// configured weight for selection, enqueue, and reconsidering runnable prev
+// from JLFP (TODO: refactor to avoid duplication)
+u64 __always_inline get_task_weight(struct task_struct *p) {
+  u64 weight = DEFAULT_TASK_WEIGHT;
+  u64 *lookup_weight = bpf_task_storage_get(&task_weights, p, 0, 0);
+  if (lookup_weight) {
+    weight = *lookup_weight;
+  }
+  if (unlikely(weight == 0)) {
+    bpf_printk("[WARN] [JLFP] [GET_WEIGHT] Task %d has weight 0, using weight 1 instead", p->pid);
+    weight = 1;
+  }
+  return weight;
 }
 
 #endif

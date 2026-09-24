@@ -29,7 +29,7 @@
 #define SUB_CG_BASE "/sys/fs/cgroup/scx_gedf"
 
 const char help_fmt[] =
-"A global earliest deadline first sched_ext hierarchical scheduler.\n"
+"A clustered job-level fixed priority sched_ext hierarchical scheduler.\n"
 "\n"
 "See the top-level comment in .bpf.c for more details.\n"
 "\n"
@@ -42,7 +42,7 @@ const char help_fmt[] =
 "Scheduler Configuration:\n"
 "  -c, --cgroup PATH          Attach the scheduler to an existing cgroup located at PATH (default: /sys/fs/cgroup/ i.e. the root cgroup)\n"
 "  -g, --global-search        Enable Global Shard Search (by default, jlfp_pick_cid only searches local shard if no idle CPU found)\n"
-"  -S, --max-shard-size N         Sets the maximum shard size (i.e. cluster size) to N (default: 8, however each shard must be within a single LLC)\n"
+"  -S, --max-shard-size N     Sets the maximum shard size (i.e. cluster size) to N (default: 8, however each shard must be within a single LLC)\n"
 "  -l, --slice-length N       Sets the slice length (max time tasks get to run before reconsidered by scheduler) to N ns (default: 1000000, must be positive)\n"
 "  -T, --max-tasks N          Sets the maximum number of tasks supported by the scheduler to N (default: 16384, must be at least the tasks in the scheduler's cgroup including non-scx tasks)"
 "\n"
@@ -182,16 +182,16 @@ restart:
 
   // set struct_ops fields
   if (cli_opts.jlfp.base.cgroup_id) {
-    skel->struct_ops.jlfp_ops->sub_cgroup_id = cli_opts.jlfp.base.cgroup_id;
+    skel->struct_ops.gedf_ops->sub_cgroup_id = cli_opts.jlfp.base.cgroup_id;
   }
-  skel->struct_ops.jlfp_ops->cid_shard_size = cli_opts.jlfp.base.max_shard_size;
+  skel->struct_ops.gedf_ops->cid_shard_size = cli_opts.jlfp.base.max_shard_size;
   skel->rodata->trace_enabled = trace_path != NULL;
   
   // load scheduler
-  SCX_OPS_LOAD(skel, jlfp_ops, scx_gedf, uei);
+  SCX_OPS_LOAD(skel, gedf_ops, scx_gedf, uei);
   aa = &skel->arena->aa;
   gedf_apply_opts(&cli_opts, aa);
-  link = SCX_OPS_ATTACH(skel, jlfp_ops, scx_gedf);
+  link = SCX_OPS_ATTACH(skel, gedf_ops, scx_gedf);
   if (!link) {
     fprintf(stderr, "Error: failed to attach scheduler\n");
     goto cleanup;

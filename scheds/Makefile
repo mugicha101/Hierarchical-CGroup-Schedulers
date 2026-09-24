@@ -1,4 +1,4 @@
-TARGETS := scx_jlfp
+TARGETS := scx_jlfp scx_gedf
 
 BUILD := build
 

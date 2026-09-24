@@ -50,18 +50,12 @@ To see how to attach a specific scheduler with a userspace program, run `./build
 - Subschedulers are prioritized by their cgroup weights set via `/sys/fs/cgroup/.../cpu.weight`.
 - Subscheduler cgroups must have lower weights than parent cgroups, which means a cgroup's own tasks always take precedence over sub-scheduler tasks. This allows dispatch to skip sub-scheduler dispatch logic when tasks exist.
 
-### (TODO) GEDF: Global Earliest Deadline First (leaf)
+### GEDF: Global Earliest Deadline First (leaf)
 
 - Sub-policy of JLFP.
-- Tasks follow a sporadic/periodic real-time task model where each task gets a relative deadline.
-- On enqueue, a task's absolute deadline will be updated to `now + relative deadline` if past the end of its period.
 - Task GEDF parameters will be stored in `/sys/fs/bpf/scx/task_sporadic_params` and will persist if the task moves to another scheduler instance.
 - Deadline-derived priorities will reuse the JLFP `task_weights` map, so task weights should not be set manually.
-
-### (TODO) CE: Cyclic Executive (hierarchical)
-
-- Scheduler is given a fixed schedule to run tasks/subschedulers on.
-- This schedule will be modified via a pseudo-file at `/sys/fs/cgroup/<cgroup path>/scx_ce.table`.
+- Job completions are marked by settings a flag in a memmapped BPF array with tid as index. Internally represented as u64 array, but userspace should index assuming a u8 array. These completion are handled on the next runnable transition (after task sleeps), or the next yield (if task doesn't sleep).
 
 ## File structure
 
