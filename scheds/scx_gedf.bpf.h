@@ -87,7 +87,8 @@ static __always_inline bool check_completion(struct task_struct *p) {
   } else {
     // sporadic task
     u64 now = bpf_ktime_get_ns();
-    abs_dl = (now < abs_dl ? abs_dl : now) + rtp->rel_dl;
+    u64 period_end = abs_dl + rtp->period - rtp->rel_dl;
+    abs_dl = (now < period_end ? period_end : now) + rtp->rel_dl;
   }
 
   *lookup_weight = ~0ULL - abs_dl;
@@ -97,7 +98,7 @@ static __always_inline bool check_completion(struct task_struct *p) {
 
 // configured weight for selection, enqueue, and reconsidering runnable prev
 // from JLFP (TODO: refactor to avoid duplication)
-u64 __always_inline get_task_weight(struct task_struct *p) {
+static __always_inline u64 get_task_weight(struct task_struct *p) {
   u64 weight = DEFAULT_TASK_WEIGHT;
   u64 *lookup_weight = bpf_task_storage_get(&task_weights, p, 0, 0);
   if (lookup_weight) {

@@ -97,6 +97,7 @@ s32 BPF_STRUCT_OPS(gedf_select_cid, struct task_struct *p, s32 prev_cid, u64 wak
 
   struct latency_ctx lctx;
   lstat_start(&lctx);
+  check_completion(p);
   jlfp_pick_cid(&aa.jlfp, p, (u32)prev_cid, SCX_ENQ_WAKEUP | wake_flags, get_task_weight(p), aa.jlfp.slice);
   u32 cid = scx_bpf_this_cid();
   lstat_record(&lctx, &aa.jlfp.stats[cid].select_cid);
@@ -119,6 +120,10 @@ void BPF_STRUCT_OPS(gedf_enqueue, struct task_struct *p, u64 enq_flags)
   struct latency_ctx lctx;
   lstat_start(&lctx);
 
+  // check for completions on wakeup
+  if (enq_flags & SCX_ENQ_WAKEUP) {
+    check_completion(p);
+  }
   jlfp_pick_cid(&aa.jlfp, p, (u32)scx_bpf_task_cid(p), enq_flags, get_task_weight(p), aa.jlfp.slice);
   
   u32 cid = scx_bpf_this_cid();
@@ -200,6 +205,14 @@ void BPF_STRUCT_OPS(gedf_exit_task, struct task_struct *p)
   struct latency_ctx lctx;
   lstat_start(&lctx);
 
+  // prevent a reused tid from inheriting a pending completion
+  u32 idx = p->pid >> 3;
+  u32 off = p->pid & 0b111;
+  u64 *flag_entry = bpf_map_lookup_elem(&job_completion_flags, &idx);
+  if (likely(flag_entry)) {
+    *((u8 *)flag_entry + off) = 0;
+  }
+
   if (!base_exit_task(&aa.jlfp.base, p)) return;
 
   u32 cid = scx_bpf_this_cid();
@@ -235,14 +248,6 @@ void BPF_STRUCT_OPS(gedf_tick, struct task_struct *p) {
   lstat_record(&lctx, &aa.jlfp.stats[cid].no_op);
 }
 
-// check for job completion on wakeup
-// handles case where task sleeps until next period
-void BPF_STRUCT_OPS(gedf_runnable, struct task_struct *p, u64 enq_flags) {
-  if (enq_flags & SCX_ENQ_WAKEUP) {
-    check_completion(p);
-  }
-}
-
 // check for job completion on sched_yield
 // handles case where task wants to do maximal early releasing
 bool BPF_STRUCT_OPS(gedf_yield, struct task_struct *from, struct task_struct *to) {
@@ -271,7 +276,6 @@ SCX_OPS_CID_DEFINE(gedf_ops,
   .sub_attach         = (void *)gedf_sub_attach,
   .sub_detach         = (void *)gedf_sub_detach,
   .update_idle        = (void *)gedf_update_idle,
-  .runnable           = (void *)gedf_runnable,
   .yield              = (void *)gedf_yield,
   .tick               = (void *)gedf_tick
 );
