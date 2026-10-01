@@ -253,7 +253,7 @@ void BPF_STRUCT_OPS(gedf_tick, struct task_struct *p) {
 bool BPF_STRUCT_OPS(gedf_yield, struct task_struct *from, struct task_struct *to) {
   if (!to) check_completion(from);
 
-  from->scx.slice = 0;
+  scx_bpf_task_set_slice(from, 0);
   return false;
 }
 
