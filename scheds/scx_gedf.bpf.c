@@ -1,7 +1,7 @@
 // Global Earliest Deadline First (GEDF) scheduler
 // Task realtime parameters can be modified via a FIFO file at /tmp/scx/<cgroup path>/task_realtime_params
 // realtime parameters should be set before moving task into sched_ext and remain constant throughout lifetime of program
-// job completions are marked with write into job_completion_flags indexed by thread id with 1 byte entries
+// job completions are marked with atomic bitwise OR into job_completion_flags, one bit per thread id
 
 #include <scx/common.bpf.h>
 
@@ -206,11 +206,11 @@ void BPF_STRUCT_OPS(gedf_exit_task, struct task_struct *p)
   lstat_start(&lctx);
 
   // prevent a reused tid from inheriting a pending completion
-  u32 idx = p->pid >> 3;
-  u32 off = p->pid & 0b111;
+  u32 idx = p->pid >> 6;
+  u64 mask = 1ULL << (p->pid & 63);
   u64 *flag_entry = bpf_map_lookup_elem(&job_completion_flags, &idx);
   if (likely(flag_entry)) {
-    *((u8 *)flag_entry + off) = 0;
+    __sync_fetch_and_and(flag_entry, ~mask);
   }
 
   if (!base_exit_task(&aa.jlfp.base, p)) return;

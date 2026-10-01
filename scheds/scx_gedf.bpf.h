@@ -27,16 +27,14 @@ struct {
     __uint(pinning, LIBBPF_PIN_BY_NAME);
 } task_rtp_map SEC(".maps");
 
-// global memmappable job completion flag array
-// size: 2^22 * 1 byte = ~4MB
-// due to BPF entries requiring minimum 8 bytes, we store 8 1 byte flags per entry
-// the userspace program can treat the array as a u8 array and simply index with its tid
-// no need for atomic operations since each flag gets a byte
-// task sets flag to 1 when job completes, scheduler clears flag to 0 when period advanced
-// if flag still 1 after task sets and sleeps, then something went wrong and the task's deadline was not advanced
+// global memmappable job completion bitmap, 8 flags per byte (~512KB)
+// use aligned u64 words because BPF atomic operations require 32 or 64 bits
+// userspace sets a bit with __atomic_fetch_or(&flags[tid >> 6], 1ULL << (tid & 63), __ATOMIC_SEQ_CST)
+// task sets flag on job completion before sleeping / yielding, scheduler clears it after advancing the deadline on wakeup enqueue
+// userspace must also read atomically when checking for pending completions
 struct {
   __uint(type, BPF_MAP_TYPE_ARRAY);
-  __uint(max_entries, (TID_MAX + 8) / 8);
+  __uint(max_entries, (TID_MAX + 64) / 64);
   __type(key, u32);
   __type(value, u64);
   __uint(map_flags, BPF_F_MMAPABLE);
@@ -44,20 +42,19 @@ struct {
 } job_completion_flags SEC(".maps");
 
 // get and clear job completion flag for task
-// we assume the task is not running at this point (should happen in enqueue), so no need for atomic operations
+// same-task callbacks are serialized, but other tasks can update bits in the same word
 // advances deadline if set
 static __always_inline bool check_completion(struct task_struct *p) {
   u32 tid = p->pid;
-  u32 idx = tid >> 3;
-  u32 off = tid & 0b111;
+  u32 idx = tid >> 6;
+  u64 mask = 1ULL << (tid & 63);
   u64 *flag_entry = bpf_map_lookup_elem(&job_completion_flags, &idx);
   if (unlikely(!flag_entry)) {
     scx_bpf_error("[GEDF] [CHECK_COMPLETION] Failed to lookup job completion flag for task %d", p->pid);
     return false;
   }
 
-  u8 *flag_byte = (u8 *)flag_entry + off;
-  if (*flag_byte == 0) {
+  if (!(__sync_fetch_and_or(flag_entry, 0) & mask)) {
     return false;
   }
 
@@ -92,7 +89,7 @@ static __always_inline bool check_completion(struct task_struct *p) {
   }
 
   *lookup_weight = ~0ULL - abs_dl;
-  *flag_byte = 0;
+  __sync_fetch_and_and(flag_entry, ~mask);
   return true;
 }
 
