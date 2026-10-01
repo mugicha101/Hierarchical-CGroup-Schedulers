@@ -125,9 +125,9 @@ class Scheduler:
       s += " [NO TRACE]"
     return s
 
-class ScxFP(Scheduler):
+class ScxScheduler(Scheduler):
   def popen(self, scx_build_path):
-    bin_path = f"{scx_build_path}/bin/scx_fp"
+    bin_path = str(Path(scx_build_path) / self.binary)
     check_sched_capabilities(bin_path)
     cmd = [bin_path]
     if self.cgroup:
@@ -139,53 +139,15 @@ class ScxFP(Scheduler):
   def ack_output(self):
     return "Scheduler Attached"
 
-class ScxFFP(Scheduler):
-  def popen(self, scx_build_path):
-    bin_path = f"{scx_build_path}/bin/scx_ffp"
-    check_sched_capabilities(bin_path)
-    cmd = [bin_path]
-    if self.cgroup:
-      cmd += ["-c", self.cgroup]
-    if self.trace_path:
-      cmd += ["-t", self.trace_path]
-    self.process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+class ScxJLFP(ScxScheduler):
+  binary = "scx_jlfp"
 
-  def ack_output(self):
-    return "Scheduler Attached"
-
-class ScxWRR(Scheduler):
-  def popen(self, scx_build_path):
-    bin_path = f"{scx_build_path}/bin/scx_wrr"
-    check_sched_capabilities(bin_path)
-    cmd = [bin_path]
-    if self.cgroup:
-      cmd += ["-c", self.cgroup]
-    if self.trace_path:
-      cmd += ["-t", self.trace_path]
-    self.process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-
-  def ack_output(self):
-    return "Scheduler Attached"
-
-class ScxEAF(Scheduler):
-  def popen(self, scx_build_path):
-    bin_path = f"{scx_build_path}/bin/scx_eaf"
-    check_sched_capabilities(bin_path)
-    cmd = [bin_path]
-    if self.cgroup:
-      cmd += ["-c", self.cgroup]
-    if self.trace_path:
-      cmd += ["-t", self.trace_path]
-    self.process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-
-  def ack_output(self):
-    return "Scheduler Attached"
+class ScxGEDF(ScxScheduler):
+  binary = "scx_gedf"
 
 POLICIES = {
-  "scx_fp": ScxFP,
-  "scx_ffp": ScxFFP,
-  "scx_wrr": ScxWRR,
-  "scx_eaf": ScxEAF
+  "scx_jlfp": ScxJLFP,
+  "scx_gedf": ScxGEDF
 }
 
 class CgroupManager:
@@ -882,10 +844,11 @@ def signal_handler(sig, frame):
     sys.exit(0)
 
 def main():
-  validate_perms()
   parser = argparse.ArgumentParser(description="Manage sched_ext schedulers attached to cgroups.")
-  parser.add_argument("scx_build_path", help="Path to the sched_ext build directory containing the scheduler binaries.")
+  parser.add_argument("scx_build_path", nargs="?", default=str(Path(__file__).resolve().parents[1] / "scheds" / "build"),
+                      help="Directory containing scx_jlfp and scx_gedf binaries (default: scheds/build).")
   args = parser.parse_args()
+  validate_perms()
 
   global manager
   manager = SchedManager(scx_build_path=args.scx_build_path)

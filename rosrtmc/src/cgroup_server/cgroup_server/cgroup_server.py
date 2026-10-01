@@ -6,7 +6,7 @@ import queue
 import sys
 
 from cgroup_server_interfaces.srv import RequestCgroup
-from cgroup_server.sched_manager import SchedManager
+from sched_manager import SchedManager
 from std_msgs.msg import String
 
 # node for managing the cgroup hierarchy via a sched_manager.py instance
