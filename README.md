@@ -118,7 +118,7 @@ sudo bpftool prog show
 
 ## Scheduler Manager Setup (Outside of ROS 2)
 
-`cd rosrtmc/src/cgroup_server/cgroup_server`
+`sched_manager.py` lives in `tools/`.
 
 The `sched_manager.py` script manages cgroups and SCHED_EXT schedulers without requiring sudo.
 
@@ -130,11 +130,11 @@ Python 3
 
 ### Use Scheduler Manager CLI
 
-Run `sudo sh perm_setup.sh` to set permissions for `/sys/fs/bpf` and `/sys/fs/cgroup` to allow the current user to create/manage cgroups and access bpf maps. Allows you to run `sched_manager` without sudo.
+Run `sudo sh tools/perm_setup.sh` to set permissions for `/sys/fs/bpf` and `/sys/fs/cgroup` to allow the current user to create/manage cgroups and access bpf maps. Allows you to run `sched_manager` without sudo.
 
-Run `sched_manager.py <scx build dir>` as a Python 3 program, which acts as an CLI for managing the scheduler hierarchy.
+Run `python3 tools/sched_manager.py` from the repository root to manage the scheduler hierarchy using binaries in `scheds/build`. Build them with `make -C scheds` first.
 
-`<scx build dir>` should look something like `/home/.../linux/tools/sched_ext/` if using the mainline kernel.
+To use a different build, run `python3 tools/sched_manager.py <scheduler binary dir>`. The directory must contain `scx_jlfp` and `scx_gedf` directly.
 
 NOTE: if you get `ERR: Root cgroup already has attached sub-cgroup /sys/fs/cgroup/<cgroup>. Use --force to overwrite.`
 
@@ -152,7 +152,7 @@ Run `load_config -h` for more details from within `sched_manager`.
 
 `trace_dir`: string, path to the directory to dump the trace output to. file name created by replacing `/` with `__`. If not provided, no trace is written to. Takes precedence over ancestor `trace_dir` fields. Creates if doesn't exist.
 
-`policy`: string, which sched_ext policy to use, currently supports scx_fp, scx_wrr, scx_eaf, none.
+`policy`: string, which sched_ext policy to use, supports `scx_jlfp`, `scx_gedf`, and `none`. JLFP supports sub-schedulers; GEDF is a leaf scheduler.
 
 `trace`: boolean, specifies whether to record traces or not. If schedulers were built without tracing, will not trace. Likewise, if schedulers were built with tracing, will incur trace overehads but will not store the trace output anywhere.
 
