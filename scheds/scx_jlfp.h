@@ -13,8 +13,8 @@
 
 // weight tuple consists of 2 64 bit halves
 // upper: misc data [127..80], cgrp_weight [79..64]
-// lower: is_nmig [63], task_weight [62..0]
-// inverse of lower is used as vtime in global dsq
+// lower: is_nmig (migration-disabled or single-cpu affinity) [63], task_weight [62..0]
+// inverse of lower is used as vtime in task dsqs
 typedef u128 weight_tuple_t;
 #define WT_IS_NMIG_SHIFT 63
 #define WT_CGRP_WEIGHT_SHIFT 64
@@ -107,7 +107,7 @@ struct jlfp_arena {
   bool global_search; // search all fully-overlapped shards (fallback on prev shard if no fully-overlapped shards)
   u64 slice;
 
-  // global task dsq
+  // global task dsq; per-cid nmig dsqs use dsq_id + 1 + cid
   u64 dsq_id;
 
   // SCHEDULING STATE

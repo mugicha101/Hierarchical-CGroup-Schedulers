@@ -9,6 +9,8 @@
 #error "This file must be included from scx_jlfp.h"
 #endif
 
+// v7.4 TODO: replace bpf_for with bpf_arena_for if index used for arena pointer arithmetic
+
 struct jlfp_task_ctx {
   struct base_task_ctx base;
 
@@ -20,6 +22,14 @@ struct jlfp_task_ctx {
 typedef struct jlfp_task_ctx __arena jlfp_task_ctx_t;
 _Static_assert(sizeof(struct jlfp_task_ctx) <= BASE_POLICY_TASK_CTX_SIZE, "jlfp_task_ctx larger than BASE_POLICY_TASK_CTX_SIZE");
 _Static_assert(offsetof(struct jlfp_task_ctx, base) == 0, "base_task_ctx must be prefix");
+static __always_inline bool jlfp_task_is_nmig(struct task_struct *p) {
+  return is_migration_disabled(p) || p->nr_cpus_allowed == 1;
+}
+
+static __always_inline u64 jlfp_nmig_dsq_id(struct jlfp_arena __arena *a, u32 cid) {
+  return a->dsq_id + 1 + cid;
+}
+
 static __always_inline jlfp_task_ctx_t *get_jlfp_task_ctx(task_ctx_t *tctx) {
   return likely(tctx) ? (jlfp_task_ctx_t *)tctx->ptctx.data : (jlfp_task_ctx_t *)0;
 }
@@ -39,9 +49,10 @@ static __always_inline bool init_jlfp_task_ctx(struct base_arena __arena *a, str
 // migration-disabled and single-cpu tasks then compare against prev cid's effective weight
 // other tasks search nearby idle cids allowed by both task affinity and self_cids
 // preemption searches fully allowed shards when global_search is enabled, with prev shard as fallback
-// the selected cid must allow the task and have a lower effective weight; otherwise use the global dsq
+// the selected cid must allow the task and have a lower effective weight, otherwise queue it into gdsq or per-cpu nmig dsq
+// migration-disabled and single-cpu tasks use per-cid nmig dsqs, other tasks use the gdsq
 // partial shards are skipped by global preemption search; prev-shard fallback still checks affinity and capabilities
-// global dsq dispatch compares eligible queued tasks against runnable prev, favoring prev on equal weight
+// per-cid dsq dispatch precedes global dsq and compares against runnable prev, favoring prev on equal weight
 
 // TODO: replace all verifier sat checks with explicit errors (across all scheds)
 
@@ -259,7 +270,12 @@ static __always_inline s32 jlfp_init_core(struct jlfp_arena __arena *a) {
   // init task data structs
   a->dsq_id = 1;
   a->base.self_cgroup_weight = a->base.cgroup_id ? DEFAULT_CGROUP_WEIGHT : WT_CGRP_WEIGHT_MASK;
-  scx_bpf_create_dsq(a->dsq_id, -1);
+  err = scx_bpf_create_dsq(a->dsq_id, -1);
+  if (err) return err;
+  bpf_for(cid, 0, nr_cids) {
+    err = scx_bpf_create_dsq(jlfp_nmig_dsq_id(a, cid), -1);
+    if (err) return err;
+  }
 
   TRACE_FUNC_END("init", "");
   return err;
@@ -481,8 +497,94 @@ static __always_inline void jlfp_cpuctl_set_weight_core(struct jlfp_arena __aren
   TRACE_FUNC_END("cpuctl_set_weight", "");
 }
 
-// try an eligible global dsq task that beats prev, otherwise resume runnable prev
-// returns the chosen task pid, or zero when no task can run
+// move the highest-weight eligible task in gdsq/nmig dsq that beats prev to the local dsq
+// returns pid of moved task of 0 if no task moved
+// note: nmig dsq > gdsq
+static __always_inline u64 jlfp_try_gdsq_dispatch(struct jlfp_arena __arena *a, u32 cid, weight_tuple_t prev_wt, u64 *moved_weight) {
+  prev_wt = WT_STRIP_MISC(prev_wt);
+  struct task_struct *t;
+  
+  // try per-cpu nmig dsq
+  // unlike other dsq traversal, this one only checks head
+  // check nmig dsq
+  u32 nretry = 0;
+  bool prev_nmig = WT_IS_NMIG(prev_wt);
+  u32 nmig_dsq_id = jlfp_nmig_dsq_id(a, cid);
+  bpf_for(nretry, 0, NTRIALS) {
+    bool no_task = true;
+
+    // peek head (1 iteration) since nmig dsq is per-cid and should not have cmask issues
+    bpf_for_each(scx_dsq, t, nmig_dsq_id, 0) {
+      task_ctx_t *tctx = get_task_ctx(t);
+      if (unlikely(!tctx)) { // for verifier, should not happen
+        scx_bpf_error("Failed to get task ctx for pid %d", t->pid);
+        return 0;
+      }
+
+      // Note: scheduler may detach if task becomes migrateable and then cmask changed while sitting in nmig dsq
+      // in this case we re-enqueue the entire nmig dsq since no way to return just this task
+      // this is temporary until we can directly re-enqueue a single task
+      // we should still check gdsq
+      if (unlikely(!cmask_test(cid, &tctx->cpus_allowed))) {
+        scx_bpf_dsq_reenq(jlfp_nmig_dsq_id(a, cid), 0);
+        break;
+      }
+
+      // only need to check weight if prev is nmig
+      if (prev_nmig) {
+        if (prev_wt && WT_STRIP_MISC(get_jlfp_task_ctx(tctx)->weight) <= prev_wt) {
+          break;
+        }
+      }
+        
+      no_task = false;
+
+      // try moving task
+      // this only fails if task dequeued between check and move, in which we re-peek
+      if (likely(scx_bpf_dsq_move(BPF_FOR_EACH_ITER, t, SCX_DSQ_LOCAL, 0))) {
+        *moved_weight = WT_LOWER(get_jlfp_task_ctx(tctx)->weight);
+        return t->pid;
+      }
+
+      break; // only care about head
+    }
+    if (no_task) break;
+  }
+  if (unlikely(nretry == NTRIALS)) {
+    scx_bpf_error("Failed to dispatch from nmig dsq after %u retries", nretry);
+    return 0;
+  }
+  if (prev_nmig) return 0; // no need to check gdsq if prev is nmig
+
+  // check gdsq
+  // NOTE: may miss newly enqueued higher priority tasks causing priority inversoin
+  // but this can get resolved when slice expires (this is why slice not infinite)
+  bpf_for_each(scx_dsq, t, a->dsq_id, 0) {
+    task_ctx_t *tctx = get_task_ctx(t);
+    if (unlikely(!tctx)) continue; // for verifier, should not happen
+
+    // since tasks ordered by decreasing weight in gdsq, early exit if weight can't beat prev
+    if (prev_wt && WT_STRIP_MISC(get_jlfp_task_ctx(tctx)->weight) <= prev_wt) {
+      break;
+    }
+
+    // skip tasks that can't run on this cpu (either due to cmask or is non-migratable on another cpu)
+    // TODO: can maybe remove nmig since not sure if task can become nmig while not running
+    if (!cmask_test(cid, &tctx->cpus_allowed) || (is_migration_disabled(t) && scx_bpf_task_cid(t) != cid)) {
+      continue;
+    }
+
+    // this move only fails if another cpu's dispatch claims the task first
+    if (likely(scx_bpf_dsq_move(BPF_FOR_EACH_ITER, t, SCX_DSQ_LOCAL, 0))) {
+      *moved_weight = WT_LOWER(get_jlfp_task_ctx(tctx)->weight);
+      return t->pid;
+    }
+  }
+  return 0;
+}
+
+// per-cid tasks carry the nmig bit and outrank global work within this scheduler
+// try queued tasks that beat prev, otherwise resume runnable prev
 static __always_inline u64 jlfp_try_task_dispatch(struct jlfp_arena __arena *a, u32 cid, struct task_struct *prev, u64 slice, u64 prev_weight) {
   TRACE_FUNC_START("jlfp_try_task_dispatch")
   if (unlikely(cid >= NR_CPUS)) return false; // for verifier, should not happen
@@ -495,7 +597,7 @@ static __always_inline u64 jlfp_try_task_dispatch(struct jlfp_arena __arena *a, 
     pctx = get_task_ctx(prev);
     if (likely(pctx)) {
       // refresh before comparison so weight changes also apply when prev resumes directly
-      prev_wt = WT_FROM_FIELDS(prev_weight, is_migration_disabled(prev), a->base.self_cgroup_weight, 0);
+      prev_wt = WT_FROM_FIELDS(prev_weight, jlfp_task_is_nmig(prev), a->base.self_cgroup_weight, 0);
       get_jlfp_task_ctx(pctx)->weight = prev_wt;
     }
   }
@@ -503,33 +605,9 @@ static __always_inline u64 jlfp_try_task_dispatch(struct jlfp_arena __arena *a, 
   struct latency_ctx lctx;
   lstat_start(&lctx);
 
-  // move highest weight in global dsq that can run on this cpu to local dsq
-  struct task_struct *t;
-  bool moved = false;
-  u64 moved_pid = 0;
   u64 moved_weight = 0;
-  bpf_for_each(scx_dsq, t, a->dsq_id, 0) {
-    task_ctx_t *tctx = get_task_ctx(t);
-    if (unlikely(!tctx)) continue; // for verifier, should not happen
-
-    // since tasks ordered by decreasing weight in gdsq, early exit if weight can't beat prev
-    if (prev_wt && WT_STRIP_MISC(get_jlfp_task_ctx(tctx)->weight) <= prev_wt) {
-      break;
-    }
-
-    // skip tasks that can't run on this cpu (either due to cmask or is non-migratable on another cpu)
-    if (!cmask_test(cid, &tctx->cpus_allowed) || (is_migration_disabled(t) && scx_bpf_task_cid(t) != cid)) {
-      continue;
-    }
-
-    // this move only fails if another cpu's dispatch claims the task first
-    if (likely(scx_bpf_dsq_move(BPF_FOR_EACH_ITER, t, SCX_DSQ_LOCAL, 0))) {
-      moved = true;
-      moved_pid = t->pid;
-      moved_weight = get_jlfp_task_ctx(tctx)->weight;
-      break;
-    }
-  }
+  u64 moved_pid = jlfp_try_gdsq_dispatch(a, cid, prev_wt, &moved_weight);
+  bool moved = moved_pid != 0;
 
   lstat_record(&lctx, &a->stats[cid].task_dispatch);
 
@@ -590,7 +668,7 @@ static __always_inline bool jlfp_try_sub_dispatch(struct jlfp_arena __arena *a, 
   return false;
 }
 
-// inserts directly into a local or global dsq from select_cid or enqueue
+// inserts into a local, per-cid, or global dsq from select_cid or enqueue
 // insertion from select_cid skips the enqueue callback
 static void __always_inline jlfp_pick_cid(struct jlfp_arena __arena *a, struct task_struct *p, u32 prev_cid, u64 enq_flags, u64 task_weight, u64 slice) {
   TRACE_FUNC_START("jlfp_pick_cid");
@@ -609,7 +687,7 @@ static void __always_inline jlfp_pick_cid(struct jlfp_arena __arena *a, struct t
 
   // setup
   u32 target_cid = prev_cid;
-  bool nmig = is_migration_disabled(p);
+  bool nmig = jlfp_task_is_nmig(p);
   weight_tuple_t task_wt = WT_FROM_FIELDS(task_weight, nmig, a->base.self_cgroup_weight, 0);
   task_ctx_t *tctx = get_task_ctx(p);
   bool weight_changed = get_jlfp_task_ctx(tctx)->weight != task_wt;
@@ -671,7 +749,7 @@ static void __always_inline jlfp_pick_cid(struct jlfp_arena __arena *a, struct t
   }
 
   // NON MIGRATEABLE / CPU PINNED CASE: just need to check prev cpu
-  if (unlikely(nmig) || p->nr_cpus_allowed == 1) {
+  if (unlikely(nmig)) {
     if (!prev_allowed || task_wt <= get_effective_weight(a, prev_cid)) goto dispatch_fail;
 
     goto dispatch;
@@ -820,13 +898,14 @@ static void __always_inline jlfp_pick_cid(struct jlfp_arena __arena *a, struct t
 
   target_cid = NR_CPUS;
 
-  // enqueue to global dsq instead
+  // keep bound tasks out of the global queue shared by other cids
   u64 vtime = WT_VTIME_FROM_LOWER(WT_LOWER(task_wt));
-  scx_bpf_dsq_insert_vtime(p, a->dsq_id, slice, vtime, enq_flags);
+  u64 dsq_id = nmig ? jlfp_nmig_dsq_id(a, prev_cid) : a->dsq_id;
+  scx_bpf_dsq_insert_vtime(p, dsq_id, slice, vtime, enq_flags);
 
   cid = scx_bpf_this_cid();
   lstat_record(&lctx, dispatch_type == 0 ? &a->stats[cid].pick_cid_prev : dispatch_type == 1 ? &a->stats[cid].pick_cid_idle : &a->stats[cid].pick_cid_search);
-  TRACE_FUNC_END("jlfp_pick_cid", "GLOBAL DSQ");
+  TRACE_FUNC_END("jlfp_pick_cid", nmig ? "PER-CID DSQ" : "GLOBAL DSQ");
 
   pick_cid_end:
 

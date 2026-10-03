@@ -46,6 +46,12 @@ To see how to attach a specific scheduler with a userspace program, run `./build
 
 - Tasks are prioritized by their weights in `/sys/fs/bpf/scx/task_weights`.
 - Tasks on different cgroups are prioritized by cgroup weight first, then task weight.
+- We assume task cpu affinity masks are either a superset of the cgroup's affinity mask or pinned to a single logical cpu (includes tasks in non-migrateable sections).
+- Pinned / non-migrateable tasks are prioritized over migrateable tasks if they are both handled by the same scheduler instance.
+- Tasks that cannot run directly are considered pending and put on one of two weight-ordered dsqs:
+  - Per CPU DSQ for non-migrateable tasks.
+  - Global DSQ for migrateable tasks.
+- Dispatch checks pending task dsqs and favors a runnable `prev` if highest pending task has equal weight.
 - Weights can be updated by updating `task_weights` and yielding/re-enqueuing.
 - Subschedulers are prioritized by their cgroup weights set via `/sys/fs/cgroup/.../cpu.weight`.
 - Subscheduler cgroups must have lower weights than parent cgroups, which means a cgroup's own tasks always take precedence over sub-scheduler tasks. This allows dispatch to skip sub-scheduler dispatch logic when tasks exist.
@@ -53,6 +59,7 @@ To see how to attach a specific scheduler with a userspace program, run `./build
 ### GEDF: Global Earliest Deadline First (leaf)
 
 - Sub-policy of JLFP.
+- Uses JLFP's per-cid queues and nmig weight boost for migration-disabled and single-CPU pinned tasks.
 - Task GEDF parameters will be stored in `/sys/fs/bpf/scx/task_sporadic_params` and will persist if the task moves to another scheduler instance.
 - Deadline-derived priorities will reuse the JLFP `task_weights` map, so task weights should not be set manually.
 - Job completions are marked by settings a flag in a memmapped BPF array with tid as index. Internally represented as u64 array, but userspace should index assuming a u8 array. These completion are handled on the next runnable transition (after task sleeps), or the next yield (if task doesn't sleep).

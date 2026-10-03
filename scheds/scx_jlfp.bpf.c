@@ -168,7 +168,7 @@ void BPF_STRUCT_OPS(jlfp_running, struct task_struct *p)
     wt = (policy == SCHED_FIFO || policy == SCHED_RR) ? U128_MAX : 0;
   } else {
     if (unlikely(!tctx)) { // should not happen but just incase
-      wt = WT_FROM_FIELDS(get_task_weight(p), is_migration_disabled(p), aa.base.self_cgroup_weight, 0);
+      wt = WT_FROM_FIELDS(get_task_weight(p), jlfp_task_is_nmig(p), aa.base.self_cgroup_weight, 0);
     } else {
       wt = get_jlfp_task_ctx(tctx)->weight;
     }
