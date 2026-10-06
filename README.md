@@ -1,3 +1,7 @@
+## Project Goal
+
+The goal of this project is to provide a framework for implementing realtime schedulers using the latest Linux scheduling features as of kernel version 7.3. Specifically, we utilize Linux's native extendible scheduling framework (sched_ext) with new features such as hierarchical cgroup schedulers, userspace-shared arena memory, and topologically aware CPU to CID mappings, to implement various realtime scheduling policies such as Global Earliest Deadline First. The benefits of using mainline Linux over forks such as LITMUS-RT is maintenance cost: It's a lot easier to update to the newest kernel build and keep the system stable if there's minimal kernel modifications. As such, this project uses kernel modifications sparingly, and most features work without kmods/patches. Additionally, non-realtime sched_ext schedulers such as the community-made Rust userspace schedulers can be used as sub-policies for mixed-criticality scheduling.
+
 ## Linux Schedulers Setup
 
 ### Setup Environment
@@ -84,24 +88,46 @@ DECLARE_LIBBPF_OPTS(bpf_test_run_opts, opts,
 int err = bpf_prog_test_run_opts(prog_fd, &opts);
 ```
 
-TODO: implement weight change + conditional yielding by using mmaped arrays
-- array mapping cpu -> running cgroup weight + pid (to determine which cgroup weight + cpu a pid is mapped to)
-- array mapping cgroup weight -> max pending weight (in global dsq) + cpu set
-- ringbuffer to handle weight update requests on enqueue in any FP scheduler
+### Trace Schedulers (WIP)
 
-### Cgroup Hierarchical Scheduler Limitations and Behavior
+To trace schedulers with low overheads, we use custom ftrace kernel tracepoints defined in `trace`. Standard scheduler use does not require a kernel module.
+
+Build the optional trace module against the configured, built kernel you will run:
+
+```sh
+make -C scheds trace-module KDIR=/path/to/kernel/build
+sudo insmod scheds/trace/scxtp.ko
+```
+
+The `trace/` BPF API skips event emission when the module is unavailable at scheduler load time. Load the module before loading the scheduler to enable this tracing; loading the module later requires reloading the scheduler. Existing ringbuffer tracing is unchanged.
+
+At the top of `scheds/trace/helpers.h`, various compilation flags are set. These enable specific tracing behavior if set to 1 (disabled if 0). They can also be defined before including `trace/events.bpf.h`.
+
+`SCXTP_TRACING`: This flag enables tracing; no ftrace events will be emitted without this set. By default, low-frequency events record cgroup property changes, sub-scheduler attachment and detachment, and task creation and exit. Combine these with generic scheduling events such as `sched_switch`, `sched_wakeup`, and `sched_wakeup_new` to check scheduler policy behavior, with initial priorities, affinity, and hierarchy recorded.
+
+`SCXTP_HOTPATH_TRACING`: When combined with `SCXTP_TRACING`, hotpath events are emitted. These record task enqueue, CPU selection, and execution transitions. These are intended to replace generic scheduling events so that the captured trace is smaller, with the tradeoff of not capturing external scheduling events. Set `SCXTP_HOTPATH_TRACING` to 1 to enable them.
+
+`SCXTP_BACKTRACE`: This enables the use of callstack dumps (up to current scx op) in the scheduler for easier debugging, and is enabled indepdendent of `SCXTP_TRACING`. The scheduler must implement `SCXTP_FUNC_ENTRY(args...)` and `SCXTP_FUNC_EXIT()` on all function entry/exit locations, which are tracked via per-cpu bpf maps. `SCXTP_BACKTRACE_DUMP()` and `SCXTP_BACKTRACE_DUMP_IF()` are used to dump the callstack via `bpf_printk`, which can be read via `/sys/kernel/debug/tracing/trace_pipe`. As this has significant overheads, it should only be enabled for debugging. For generic scheduler debugging, `bpf_printk()` is usually sufficient if used sparingly.
+
+Note: Only use for functions that are non-reentrant, non-sleeping, since assumes each CPU runs 1 op at a time.
+
+The instrumented stack uses a per-CPU BPF map scoped to one op. Call `SCXTP_BACKTRACE_RESET()` at op entry, then `SCXTP_FUNC_ENTRY("arg=%d", arg)` in each instrumented function and `SCXTP_FUNC_EXIT()` before every return. `SCXTP_FUNC_ENTRY()` also works without arguments. Entry captures the function name and formatted argument values; dumps print the active frames from innermost to outermost. The defaults are 16 frames and 128 bytes per frame, configurable with `SCXTP_BACKTRACE_MAX_DEPTH` and `SCXTP_BACKTRACE_FRAME_SIZE`. Dumps report omitted frames, truncated text, and unmatched exits. When disabled, the map and helpers are omitted, and macro arguments are not evaluated.
+
+This per-CPU stack assumes a non-sleeping, non-reentrant op that remains on the same CPU until exit. Sleepable or nested ops can overwrite another op's frames and must not use this shared stack. Scheduler instrumentation still needs to be added at the desired call sites.
+
+For integration with babeltrace2, use an ftrace to CTF converter such as https://github.com/siemens/bt2-ftrace-to-ctf.
+
+### Limitations and Behavior
 
 By default, the linux kernel supports at most 4 layers of nested schedulers (including root scheduler). This can be configured within the kernel by modifying the `SCX_SUB_MAX_DEPTH` macro.
 
-Must have a root scheduler to have subschedulers, but can have gaps between schedulers.
-
-Tasks enqueued to a cgroup without a scheduler get enqueued to the nearest ancestor scheduler.
-
-Due to limitations with the current v3 patchset, `clone3` with flag `CLONE_INTO_CGROUP` must be used to enqueue into a cgroup subscheduler. Using fork or trying to write to `cgroup.procs` will result in enqueueing to the root.
+Must have a root scheduler to have subschedulers, but can have gaps between schedulers. Tasks enqueued to a cgroup without a scheduler get enqueued to the nearest ancestor scheduler.
 
 When a scheduler exits (either by crash or gracefully), its tasks are enqueued into the nearest ancestor scheduler.
 
-With PREEMPT_RT enabled, `struct bpf_timer` cannot be used. This breaks `scx_wrr`.
+As of the release of Linux 7.3, `struct bpf_timer` cannot be used with PREEMPT_RT enabled. Since timers are very useful for realtime systems, a kernel module must be used to bypass this behavior. Slices are not a suitable replacement since they are only enforced in ops.tick and certain scheduler events, rather than using an hrtimer callback. To enable bpf_timer, we can add a patch that adds a workaround that is sufficient for our schedulers but not bpf_timers in general: (TODO: add patch that fix this)
+
+As of the release of 7.3, `sched_class_ext` tasks have lower priority than `sched_class_fair`. This means SCHED_EXT cannot preempt tasks scheduled under the default CFS/EEVDF scheduler, which means running a realtime workload with SCHED_EXT requires careful management of all tasks in the system (either by scheduling them all with SCHED_EXT by omitting the `SCHED_SWITCH_PARTIAL` flag or by using systemd slices / an equivalent CPU partitioning system). The fix to this is to patch the kernel to add a config flag to swap the order of SCX and FAIR: (TODO: add patch that fixes this)
 
 ### Measuring Overhead
 
@@ -114,6 +140,8 @@ Then listing bpf programs will show both runtime in ns and number of calls
 ```
 sudo bpftool prog show
 ```
+
+Schedulers can also output the mean and worst case latencies of various scheduling logic by specifying a stats output file (`/scx_<policy> -h` for more info).
 
 
 ## Scheduler Manager Setup (Outside of ROS 2)
