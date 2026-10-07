@@ -10,7 +10,6 @@
 #endif
 
 #include "diagnostics.h"
-CREATE_TRACE_BUFF();
 
 _Static_assert(BASE_MAX_CPUS >= NR_CPUS, "BASE_MAX_CPUS must be >= NR_CPUS");
 _Static_assert(BASE_CMASK_WORDS == CMASK_NR_WORDS(NR_CPUS), "BASE_CMASK_WORDS must equal CMASK_NR_WORDS(NR_CPUS)");
@@ -161,7 +160,7 @@ static __always_inline void root_init() {
       t.shard_cid,
       t.shard_idx
     );
-    TRACE_EVENT(struct sched_trace_event_cid_topo, SCHED_TRACE_CID_TOPO,
+    SCXTP_EMIT(cid_topo, 0,
       e->cid = cid;
       e->cpu = scx_bpf_cid_to_cpu(cid);
       e->core = t.core_idx;

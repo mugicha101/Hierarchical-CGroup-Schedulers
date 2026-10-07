@@ -217,10 +217,9 @@ static __always_inline void set_pending_weight_locked(struct jlfp_arena __arena 
 }
 
 static __always_inline s32 jlfp_init_core(struct jlfp_arena __arena *a) {
-  TRACE_FUNC_START("init");
   bpf_printk("[INFO] [JLFP] [INIT] cgroup=%llu", a->base.cgroup_id);
   bpf_printk("[INFO] [JLFP] [INIT] SCX_TASK_QUEUED=%u", SCX_TASK_QUEUED);
-  TRACE_EVENT(struct sched_trace_event_init, SCHED_TRACE_INIT,
+  SCXTP_EMIT(init, a->base.cgroup_id,
     e->cgrp_id = a->base.cgroup_id;
   );
   
@@ -277,7 +276,6 @@ static __always_inline s32 jlfp_init_core(struct jlfp_arena __arena *a) {
     if (err) return err;
   }
 
-  TRACE_FUNC_END("init", "");
   return err;
 }
 
@@ -395,7 +393,6 @@ static __always_inline bool sync_porder(struct jlfp_arena __arena *a, u32 cid) {
 // NOTE: assume sub_attach, sub_detach, and cpuctl_set_weight are done sequentially
 
 static __always_inline s32 jlfp_sub_attach_core(struct jlfp_arena __arena *a, struct scx_sub_attach_args *args) {
-  TRACE_FUNC_START("sub_attach");
   
   struct latency_ctx lctx;
   lstat_start(&lctx);
@@ -412,7 +409,7 @@ static __always_inline s32 jlfp_sub_attach_core(struct jlfp_arena __arena *a, st
 
   sub->cgroup_id = sub_cgroup_id;
   sub->weight = cgroup_curr_weight(sub_cgroup_id);
-  TRACE_EVENT(struct sched_trace_sub_params_update, SCHED_TRACE_SUB_PARAMS_UPDATE,
+  SCXTP_EMIT(sub_params_update, a->base.cgroup_id,
     e->idx = sub - a->base.sub_scheds;
     e->cgrp_id = sub->cgroup_id;
     e->weight = sub->weight;
@@ -426,13 +423,10 @@ static __always_inline s32 jlfp_sub_attach_core(struct jlfp_arena __arena *a, st
   scx_bpf_sub_grant(sub_cgroup_id, SCX_CAP_ENQ_IMMED | SCX_CAP_ENQ | SCX_CAP_PREEMPT, (void *)(long)&a->base.self_cids.mask, NULL);
 
   lstat_record(&lctx, &a->stats[cid].sub_attach);
-  TRACE_FUNC_END("sub_attach", "");
   return 0;
 }
 
 static __always_inline void jlfp_sub_detach_core(struct jlfp_arena __arena *a, struct scx_sub_detach_args *args) {
-  TRACE_FUNC_START("sub_detach");
-
   struct latency_ctx lctx;
   lstat_start(&lctx);
 
@@ -440,7 +434,6 @@ static __always_inline void jlfp_sub_detach_core(struct jlfp_arena __arena *a, s
   u64 sub_cgroup_id = args->ops->sub_cgroup_id;
   struct sub_sched_ctx __arena *sub = sub_lookup(&a->base, sub_cgroup_id);
   if (unlikely(!sub)) { // for verifier, should not happen
-    TRACE_FUNC_END("sub_detach", "NOT ATTACHED");
     return;
   }
 
@@ -448,21 +441,18 @@ static __always_inline void jlfp_sub_detach_core(struct jlfp_arena __arena *a, s
   sub->weight = 0;
   update_porder(a, cid, sub - a->base.sub_scheds);
 
-  TRACE_EVENT(struct sched_trace_sub_params_update, SCHED_TRACE_SUB_PARAMS_UPDATE,
+  SCXTP_EMIT(sub_params_update, a->base.cgroup_id,
     e->idx = sub - a->base.sub_scheds;
     e->cgrp_id = 0;
     e->weight = 0;
   );
 
   lstat_record(&lctx, &a->stats[cid].sub_detach);
-  TRACE_FUNC_END("sub_detach", "");
 }
 
 static __always_inline void jlfp_cpuctl_set_weight_core(struct jlfp_arena __arena *a, struct cgroup *cgrp, u32 weight) {
-  TRACE_FUNC_START("cpuctl_set_weight");
-
   u64 sub_cgroup_id = cgrp->kn->id;
-  TRACE_EVENT(struct sched_trace_event_set_weight_args, SCHED_TRACE_SET_WEIGHT_ARGS,
+  SCXTP_EMIT(set_weight_args, a->base.cgroup_id,
     e->cgrp_id = sub_cgroup_id;
     e->weight = weight;
   );
@@ -474,18 +464,16 @@ static __always_inline void jlfp_cpuctl_set_weight_core(struct jlfp_arena __aren
 
   if (sub_cgroup_id == a->base.cgroup_id) {
     a->base.self_cgroup_weight = weight;
-    TRACE_FUNC_END("cpuctl_set_weight", "SELF");
     return; // self not in subs
   }
 
   struct sub_sched_ctx __arena *sub = sub_lookup(&a->base, sub_cgroup_id);
   if (!sub) {
-    TRACE_FUNC_END("cpuctl_set_weight", "NOT ATTACHED");
     return;
   }
 
   sub->weight = weight;
-  TRACE_EVENT(struct sched_trace_sub_params_update, SCHED_TRACE_SUB_PARAMS_UPDATE,
+  SCXTP_EMIT(sub_params_update, a->base.cgroup_id,
     e->idx = sub - a->base.sub_scheds;
     e->cgrp_id = sub->cgroup_id;
     e->weight = sub->weight;
@@ -493,14 +481,12 @@ static __always_inline void jlfp_cpuctl_set_weight_core(struct jlfp_arena __aren
   update_porder(a, cid, sub - a->base.sub_scheds);
 
   lstat_record(&lctx, &a->stats[cid].cpuctl_weight_update);
-
-  TRACE_FUNC_END("cpuctl_set_weight", "");
 }
 
 // move the highest-weight eligible task in gdsq/nmig dsq that beats prev to the local dsq
 // returns pid of moved task of 0 if no task moved
 // note: nmig dsq > gdsq
-static __always_inline u64 jlfp_try_gdsq_dispatch(struct jlfp_arena __arena *a, u32 cid, weight_tuple_t prev_wt, u64 *moved_weight) {
+static __always_inline u64 jlfp_try_gdsq_dispatch(struct jlfp_arena __arena *a, u32 cid, weight_tuple_t prev_wt) {
   prev_wt = WT_STRIP_MISC(prev_wt);
   struct task_struct *t;
   
@@ -542,7 +528,6 @@ static __always_inline u64 jlfp_try_gdsq_dispatch(struct jlfp_arena __arena *a, 
       // try moving task
       // this only fails if task dequeued between check and move, in which we re-peek
       if (likely(scx_bpf_dsq_move(BPF_FOR_EACH_ITER, t, SCX_DSQ_LOCAL, 0))) {
-        *moved_weight = WT_LOWER(get_jlfp_task_ctx(tctx)->weight);
         return t->pid;
       }
 
@@ -576,7 +561,6 @@ static __always_inline u64 jlfp_try_gdsq_dispatch(struct jlfp_arena __arena *a, 
 
     // this move only fails if another cpu's dispatch claims the task first
     if (likely(scx_bpf_dsq_move(BPF_FOR_EACH_ITER, t, SCX_DSQ_LOCAL, 0))) {
-      *moved_weight = WT_LOWER(get_jlfp_task_ctx(tctx)->weight);
       return t->pid;
     }
   }
@@ -586,7 +570,6 @@ static __always_inline u64 jlfp_try_gdsq_dispatch(struct jlfp_arena __arena *a, 
 // per-cid tasks carry the nmig bit and outrank global work within this scheduler
 // try queued tasks that beat prev, otherwise resume runnable prev
 static __always_inline u64 jlfp_try_task_dispatch(struct jlfp_arena __arena *a, u32 cid, struct task_struct *prev, u64 slice, u64 prev_weight) {
-  TRACE_FUNC_START("jlfp_try_task_dispatch")
   if (unlikely(cid >= NR_CPUS)) return false; // for verifier, should not happen
 
   // if prev task has a weight and is runnable, need to consider it
@@ -605,36 +588,20 @@ static __always_inline u64 jlfp_try_task_dispatch(struct jlfp_arena __arena *a, 
   struct latency_ctx lctx;
   lstat_start(&lctx);
 
-  u64 moved_weight = 0;
-  u64 moved_pid = jlfp_try_gdsq_dispatch(a, cid, prev_wt, &moved_weight);
-  bool moved = moved_pid != 0;
+  u64 moved_pid = jlfp_try_gdsq_dispatch(a, cid, prev_wt);
 
   lstat_record(&lctx, &a->stats[cid].task_dispatch);
 
   // rerun the previous task
-  if (!moved && prev_wt && likely(prev && pctx)) {
-    moved = true;
+  if (!moved_pid && prev_wt && likely(prev && pctx)) {
     moved_pid = prev->pid;
-    moved_weight = WT_LOWER(prev_wt);
     scx_bpf_task_set_slice(prev, slice);
-  }
-
-  TRACE_FUNC_END("jlfp_try_task_dispatch", moved ? "MOVED" : "NOT MOVED");
-
-  if (moved) {
-    HOTPATH_TRACE_EVENT(struct sched_trace_event_dispatch_result, SCHED_TRACE_DISPATCH_RESULT,
-      e->sub_dispatch = false;
-      e->prev_tid = prev ? prev->pid : 0;
-      e->prev_weight = prev_wt;
-      e->next_tid = moved_pid;
-      e->next_weight = moved_weight;
-    );
   }
 
   return moved_pid;
 }
 
-static __always_inline bool jlfp_try_sub_dispatch(struct jlfp_arena __arena *a, u32 cid, struct task_struct *prev) {
+static __always_inline bool jlfp_try_sub_dispatch(struct jlfp_arena __arena *a, u32 cid) {
   if (unlikely(cid >= NR_CPUS)) return false;
 
   struct latency_ctx lctx_sub;
@@ -655,12 +622,6 @@ static __always_inline bool jlfp_try_sub_dispatch(struct jlfp_arena __arena *a, 
     if (scx_bpf_sub_dispatch(sub_cgroup_id)) {
       lstat_record(&lctx_sub, &a->stats[cid].sub_dispatch);
 
-      HOTPATH_TRACE_EVENT(struct sched_trace_event_dispatch_result, SCHED_TRACE_DISPATCH_RESULT,
-        e->sub_dispatch = true;
-        e->prev_tid = prev ? prev->pid : 0;
-        e->next_tid = idx;
-        e->next_weight = a->base.sub_scheds[idx].weight;
-      );
       return true;
     }
   }
@@ -671,8 +632,6 @@ static __always_inline bool jlfp_try_sub_dispatch(struct jlfp_arena __arena *a, 
 // inserts into a local, per-cid, or global dsq from select_cid or enqueue
 // insertion from select_cid skips the enqueue callback
 static void __always_inline jlfp_pick_cid(struct jlfp_arena __arena *a, struct task_struct *p, u32 prev_cid, u64 enq_flags, u64 task_weight, u64 slice) {
-  TRACE_FUNC_START("jlfp_pick_cid");
-
   struct latency_ctx lctx;
   lstat_start(&lctx);
 
@@ -890,7 +849,6 @@ static void __always_inline jlfp_pick_cid(struct jlfp_arena __arena *a, struct t
 
   u32 cid = scx_bpf_this_cid();
   lstat_record(&lctx, dispatch_type == 0 ? &a->stats[cid].pick_cid_prev : dispatch_type == 1 ? &a->stats[cid].pick_cid_idle : &a->stats[cid].pick_cid_search);
-  TRACE_FUNC_END("jlfp_pick_cid", "");
   goto pick_cid_end;
 
   // NO DISPATCH
@@ -905,39 +863,15 @@ static void __always_inline jlfp_pick_cid(struct jlfp_arena __arena *a, struct t
 
   cid = scx_bpf_this_cid();
   lstat_record(&lctx, dispatch_type == 0 ? &a->stats[cid].pick_cid_prev : dispatch_type == 1 ? &a->stats[cid].pick_cid_idle : &a->stats[cid].pick_cid_search);
-  TRACE_FUNC_END("jlfp_pick_cid", nmig ? "PER-CID DSQ" : "GLOBAL DSQ");
 
   pick_cid_end:
 
   if (unlikely(weight_changed)) {
-    TRACE_EVENT(struct sched_trace_event_set_task_weight, SCHED_TRACE_SET_TASK_WEIGHT,
+    SCXTP_EMIT(set_task_weight, a->base.cgroup_id,
       e->tid = p->pid;
-      e->weight = task_wt;
+      e->weight = WT_LOWER(task_wt);
     );
   }
-
-  HOTPATH_TRACE_EVENT(struct sched_trace_event_pick_cid_result, SCHED_TRACE_PICK_CID_RESULT,
-    enum sched_trace_pick_cid_type type;
-    switch (dispatch_type) {
-      case 0:
-        type = nmig ? SCHED_TRACE_PICK_CID_NMIG : SCHED_TRACE_PICK_CID_PREV_IMMED;
-        break;
-      case 1:
-        type = SCHED_TRACE_PICK_CID_IDLE;
-        break;
-      case 2:
-        type = SCHED_TRACE_PICK_CID_SEARCH;
-        break;
-      default: // should not happen
-        type = SCHED_TRACE_PICK_CID_NMIG;
-        break;
-    }
-    e->type = type;
-    e->tid = p->pid;
-    e->enq_flags = enq_flags;
-    e->prev_cid = prev_cid;
-    e->target_cid = target_cid == NR_CPUS ? -1 : target_cid;
-  );
 }
 
 static __always_inline void jlfp_running_core(struct jlfp_arena __arena *a, struct task_struct *p, task_ctx_t *tctx, weight_tuple_t wt, struct latency_ctx *lctx) {
@@ -974,7 +908,7 @@ static __always_inline void jlfp_running_core(struct jlfp_arena __arena *a, stru
   if (likely(tctx)) get_jlfp_task_ctx(tctx)->pending_cid = NR_CPUS;
   lstat_record(lctx, &a->stats[cid].running);
 
-  HOTPATH_TRACE_EVENT(struct sched_trace_event_running, SCHED_TRACE_RUNNING,
+  SCXTP_EMIT_HOTPATH(running, a->base.cgroup_id,
     e->tid = p->pid;
     e->weight = WT_LOWER(wt);
   );
@@ -1015,7 +949,7 @@ static __always_inline void jlfp_stopping_core(struct jlfp_arena __arena *a, str
 
   lstat_record(&lctx, &a->stats[cid].stopping);
 
-  HOTPATH_TRACE_EVENT(struct sched_trace_event_stopping, SCHED_TRACE_STOPPING,
+  SCXTP_EMIT_HOTPATH(stopping, a->base.cgroup_id,
     e->tid = p->pid;
     e->runnable = runnable;
   );

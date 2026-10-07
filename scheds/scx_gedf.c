@@ -47,7 +47,7 @@ const char help_fmt[] =
 "  -T, --max-tasks N          Sets the maximum number of tasks supported by the scheduler to N (default: 16384, must be at least the tasks in the scheduler's cgroup including non-scx tasks)"
 "\n"
 "Diagnostics:\n"
-"  -t, --trace PATH           Output trace data from the scheduler to PATH continuously during runtime (trace output ignored if not provided)\n"
+"  -t, --trace PATH           Reserved trace output path (currently unused)\n"
 "  -s, --stats PATH           Output JSON-formatted latency stats to PATH when scheduler exits (discarded if not provided)\n"
 ;
 
@@ -94,9 +94,6 @@ int main(int argc, char **argv)
   struct rtp_fifo rtp_fifo = { .dir_fd = -1, .fd = -1 };
   struct scx_gedf *skel = NULL;
   struct bpf_link *link = NULL;
-  #if TRACING
-  struct ring_buffer *rb_manager = NULL;
-  #endif
   struct gedf_arena *aa = NULL;
   
   struct gedf_cli_opts cli_opts;
@@ -141,34 +138,16 @@ int main(int argc, char **argv)
   verbose = cli_opts.jlfp.base.verbose;
   const char *cg_path = cli_opts.jlfp.base.cgroup_path;
   const char *sched_name = cg_path ? cg_path : "<root>";
-  const char *trace_path = cli_opts.jlfp.base.trace_path;
   const char *stats_path = cli_opts.jlfp.base.stats_path;
 restart:
   // reset resources before each scheduler instance
   skel = NULL;
   link = NULL;
   aa = NULL;
-  #if TRACING
-  rb_manager = NULL;
-  #endif
   ecode = 0;
   ret = 1;
 
   fprintf(stdout, "Initializing %s\n", sched_name);
-
-  // open trace fd
-  trace_fd = NULL;
-  start_time = 0;
-  if (trace_path) {
-    trace_fd = fopen(trace_path, "w");
-    if (!trace_fd) {
-      fprintf(stderr, "Error: failed to open trace file %s\n", trace_path);
-      goto cleanup;
-    }
-    fprintf(stdout, "Tracing enabled, writing to %s\n", trace_path);
-  } else {
-    fprintf(stdout, "Tracing disabled\n");
-  }
 
   // open skel
   LIBBPF_OPTS(bpf_object_open_opts, opts,
@@ -186,7 +165,6 @@ restart:
     skel->struct_ops.gedf_ops->sub_cgroup_id = cli_opts.jlfp.base.cgroup_id;
   }
   skel->struct_ops.gedf_ops->cid_shard_size = cli_opts.jlfp.base.max_shard_size;
-  skel->rodata->trace_enabled = trace_path != NULL;
   
   // load scheduler
   SCX_OPS_LOAD(skel, gedf_ops, scx_gedf, uei);
@@ -200,18 +178,6 @@ restart:
   
   fprintf(stdout, "Scheduler Attached\n");
   fflush(stdout);
-
-  // setup trace buffer manager and attach trace buffer
-  #if TRACING
-  struct callback_ctx cb_ctx;
-  int tbuff_fd = bpf_map__fd(skel->maps.trace_buff);
-  snprintf(cb_ctx.sched_name, sizeof(cb_ctx.sched_name), "%s", sched_name);
-  rb_manager = ring_buffer__new(tbuff_fd, handle_event, &cb_ctx, NULL);
-  if (!rb_manager) {
-    fprintf(stderr, "Failed to create ring buffer manager\n");
-    goto cleanup;
-  }
-  #endif
 
   // setup named fifo for modifying task realtime params
   int fifo_err = rtp_fifo_open(&rtp_fifo, cg_path);
@@ -232,23 +198,12 @@ restart:
       ret = 1;
       break;
     }
-    #if TRACING
-    int err = ring_buffer__poll(rb_manager, 100);
-    if (err < 0) {
-      if (err != -EINTR) {
-        fprintf(stderr, "Error polling ring buffer: %d\n", err);
-        ret = 1;
-      }
-      break;
-    }
-    #else
     struct pollfd pfd = { .fd = rtp_fifo.fd, .events = POLLIN };
     if (poll(&pfd, 1, 100) < 0 && errno != EINTR) {
       fprintf(stderr, "Error polling realtime parameter FIFO: %s\n", strerror(errno));
       ret = 1;
       break;
     }
-    #endif
   }
 
 cleanup:
@@ -258,17 +213,6 @@ cleanup:
     bpf_link__destroy(link);
     ecode = UEI_REPORT(skel, uei);
   }
-
-  #if TRACING
-  // read exit event
-  if (rb_manager) {
-    int err = ring_buffer__poll(rb_manager, 100);
-    if (err < 0) {
-      fprintf(stderr, "Error polling ring buffer: %d\n", err);
-    }
-    ring_buffer__free(rb_manager);
-  }
-  #endif
 
   if (stats_path && aa) {
     FILE *stats_fd = fopen(stats_path, "w");
@@ -290,10 +234,6 @@ cleanup:
   }
 
   if (skel) scx_gedf__destroy(skel);
-
-  if (trace_fd && trace_path) {
-    fclose(trace_fd);
-  }
 
   fprintf(stdout, "Scheduler Detached\n");
   fflush(stdout);

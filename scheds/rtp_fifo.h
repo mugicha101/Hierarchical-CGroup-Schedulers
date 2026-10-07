@@ -195,7 +195,7 @@ static inline int rtp_fifo_drain(struct rtp_fifo *fifo,
                                rtp_fifo_update_fn update, void *ctx)
 {
   char buf[4096];
-  // bound work so continuous writers cannot starve exit and trace handling
+  // bound work so continuous writers cannot starve exit
   for (int batch = 0; batch < 16; batch++) {
     ssize_t n = read(fifo->fd, buf, sizeof(buf));
     if (n < 0) {

@@ -23,7 +23,7 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(gedf_init)
 
 void BPF_STRUCT_OPS(gedf_exit, struct scx_exit_info *ei)
 {
-  TRACE_EVENT(struct sched_trace_event_exit, SCHED_TRACE_EXIT,
+  SCXTP_EMIT(exit, aa.jlfp.base.cgroup_id,
     e->cgrp_id = aa.jlfp.base.cgroup_id;
   );
   bpf_printk("[INFO] [GEDF] [EXIT] cgroup=%llu\n", aa.jlfp.base.cgroup_id);
@@ -55,7 +55,6 @@ void BPF_STRUCT_OPS(gedf_dispatch, s32 cid, struct task_struct *prev)
   if (unlikely(cid >= NR_CPUS)) return; // for testing limited CPUs
 
   // bpf_printk("[INFO] [GEDF] [DISPATCH] dispatching on cpu %u", cpu);
-  TRACE_FUNC_START("dispatch");
 
   struct latency_ctx lctx;
   lstat_start(&lctx);
@@ -66,34 +65,21 @@ void BPF_STRUCT_OPS(gedf_dispatch, s32 cid, struct task_struct *prev)
   u64 tid = jlfp_try_task_dispatch(a, cid, prev, a->slice, prev_weight);
   if (tid) {
     lstat_record(&lctx, &a->stats[cid].dispatch);
-    TRACE_FUNC_END("dispatch", prev && tid == prev->pid ? "DISPATCHED PREV" : "DISPATCHED TASK");
     return;
   }
 
   // dispatch cgroups if no tasks
-  if (jlfp_try_sub_dispatch(a, cid, prev)) {
+  if (jlfp_try_sub_dispatch(a, cid)) {
     lstat_record(&lctx, &a->stats[cid].dispatch);
-    TRACE_FUNC_END("dispatch", "DISPATCHED CGROUP");
     return;
   }
 
   lstat_record(&lctx, &a->stats[cid].dispatch);
-  TRACE_FUNC_END("dispatch", "NO READY SUBS");
-  if (prev) {
-    HOTPATH_TRACE_EVENT(struct sched_trace_event_dispatch_result, SCHED_TRACE_DISPATCH_RESULT,
-      e->sub_dispatch = false;
-      e->prev_tid = prev ? prev->pid : 0;
-      e->next_tid = 0;
-      e->next_weight = 0;
-    );
-    return; // no sub schedulers
-  }
 }
 
 s32 BPF_STRUCT_OPS(gedf_select_cid, struct task_struct *p, s32 prev_cid, u64 wake_flags)
 {
   // bpf_printk("[INFO] [GEDF] [SELECT_CID] cgroup=%d pid=%d comm=%s prev_cid=%d wake_flags=%llu", cgroup_id, p->pid, p->comm, prev_cid, wake_flags);
-  TRACE_FUNC_START("select_cid");
 
   struct latency_ctx lctx;
   lstat_start(&lctx);
@@ -102,18 +88,16 @@ s32 BPF_STRUCT_OPS(gedf_select_cid, struct task_struct *p, s32 prev_cid, u64 wak
   u32 cid = scx_bpf_this_cid();
   lstat_record(&lctx, &aa.jlfp.stats[cid].select_cid);
 
-  TRACE_FUNC_END("select_cid", "");
   return prev_cid; // should be ignored since enqueue shouldn't run
 }
 
 void BPF_STRUCT_OPS(gedf_enqueue, struct task_struct *p, u64 enq_flags)
 {
   // bpf_printk("[INFO] [GEDF] [ENQUEUE] cgroup=%d pid=%d comm=%s enq_flags=%llu", cgroup_id, p->pid, p->comm, enq_flags);
-  TRACE_FUNC_START("enqueue");
 
-  HOTPATH_TRACE_EVENT(struct sched_trace_event_enqueue_args, SCHED_TRACE_ENQUEUE_ARGS,
+  SCXTP_EMIT_HOTPATH(enqueue_args, aa.jlfp.base.cgroup_id,
     e->enq_flags = enq_flags;
-    e->prev_cid = (u32)scx_bpf_task_cid(p);
+    e->prev_cid = scx_bpf_task_cid(p);
     e->tid = p->pid;
   );
 
@@ -128,8 +112,6 @@ void BPF_STRUCT_OPS(gedf_enqueue, struct task_struct *p, u64 enq_flags)
   
   u32 cid = scx_bpf_this_cid();
   lstat_record(&lctx, &aa.jlfp.stats[cid].enqueue);
-
-  TRACE_FUNC_END("enqueue", "");
 }
 
 void BPF_STRUCT_OPS(gedf_running, struct task_struct *p)
@@ -173,9 +155,7 @@ void BPF_STRUCT_OPS(gedf_update_idle, s32 cid, bool idle)
 // because cid-form removes enable/disable can only be done in enqueue
 s32 BPF_STRUCT_OPS_SLEEPABLE(gedf_init_task, struct task_struct *p, struct scx_init_task_args *args)
 {
-  TRACE_FUNC_START("init_task");
-  
-  TRACE_EVENT(struct sched_trace_event_init_task_args, SCHED_TRACE_INIT_TASK_ARGS,
+  SCXTP_EMIT(init_task_args, aa.jlfp.base.cgroup_id,
     e->tid = p->pid;
     e->fork = args->fork;
   );
@@ -188,16 +168,13 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(gedf_init_task, struct task_struct *p, struct scx_i
     return -ENOMEM;
   }
 
-  TRACE_FUNC_END("init_task", "");
   return 0;
 }
 
 // from qmap
 void BPF_STRUCT_OPS(gedf_exit_task, struct task_struct *p)
 {
-  TRACE_FUNC_START("exit_task");
-
-  TRACE_EVENT(struct sched_trace_event_exit_task_args, SCHED_TRACE_EXIT_TASK_ARGS,
+  SCXTP_EMIT(exit_task_args, aa.jlfp.base.cgroup_id,
     e->tid = p->pid;
   );
   
@@ -217,13 +194,11 @@ void BPF_STRUCT_OPS(gedf_exit_task, struct task_struct *p)
 
   u32 cid = scx_bpf_this_cid();
   lstat_record(&lctx, &aa.jlfp.stats[cid].exit_task);
-  TRACE_FUNC_END("exit_task", "");
 }
 
 // from qmap
 void BPF_STRUCT_OPS(gedf_set_cmask, struct task_struct *p, const struct scx_cmask *cmask_in)
 {
-  TRACE_FUNC_START("set_cmask");
   struct latency_ctx lctx;
   lstat_start(&lctx);
 
@@ -232,9 +207,8 @@ void BPF_STRUCT_OPS(gedf_set_cmask, struct task_struct *p, const struct scx_cmas
 
   u32 cid = scx_bpf_this_cid();
   lstat_record(&lctx, &aa.jlfp.stats[cid].set_cmask);
-  TRACE_FUNC_END("set_cmask", "");
 
-  TRACE_EVENT(struct sched_trace_event_set_cmask, SCHED_TRACE_SET_CMASK,
+  SCXTP_EMIT(set_cmask, aa.jlfp.base.cgroup_id,
     e->tid = p->pid;
     e->cmask = cmask_to_u64(&tctx->cpus_allowed);
   );
