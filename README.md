@@ -1,6 +1,6 @@
 ## Project Goal
 
-The goal of this project is to provide a framework for implementing realtime schedulers using the latest Linux scheduling features as of kernel version 7.3. Specifically, we utilize Linux's native extendible scheduling framework (sched_ext) with new features such as hierarchical cgroup schedulers, userspace-shared arena memory, and topologically aware CPU to CID mappings, to implement various realtime scheduling policies such as Global Earliest Deadline First. The benefits of using mainline Linux over forks such as LITMUS-RT is maintenance cost: It's a lot easier to update to the newest kernel build and keep the system stable if there's minimal kernel modifications. As such, this project uses kernel modifications sparingly, and most features work without kmods/patches. Additionally, non-realtime sched_ext schedulers such as the community-made Rust userspace schedulers can be used as sub-policies for mixed-criticality scheduling.
+The goal of this project is to provide a framework for implementing realtime schedulers using the latest Linux scheduling features planned for kernel version 7.3. Specifically, we utilize Linux's native extendible scheduling framework (sched_ext) with new features such as hierarchical cgroup schedulers, userspace-shared arena memory, and topologically aware CPU to CID mappings, to implement various realtime scheduling policies such as Global Earliest Deadline First. The benefits of using mainline Linux over forks such as LITMUS-RT is maintenance cost: It's a lot easier to update to the newest kernel build and keep the system stable if there's minimal kernel modifications. As such, this project uses kernel modifications sparingly, and most features work without kmods/patches. Additionally, non-realtime sched_ext schedulers such as the community-made Rust userspace schedulers can be used as sub-policies for mixed-criticality scheduling.
 
 ## Linux Schedulers Setup
 
@@ -14,42 +14,36 @@ install kernel
 
 ### Build Schedulers
 
-go to tools/sched_ext
+go to the repository root
 
-copy everything in `scheds` into `tools/sched_ext`
+For a fresh clone, install Git, make, GCC, bpftool, and development libraries/headers for libbpf, libelf, and zlib. Kernel BTF must be available at `/sys/kernel/btf/vmlinux`.
 
-modify in Makefile:
+Fetch the sched_ext headers before the first build
 ```
-c-sched-targets = scx_simple scx_cpu0 scx_qmap scx_central scx_flatcg scx_userland scx_pair scx_sdt scx_eaf scx_wrr scx_fp
+(cd scheds && ./setup.sh)
 ```
-
-To enable/disable tracing, modify `trace_events.h` to define `TRACING` to 1 or 0 respectively.
-
-To limit CPUs, uncomment out the NR_CPU redefine in `trace_events.h`.
 
 Compile the schedulers
 ```
-sudo bear -- make CC="clang-21 -Wno-unused-command-line-argument" CLANG=clang-21 LLVM_STRIP=llvm-strip-21 VMLINUX_BTF=/sys/kernel/btf/vmlinux
+make -C scheds CLANG=clang-21
 ```
 
-To ensure scheduler binaries can load schedulers without sudo, change the capabilities
+To ensure scheduler binaries can load schedulers without sudo, run the setup script (will ask for sudo permission)
 ```
-find ./build/bin/ -type f -name "scx_*" -executable -exec setcap 'cap_bpf,cap_perfmon=ep' {} \;
+(cd scheds && ./setcaps.sh)
 ```
 
-Additionally, if running without the cgroup_server node, you need to chown /sys/fs/bpf so that the scheduler binaries can access them without root.
+This grants the cap_bpf and cap_perfmon capabilities to the scheduler binaries and sets up permissions for `/sys/fs/bpf/scx`.
 
-Built schedulers can be run like so: `./build/bin/scx_wrr`.
+Built schedulers can be run like so: `./scheds/build/scx_jlfp`.
 
 Brief description of schedulers (see their bpf code for more details)
 
-- scx_fp: Fixed Priority Scheduler. Supports both sub cgroups and tasks. Supports job-level fixed priority by calling the `set_weight` bpf program pinned to `/sys/fs/bpf/set_weight` (~0.5s) or by writing to `/sys/fs/bpf/task_weights` and then `sched_yield()` (~50us).
+- scx_jlfp: Job-Level Fixed Priority Scheduler. Supports both sub cgroups and tasks. Supports job-level fixed priority by writing to `/sys/fs/bpf/scx/task_weights` and then `sched_yield()`.
 
-- scx_wrr: Weighted Round Robin Scheduler (per-cpu round robin queues). Only supports sub cgroups, not tasks.
+- scx_gedf: Global Earliest Deadline First Scheduler. Only supports tasks.
 
-- scx_eaf: FIFO Scheduler (Earliest Arrival First). Only supports tasks.
-
-Example of setting weight via `/sys/fs/bpf/task_weights`
+Example of setting weight via `/sys/fs/bpf/scx/task_weights`
 ```c
 #include <bpf/bpf.h>
 #include <fcntl.h>
@@ -59,73 +53,32 @@ Example of setting weight via `/sys/fs/bpf/task_weights`
 #endif
 
 // on thread init
-int file_fd = bpf_obj_get("/sys/fs/bpf/task_weights");
+int file_fd = bpf_obj_get("/sys/fs/bpf/scx/task_weights");
 uint64_t tid = syscall(SYS_gettid);
 int pid_fd = syscall(SYS_pidfd_open, tid, PIDFD_THREAD);
 
 // during update
 uint64_t weight = rand() % 100 + 1;
 int err = bpf_map_update_elem(file_fd, &pid_fd, &weight, BPF_ANY);
-sched_yield(); // task weight only updated on enqueue
-```
-
-Example of calling `/sys/fs/bpf/update_weight` from a C program:
-```c
-#include <bpf/bpf.h>
-
-// on thread init
-const char *pin_path = "/sys/fs/bpf/update_weight";
-int prog_fd = bpf_obj_get(pin_path);
-uint64_t tid = syscall(SYS_gettid);
-
-// during update
-uint64_t weight = rand() % 100 + 1;
-__u64 bpf_args[2] = { tid, weight };
-DECLARE_LIBBPF_OPTS(bpf_test_run_opts, opts,
-  .ctx_in = bpf_args,
-  .ctx_size_in = sizeof(bpf_args),
-);
-int err = bpf_prog_test_run_opts(prog_fd, &opts);
+// task weight refreshed on selection, enqueue, or dispatch
+sched_yield();
 ```
 
 ### Tracing Schedulers
 
-TODO: replace ringbuffer system
-
-#### General Debugging
-
-For general scheduler debugging without needing a kernel module, use the native `bpf_printk()` macro. Its output is emitted through ftrace as `bpf_trace:bpf_trace_printk` and can be read from `/sys/kernel/tracing/trace_pipe`.
-
-#### Structured Scheduler Tracepoints
-
-To trace BPF schedulers with low overhead, we use custom ftrace kernel tracepoints defined in `scheds/trace`, which requires a kernel module to work. Without the kernel module loaded, trace emissions will become no-ops at scheduler load-time. This kernel module is used to add custom kernel tracepoints, since forwarding tracepoints to userspace would add overhead and complexity.
-
-Build and load the kernel module as follows:
-
-```sh
-make -C scheds trace-module KDIR=/path/to/kernel/build
-sudo insmod scheds/trace/scxtp.ko
-```
-
-At the top of `scheds/trace/helpers.h`, various compilation flags are set. These enable specific tracing behavior if set to 1 (disabled if 0). They can also be defined before including `trace/events.bpf.h`.
-
-`SCXTP_TRACING`: This flag enables the custom scheduler tracepoints. By default, low-frequency events record cgroup property changes, sub-scheduler attachment and detachment, and task creation and exit. Combine these with generic scheduling events such as `sched_switch`, `sched_wakeup`, and `sched_wakeup_new` to check scheduler policy behavior, with initial priorities, affinity, and hierarchy recorded.
-
-`SCXTP_HOTPATH_TRACING`: When combined with `SCXTP_TRACING`, hotpath events are emitted. These record task enqueue, CPU selection, and execution transitions. These are intended to replace generic scheduling events so that the captured trace is smaller, with the tradeoff of not capturing external scheduling events. Set `SCXTP_HOTPATH_TRACING` to 1 to enable them.
-
-For integration with babeltrace2, use an ftrace to CTF converter such as https://github.com/siemens/bt2-ftrace-to-ctf.
+See [Tracing in the scheduler README](scheds/README.md#tracing) for debugging, trace module setup, emission controls, and external recording and parsing.
 
 ### Limitations and Behavior
 
-By default, the linux kernel supports at most 4 layers of nested schedulers (including root scheduler). This can be configured within the kernel by modifying the `SCX_SUB_MAX_DEPTH` macro.
+By default, the linux kernel supports at most 4 layers of nested schedulers (including root scheduler). This can be configured within the kernel by modifying the `SCX_SUB_MAX_DEPTH` enum constant.
 
 Must have a root scheduler to have subschedulers, but can have gaps between schedulers. Tasks enqueued to a cgroup without a scheduler get enqueued to the nearest ancestor scheduler.
 
 When a scheduler exits (either by crash or gracefully), its tasks are enqueued into the nearest ancestor scheduler.
 
-As of the release of Linux 7.3, `struct bpf_timer` cannot be used with PREEMPT_RT enabled. Since timers are very useful for realtime systems, a kernel module must be used to bypass this behavior. Slices are not a suitable replacement since they are only enforced in ops.tick and certain scheduler events, rather than using an hrtimer callback. To enable bpf_timer, we can add a patch that adds a workaround that is sufficient for our schedulers but not bpf_timers in general: (TODO: add patch that fix this)
+As of the release of Linux 7.3, `struct bpf_timer` cannot be used with PREEMPT_RT enabled. Since timers are very useful for realtime systems, a kernel patch must be used to bypass this behavior. Slices are not a suitable replacement since they are only enforced in ops.tick and certain scheduler events, rather than using an hrtimer callback. To enable bpf_timer, we can add a patch that adds a workaround that is sufficient for our schedulers but not bpf_timers in general: (TODO: add patch that fix this)
 
-As of the release of 7.3, `sched_class_ext` tasks have lower priority than `sched_class_fair`. This means SCHED_EXT cannot preempt tasks scheduled under the default CFS/EEVDF scheduler, which means running a realtime workload with SCHED_EXT requires careful management of all tasks in the system (either by scheduling them all with SCHED_EXT by omitting the `SCHED_SWITCH_PARTIAL` flag or by using systemd slices / an equivalent CPU partitioning system). The fix to this is to patch the kernel to add a config flag to swap the order of SCX and FAIR: (TODO: add patch that fixes this)
+As of the release of 7.3, `sched_class_ext` tasks have lower priority than `sched_class_fair`. This means SCHED_EXT cannot preempt tasks scheduled under the default CFS/EEVDF scheduler, which means running a realtime workload with SCHED_EXT requires careful management of all tasks in the system (either by scheduling them all with SCHED_EXT by omitting the `SCX_OPS_SWITCH_PARTIAL` flag or by using systemd slices / an equivalent CPU partitioning system). The fix to this is to patch the kernel to add a config flag to swap the order of SCX and FAIR: (TODO: add patch that fixes this)
 
 ### Measuring Overhead
 
@@ -139,7 +92,7 @@ Then listing bpf programs will show both runtime in ns and number of calls
 sudo bpftool prog show
 ```
 
-Schedulers can also output the mean and worst case latencies of various scheduling logic by specifying a stats output file (`/scx_<policy> -h` for more info).
+Schedulers can also output the mean (via sum/count) and worst case latencies of various scheduling logic by specifying a stats output file (`./scheds/build/scx_<policy> -h` for more info).
 
 
 ## Scheduler Manager Setup (Outside of ROS 2)
@@ -176,11 +129,9 @@ Run `load_config -h` for more details from within `sched_manager`.
 
 #### Schedulers have the following fields
 
-`trace_dir`: string, path to the directory to dump the trace output to. file name created by replacing `/` with `__`. If not provided, no trace is written to. Takes precedence over ancestor `trace_dir` fields. Creates if doesn't exist.
-
 `policy`: string, which sched_ext policy to use, supports `scx_jlfp`, `scx_gedf`, and `none`. JLFP supports sub-schedulers; GEDF is a leaf scheduler.
 
-`trace`: boolean, specifies whether to record traces or not. If schedulers were built without tracing, will not trace. Likewise, if schedulers were built with tracing, will incur trace overehads but will not store the trace output anywhere.
+`trace`: boolean, enables custom ftrace event emissions for this scheduler (default: false). See [Tracing in the scheduler README](scheds/README.md#tracing).
 
 `weight`: int, cgroup weight (1 to 10000), can also be set externally using the cgroup fs interface.
 
@@ -188,4 +139,4 @@ Run `load_config -h` for more details from within `sched_manager`.
 
 ## ROS 2 Component Scheduling Setup
 
-TODO
+`rosrtmc` is currently unfinished code for integrating cgroup scheduling into ROS2.
