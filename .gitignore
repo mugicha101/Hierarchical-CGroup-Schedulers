@@ -4,3 +4,14 @@
 **/log/
 **/__pycache__/
 scheds/include
+
+# kernel module build artifacts
+/scheds/**/*.o
+/scheds/**/*.ko
+/scheds/**/*.mod
+/scheds/**/*.mod.c
+/scheds/**/.*.cmd
+/scheds/**/.*.d
+/scheds/**/Module.symvers
+/scheds/**/modules.order
+/scheds/**/.tmp_versions/
