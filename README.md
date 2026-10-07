@@ -88,32 +88,30 @@ DECLARE_LIBBPF_OPTS(bpf_test_run_opts, opts,
 int err = bpf_prog_test_run_opts(prog_fd, &opts);
 ```
 
-### Trace Schedulers (WIP)
+### Tracing Schedulers
 
-To trace schedulers with low overheads, we use custom ftrace kernel tracepoints defined in `trace`. Standard scheduler use does not require a kernel module.
+TODO: replace ringbuffer system
 
-Build the optional trace module against the configured, built kernel you will run:
+#### General Debugging
+
+For general scheduler debugging without needing a kernel module, use the native `bpf_printk()` macro. Its output is emitted through ftrace as `bpf_trace:bpf_trace_printk` and can be read from `/sys/kernel/tracing/trace_pipe`.
+
+#### Structured Scheduler Tracepoints
+
+To trace BPF schedulers with low overhead, we use custom ftrace kernel tracepoints defined in `scheds/trace`, which requires a kernel module to work. Without the kernel module loaded, trace emissions will become no-ops at scheduler load-time. This kernel module is used to add custom kernel tracepoints, since forwarding tracepoints to userspace would add overhead and complexity.
+
+Build and load the kernel module as follows:
 
 ```sh
 make -C scheds trace-module KDIR=/path/to/kernel/build
 sudo insmod scheds/trace/scxtp.ko
 ```
 
-The `trace/` BPF API skips event emission when the module is unavailable at scheduler load time. Load the module before loading the scheduler to enable this tracing; loading the module later requires reloading the scheduler. Existing ringbuffer tracing is unchanged.
-
 At the top of `scheds/trace/helpers.h`, various compilation flags are set. These enable specific tracing behavior if set to 1 (disabled if 0). They can also be defined before including `trace/events.bpf.h`.
 
-`SCXTP_TRACING`: This flag enables tracing; no ftrace events will be emitted without this set. By default, low-frequency events record cgroup property changes, sub-scheduler attachment and detachment, and task creation and exit. Combine these with generic scheduling events such as `sched_switch`, `sched_wakeup`, and `sched_wakeup_new` to check scheduler policy behavior, with initial priorities, affinity, and hierarchy recorded.
+`SCXTP_TRACING`: This flag enables the custom scheduler tracepoints. By default, low-frequency events record cgroup property changes, sub-scheduler attachment and detachment, and task creation and exit. Combine these with generic scheduling events such as `sched_switch`, `sched_wakeup`, and `sched_wakeup_new` to check scheduler policy behavior, with initial priorities, affinity, and hierarchy recorded.
 
 `SCXTP_HOTPATH_TRACING`: When combined with `SCXTP_TRACING`, hotpath events are emitted. These record task enqueue, CPU selection, and execution transitions. These are intended to replace generic scheduling events so that the captured trace is smaller, with the tradeoff of not capturing external scheduling events. Set `SCXTP_HOTPATH_TRACING` to 1 to enable them.
-
-`SCXTP_BACKTRACE`: This enables the use of callstack dumps (up to current scx op) in the scheduler for easier debugging, and is enabled indepdendent of `SCXTP_TRACING`. The scheduler must implement `SCXTP_FUNC_ENTRY(args...)` and `SCXTP_FUNC_EXIT()` on all function entry/exit locations, which are tracked via per-cpu bpf maps. `SCXTP_BACKTRACE_DUMP()` and `SCXTP_BACKTRACE_DUMP_IF()` are used to dump the callstack via `bpf_printk`, which can be read via `/sys/kernel/debug/tracing/trace_pipe`. As this has significant overheads, it should only be enabled for debugging. For generic scheduler debugging, `bpf_printk()` is usually sufficient if used sparingly.
-
-Note: Only use for functions that are non-reentrant, non-sleeping, since assumes each CPU runs 1 op at a time.
-
-The instrumented stack uses a per-CPU BPF map scoped to one op. Call `SCXTP_BACKTRACE_RESET()` at op entry, then `SCXTP_FUNC_ENTRY("arg=%d", arg)` in each instrumented function and `SCXTP_FUNC_EXIT()` before every return. `SCXTP_FUNC_ENTRY()` also works without arguments. Entry captures the function name and formatted argument values; dumps print the active frames from innermost to outermost. The defaults are 16 frames and 128 bytes per frame, configurable with `SCXTP_BACKTRACE_MAX_DEPTH` and `SCXTP_BACKTRACE_FRAME_SIZE`. Dumps report omitted frames, truncated text, and unmatched exits. When disabled, the map and helpers are omitted, and macro arguments are not evaluated.
-
-This per-CPU stack assumes a non-sleeping, non-reentrant op that remains on the same CPU until exit. Sleepable or nested ops can overwrite another op's frames and must not use this shared stack. Scheduler instrumentation still needs to be added at the desired call sites.
 
 For integration with babeltrace2, use an ftrace to CTF converter such as https://github.com/siemens/bt2-ftrace-to-ctf.
 

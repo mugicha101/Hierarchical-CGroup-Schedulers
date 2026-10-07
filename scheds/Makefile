@@ -1,3 +1,13 @@
+ifneq ($(KERNELRELEASE),)
+
+# invoked by kernel build system
+# build trace kmod
+
+obj-m += trace/scxtp.o
+ccflags-y += -I$(src)/trace
+
+else
+
 TARGETS := scx_jlfp scx_gedf
 
 BUILD := build
@@ -31,6 +41,11 @@ DEPS := $(addprefix $(BUILD)/,$(addsuffix .d,$(TARGETS))) \
 
 all: $(BINARIES)
 
+KDIR ?= /lib/modules/$(shell uname -r)/build
+
+trace-module:
+	$(MAKE) -C $(KDIR) M=$(CURDIR) modules
+
 $(BUILD):
 	mkdir -p $@
 
@@ -51,4 +66,6 @@ $(BUILD)/%: %.c $(BUILD)/%.bpf.skel.h
 clean:
 	rm -rf $(BUILD)
 
-.PHONY: all clean
+.PHONY: all clean trace-module
+
+endif
