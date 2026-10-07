@@ -35,11 +35,13 @@ BPF_CFLAGS := -O2 -g \
 LDLIBS := -lbpf -lelf -lz -lpthread
 
 BINARIES := $(addprefix $(BUILD)/,$(TARGETS))
+TRACE_CHECK := $(BUILD)/check_tracing
 
 DEPS := $(addprefix $(BUILD)/,$(addsuffix .d,$(TARGETS))) \
-	$(addprefix $(BUILD)/,$(addsuffix .bpf.d,$(TARGETS)))
+	$(addprefix $(BUILD)/,$(addsuffix .bpf.d,$(TARGETS))) \
+	$(TRACE_CHECK).d
 
-all: $(BINARIES)
+all: $(BINARIES) $(TRACE_CHECK)
 
 KDIR ?= /lib/modules/$(shell uname -r)/build
 
@@ -59,6 +61,9 @@ $(BUILD)/%.bpf.skel.h: $(BUILD)/%.bpf.o
 	$(BPFTOOL) gen skeleton $< name $* > $@
 
 $(BUILD)/%: %.c $(BUILD)/%.bpf.skel.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDLIBS)
+
+$(TRACE_CHECK): trace/check_tracing.c $(addprefix $(BUILD)/,$(addsuffix .bpf.skel.h,$(TARGETS)))
 	$(CC) $(CFLAGS) $< -o $@ $(LDLIBS)
 
 -include $(DEPS)
