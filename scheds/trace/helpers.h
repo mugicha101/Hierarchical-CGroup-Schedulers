@@ -17,17 +17,20 @@
 #define SCXTP_HOTPATH_TRACING 0
 #endif
 
+// set per scheduler before BPF load (disabled by default)
+const volatile bool scxtp_enabled = false;
+
 #define SCXTP_DECLARE_KFUNC(NAME) \
   extern void scxtp_emit_##NAME(__u64 sched_cgrp_id, \
                                 const struct scxtp_event_##NAME *event) __ksym __weak;
 
 #if SCXTP_TRACING
 
-// skip payload preparation when the optional module was absent at load time
+// skip payload preparation when disabled or the optional module was absent at load time
 // initialize the full payload, including padding, before calling the kfunc
 #define SCXTP_EMIT(NAME, SCHED_CGRP_ID, ...) \
 do { \
-  if (bpf_ksym_exists(scxtp_emit_##NAME)) { \
+  if (scxtp_enabled && bpf_ksym_exists(scxtp_emit_##NAME)) { \
     struct scxtp_event_##NAME scxtp_event = {}; \
     struct scxtp_event_##NAME *e = &scxtp_event; \
     __VA_ARGS__ \

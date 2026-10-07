@@ -57,7 +57,7 @@ struct base_cli_opts {
 	uint32_t max_tasks;
 	const char *cgroup_path;
 	uint32_t cgroup_id;
-	const char *trace_path;
+	bool trace;
 	const char *stats_path;
 };
 
@@ -65,7 +65,7 @@ static inline void base_init_opts(struct base_cli_opts *opts) {
   opts->verbose = false;
   opts->cgroup_path = NULL;
   opts->cgroup_id = 0;
-  opts->trace_path = NULL;
+  opts->trace = false;
   opts->stats_path = NULL;
   opts->max_shard_size = 8;
   opts->max_tasks = 16384;
@@ -94,7 +94,7 @@ static inline int base_parse_opt(struct base_cli_opts *opts, int opt, const char
       opts->cgroup_id = st.st_ino;
       return 0;
     case 't':
-      opts->trace_path = arg;
+      opts->trace = true;
       return 0;
     case 's':
       opts->stats_path = arg;

@@ -66,7 +66,7 @@ class Scheduler:
   def __init__(self, config: Dict[str, Any]):
     self.policy = config.get("policy", None)
     self.cgroup = config.get("cgroup", None)
-    self.trace_path = config.get("trace_path", None)
+    self.trace = config.get("trace", False)
     self.process: subprocess.Popen = None
     self.attached = False # set to true once monitor reads ack_output
 
@@ -92,10 +92,6 @@ class Scheduler:
     if self.is_running():
       raise ValueError(f"Scheduler for cgroup {cgname(self.cgroup)} is already running.")
 
-    if self.trace_path:
-      dir_path = Path(self.trace_path).parent
-      dir_path.mkdir(parents=True, exist_ok=True)
-
     self.popen(scx_build_path)
     if not self.is_running():
       raise RuntimeError(f"Failed to start scheduler for cgroup {cgname(self.cgroup)}")
@@ -119,10 +115,10 @@ class Scheduler:
 
   def status(self):
     s = f"{self.policy} [{'ON' if self.is_attached() else 'OFF'}]"
-    if self.trace_path is not None:
-      s += f" [TRACE: {self.trace_path}]"
+    if self.trace:
+      s += " [TRACE EMISSIONS ENABLED]"
     else:
-      s += " [NO TRACE]"
+      s += " [TRACE EMISSIONS DISABLED]"
     return s
 
 class ScxScheduler(Scheduler):
@@ -132,8 +128,8 @@ class ScxScheduler(Scheduler):
     cmd = [bin_path]
     if self.cgroup:
       cmd += ["-c", self.cgroup]
-    if self.trace_path:
-      cmd += ["-t", self.trace_path]
+    if self.trace:
+      cmd += ["-t"]
     self.process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
 
   def ack_output(self):
@@ -707,18 +703,17 @@ class SchedManager(cmd.Cmd):
     )
     parser.add_argument("policy", help=f"Type of scheduler to add ({', '.join(POLICIES.keys())}) or none to create a blank cgroup.")
     parser.add_argument("cgroup_path", help="Path to the cgroup relative to the root cgroup (default is root).", nargs="?", default="")
-    parser.add_argument("-t", "--trace_dir", help="Directory to write scheduler trace output to (default is no tracing).", default=None)
+    parser.add_argument("-t", "--trace", help="Enable custom ftrace event emissions (disabled by default).", action="store_true")
     parser.add_argument("-f", "--force", action="store_true", help="If cgroup already exists, overwrite it.")
     args = self.parse_args(parser, arg)
     if args is None:
       return
     
     config = {
-      "policy": args.policy
+      "policy": args.policy,
+      "trace": args.trace
     }
     cgroup_path = Path(args.cgroup_path)
-    if args.trace_dir is not None:
-      config["trace_path"] = str((Path(args.trace_dir) / ("trace_" + "__".join(cgroup_path.parts))).with_suffix(".trace"))
     self.load_configs([(config, Path())], basepath=cgroup_path, force=args.force)
 
   def complete_attach(self, text, line, begidx, endidx):
@@ -779,22 +774,10 @@ class SchedManager(cmd.Cmd):
       i += 1
       cgroup_path = rel_path / config.get("cgroup", "")
       cgroup = self.add_cgroup(cgroup_path, create=False)
-      trace = config.get("trace", False)
-
-      # add trace path
-      trace_dir = None
-      if "trace_dir" in config:
-        trace_dir = Path(config["trace_dir"]).expanduser().resolve(strict=False)
-      if "trace_path" in config:
-        del config["trace_path"]
-      if trace and trace_dir is not None:
-        config["trace_path"] = str((Path(trace_dir) / ("trace_" + "__".join(cgroup_path.parts))).with_suffix(".trace"))
       
       # add subs
       subs = config.get("subs", {})
       for name, sub_config in subs.items():
-        if trace_dir is not None and "trace_dir" not in sub_config:
-          sub_config["trace_dir"] = str(trace_dir)
         configs.append((sub_config, cgroup_path / name))
 
     # load configs

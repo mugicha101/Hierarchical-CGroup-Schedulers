@@ -45,7 +45,7 @@ const char help_fmt[] =
 "  -T, --max-tasks N          Sets the maximum number of tasks supported by the scheduler to N (default: 16384, must be at least the tasks in the scheduler's cgroup including non-scx tasks)"
 "\n"
 "Diagnostics:\n"
-"  -t, --trace PATH           Reserved trace output path (currently unused)\n"
+"  -t, --trace                Enable custom ftrace event emissions (disabled by default)\n"
 "  -s, --stats PATH           Output JSON-formatted latency stats to PATH when scheduler exits (discarded if not provided)\n"
 ;
 
@@ -80,7 +80,7 @@ int main(int argc, char **argv)
     { "slice-length", required_argument, NULL, 'l' },
     { "max-shard-size", required_argument, NULL, 'S' },
     { "max-tasks", required_argument, NULL, 'T' },
-    { "trace", required_argument, NULL, 't' },
+    { "trace", no_argument, NULL, 't' },
     { "stats", required_argument, NULL, 's' },
     { "help", no_argument, NULL, 'h' },
     { NULL, 0, NULL, 0 },
@@ -94,7 +94,7 @@ int main(int argc, char **argv)
   signal(SIGTERM, sigint_handler);
 
   // parse arguments
-  while ((opt = getopt_long(argc, argv, "c:vgl:S:T:t:s:h", long_opts, NULL)) != -1) {
+  while ((opt = getopt_long(argc, argv, "c:vgl:S:T:ts:h", long_opts, NULL)) != -1) {
     int err = jlfp_parse_opt(&cli_opts, opt, optarg);
     if (err == 0) continue;
 
@@ -133,6 +133,7 @@ restart:
     goto cleanup;
   }
   SCX_ENUM_INIT(skel);
+  skel->rodata->scxtp_enabled = cli_opts.base.trace;
 
   // set struct_ops fields
   if (cli_opts.base.cgroup_id) {

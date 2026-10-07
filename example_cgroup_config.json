@@ -1,5 +1,4 @@
 {
-  "trace_dir": "/tmp/sched_ext/traces",
   "policy": "scx_jlfp",
   "trace": false,
   "subs": {
