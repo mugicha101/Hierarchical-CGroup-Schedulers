@@ -15,6 +15,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 static inline uint32_t parse_u32(const char *str, bool *err) {
   char *endptr;
@@ -102,6 +103,33 @@ static inline int base_parse_opt(struct base_cli_opts *opts, int opt, const char
     default:
       return -1;
   }
+}
+
+#define base_report_tracing(opts, skel) \
+  base_report_tracing_impl((opts), \
+    (skel)->rodata->scxtp_lowfreq_compiled, \
+    (skel)->rodata->scxtp_hotpath_compiled)
+
+static inline void base_report_tracing_impl(const struct base_cli_opts *opts,
+                                          bool lowfreq_compiled, bool hotpath_compiled) {
+  if (!opts->trace) {
+    fprintf(stdout, "Tracing Disabled\n");
+    return;
+  }
+
+  bool module_loaded = access("/sys/module/scxtp", F_OK) == 0;
+
+  if (module_loaded && lowfreq_compiled) {
+    fprintf(stdout, "Tracing Enabled: %s events\n", hotpath_compiled ? "all" : "non-hotpath");
+  } else {
+    fprintf(stdout, "Tracing Disabled: -t/--trace specified but scxtp kernel module not loaded or compiled without tracing\n");
+  }
+
+  fprintf(stdout, "Tracing Compilation Flags: SCXTP_TRACING=%d, SCXTP_HOTPATH_TRACING=%d\n",
+          lowfreq_compiled, hotpath_compiled);
+
+  fprintf(stdout, "Tracing Loadtime Flags: -t/--trace=%d, scxtp kernel module loaded=%d\n",
+          opts->trace, module_loaded);
 }
 
 static inline void base_apply_opts(struct base_cli_opts *opts, struct base_arena *a) {

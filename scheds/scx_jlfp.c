@@ -142,6 +142,7 @@ restart:
   skel->struct_ops.jlfp_ops->cid_shard_size = cli_opts.base.max_shard_size;
   
   // load scheduler
+  base_report_tracing(&cli_opts.base, skel);
   SCX_OPS_LOAD(skel, jlfp_ops, scx_jlfp, uei);
   aa = &skel->arena->aa;
   jlfp_apply_opts(&cli_opts, aa);

@@ -17,6 +17,10 @@
 #define SCXTP_HOTPATH_TRACING 0
 #endif
 
+// expose the BPF build settings to the userspace loader
+const bool scxtp_lowfreq_compiled = SCXTP_TRACING;
+const bool scxtp_hotpath_compiled = SCXTP_HOTPATH_TRACING;
+
 // set per scheduler before BPF load (disabled by default)
 const volatile bool scxtp_enabled = false;
 
