@@ -1,4 +1,4 @@
-// trace events + latency stats
+// BPF ringbuffer trace events + latency stats
 
 // without HOTPATH_TRACING, only captures low-frequency events (i.e. not every enqueue/dispatch)
 // rest can be captured through switch events, latency stats, tracebox, and scx_tracer (if can get working)
@@ -11,10 +11,10 @@
 // func events trigger too often and are either all on or off
 // instead, track a stack and let the scheduler emit the entire stack where needed for debugging
 
-#ifndef __TRACE_EVENTS_H
-  #define __TRACE_EVENTS_H
+#ifndef __DIAGNOSTICS_H
+  #define __DIAGNOSTICS_H
 
-  #define TRACING 0
+  #define TRACING 1
   #define HOTPATH_TRACING 0
   #define SCX_TRACER 0
   #define TRACE_FUNCS 0
@@ -445,52 +445,6 @@
       lctx->start_time += bpf_ktime_get_ns() - lctx->pause_start_time;
     }
     
-  #endif
-
-  // HACK FOR RESOLVING LINKER ISSUES (some macros missing)
-
-  #ifdef __BPF__
-
-    #if SCX_KICK_IDLE == 0
-    #undef SCX_KICK_IDLE
-    #define SCX_KICK_IDLE 0b01
-    #endif
-
-    #if SCX_KICK_PREEMPT == 0
-    #undef SCX_KICK_PREEMPT
-    #define SCX_KICK_PREEMPT 0b10
-    #endif
-
-    #if SCX_SLICE_INF == 0
-    #undef SCX_SLICE_INF
-    #define SCX_SLICE_INF ~0ULL
-    #endif
-
-    #if SCX_DSQ_LOCAL == 0
-    #undef SCX_DSQ_LOCAL
-    #define SCX_DSQ_LOCAL 9223372036854775810ULL
-    #endif
-
-    #if SCX_DSQ_LOCAL_ON == 0
-    #undef SCX_DSQ_LOCAL_ON
-    #define SCX_DSQ_LOCAL_ON 13835058055282163712ULL
-    #endif
-
-    #if SCX_ENQ_WAKEUP == 0
-    #undef SCX_ENQ_WAKEUP
-    #define SCX_ENQ_WAKEUP 1ULL
-    #endif
-
-    #if SCX_ENQ_LAST == 0
-    #undef SCX_ENQ_LAST
-    #define SCX_ENQ_LAST 2199023255552ULL
-    #endif
-
-    #if SCX_TASK_QUEUED == 0
-    #undef SCX_TASK_QUEUED
-    #define SCX_TASK_QUEUED 1
-    #endif
-
   #endif
 
 #endif

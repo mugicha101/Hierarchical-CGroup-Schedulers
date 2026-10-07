@@ -9,7 +9,7 @@
 #error "This file must be included from scx_base.h"
 #endif
 
-#include "trace_events.h"
+#include "diagnostics.h"
 CREATE_TRACE_BUFF();
 
 _Static_assert(BASE_MAX_CPUS >= NR_CPUS, "BASE_MAX_CPUS must be >= NR_CPUS");

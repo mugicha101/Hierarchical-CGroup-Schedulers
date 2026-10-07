@@ -8,7 +8,7 @@
 #include <scx/bpf_arena_common.h>
 #endif
 
-#include "trace_events.h"
+#include "diagnostics.h"
 #include "scx_base.h"
 
 // weight tuple consists of 2 64 bit halves

@@ -153,6 +153,7 @@ restart:
     fprintf(stderr, "Error: failed to open skel\n");
     goto cleanup;
   }
+  SCX_ENUM_INIT(skel);
 
   // set struct_ops fields
   if (cli_opts.base.cgroup_id) {

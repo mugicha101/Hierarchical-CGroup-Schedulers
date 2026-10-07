@@ -2,7 +2,7 @@
 
 #include "bpf/bpf_helpers.h"
 #include "scx/enums.bpf.h"
-#include "trace_events.h"
+#include "diagnostics.h"
 #include "scx_jlfp.h"
 
 char _license[] SEC("license") = "GPL";
