@@ -122,6 +122,10 @@ class Scheduler:
     return s
 
 class ScxScheduler(Scheduler):
+  def __init__(self, config):
+    super().__init__(config)
+    self.max_shard_size = config.get("max_shard_size", None)
+
   def popen(self, scx_build_path):
     bin_path = str(Path(scx_build_path) / self.binary)
     check_sched_capabilities(bin_path)
@@ -130,6 +134,8 @@ class ScxScheduler(Scheduler):
       cmd += ["-c", self.cgroup]
     if self.trace:
       cmd += ["-t"]
+    if self.max_shard_size is not None:
+      cmd += ["-S", str(self.max_shard_size)]
     self.process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
 
   def ack_output(self):
