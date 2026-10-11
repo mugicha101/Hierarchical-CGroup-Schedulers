@@ -16,6 +16,7 @@ char _license[] SEC("license") = "GPL";
 UEI_DEFINE(uei);
 
 struct jlfp_arena __arena_global aa;
+bool jlfp_sched_switch_ready;
 
 // configured task weights, shared through the pinned map across JLFP instances
 struct {
@@ -28,11 +29,17 @@ struct {
 
 s32 BPF_STRUCT_OPS_SLEEPABLE(jlfp_init)
 {
-  return jlfp_init_core(&aa);
+  s32 err = jlfp_init_core(&aa);
+  if (!err) {
+    smp_wmb();
+    WRITE_ONCE(jlfp_sched_switch_ready, true);
+  }
+  return err;
 }
 
 void BPF_STRUCT_OPS(jlfp_exit, struct scx_exit_info *ei)
 {
+  WRITE_ONCE(jlfp_sched_switch_ready, false);
   SCXTP_EMIT(exit, aa.base.cgroup_id,
     e->cgrp_id = aa.base.cgroup_id;
   );
@@ -263,6 +270,16 @@ void BPF_STRUCT_OPS(jlfp_tick, struct task_struct *p) {
   u32 cid = scx_bpf_this_cid();
   lstat_start(&lctx);
   lstat_record(&lctx, &aa.stats[cid].no_op);
+}
+
+// based on scx_pair
+// allows cid_form schedulers to detect when a cpu is used for higher priority work
+// this replaces ops.cpu_acquire and ops.cpu_release which are deprecated in sched_ext_ops and unusable in cid_form schedulers
+SEC("tp_btf/sched_switch")
+int BPF_PROG(on_switch, bool preempt, struct task_struct *prev, struct task_struct *next, unsigned int prev_state)
+{
+  jlfp_sched_switch_core(&aa, preempt, prev, next, prev_state);
+  return 0;
 }
 
 // ops

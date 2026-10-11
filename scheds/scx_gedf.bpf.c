@@ -15,14 +15,21 @@ char _license[] SEC("license") = "GPL";
 UEI_DEFINE(uei);
 
 struct gedf_arena __arena_global aa;
+bool jlfp_sched_switch_ready;
 
 s32 BPF_STRUCT_OPS_SLEEPABLE(gedf_init)
 {
-  return jlfp_init_core(&aa.jlfp);
+  s32 err = jlfp_init_core(&aa.jlfp);
+  if (!err) {
+    smp_wmb();
+    WRITE_ONCE(jlfp_sched_switch_ready, true);
+  }
+  return err;
 }
 
 void BPF_STRUCT_OPS(gedf_exit, struct scx_exit_info *ei)
 {
+  WRITE_ONCE(jlfp_sched_switch_ready, false);
   SCXTP_EMIT(exit, aa.jlfp.base.cgroup_id,
     e->cgrp_id = aa.jlfp.base.cgroup_id;
   );
@@ -229,6 +236,16 @@ bool BPF_STRUCT_OPS(gedf_yield, struct task_struct *from, struct task_struct *to
 
   scx_bpf_task_set_slice(from, 0);
   return false;
+}
+
+// based on scx_pair
+// allows cid_form schedulers to detect when a cpu is used for higher priority work
+// this replaces ops.cpu_acquire and ops.cpu_release which are deprecated in sched_ext_ops and unusable in cid_form schedulers
+SEC("tp_btf/sched_switch")
+int BPF_PROG(on_switch, bool preempt, struct task_struct *prev, struct task_struct *next, unsigned int prev_state)
+{
+  jlfp_sched_switch_core(&aa.jlfp, preempt, prev, next, prev_state);
+  return 0;
 }
 
 // ops
