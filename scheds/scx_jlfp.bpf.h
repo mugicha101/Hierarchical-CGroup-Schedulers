@@ -436,7 +436,7 @@ static __always_inline s32 jlfp_sub_attach_core(struct jlfp_arena __arena *a, st
   // debug output cmask
   // bpf_printk("[INFO] [JLFP] [SUB_ATTACH] cgroup=%llu weight=%llu cmask=%016llx", sub_cgroup_id, sub->weight, cmask_to_u64(&a->base.self_cids.mask));
 
-  scx_bpf_sub_grant(sub_cgroup_id, SCX_CAP_ENQ_IMMED | SCX_CAP_ENQ | SCX_CAP_PREEMPT, (void *)(long)&a->base.self_cids.mask, NULL);
+  scx_bpf_sub_grant(sub_cgroup_id, SCX_CAP_ENQ_IMMED | SCX_CAP_ENQ | SCX_CAP_PREEMPT, &a->base.self_cids.mask, NULL);
 
   lstat_record(&lctx, &a->stats[cid].sub_attach);
   return 0;

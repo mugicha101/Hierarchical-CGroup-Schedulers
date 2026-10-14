@@ -1,8 +1,8 @@
 #!/bin/bash
 set -euo pipefail
 
-LINUX_REPO=https://git.kernel.org/pub/scm/linux/kernel/git/tj/sched_ext.git
-LINUX_REF="e158e309cd90249a90cc84e6d29e46a3d5551b7b"
+LINUX_REPO=https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git
+LINUX_REF="v7.3-rc7"
 
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT

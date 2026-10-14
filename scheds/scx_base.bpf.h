@@ -149,7 +149,7 @@ static __always_inline void root_init() {
   u32 no_topo_node = BASE_MAX_CPUS;
   bpf_for(cid, 0, nr_cids) {
     struct scx_cid_topo t = {};
-    scx_bpf_cid_topo(cid, &t);
+    scx_bpf_cid_topo(cid, &t, sizeof(t));
     bpf_printk("[INFO] [JLFP] [INIT] core_cid=%u core_idx=%d llc_cid=%d llc_idx=%d node_cid=%d node_idx=%d shard_cid=%d shard_idx=%d",
       t.core_cid,
       t.core_idx,
