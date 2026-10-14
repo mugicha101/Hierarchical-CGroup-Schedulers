@@ -15,6 +15,7 @@ BUILD := build
 CC := gcc
 CLANG := clang
 BPFTOOL := bpftool
+SCXTP_HOTPATH_TRACING ?= 0
 
 ARCH := x86
 
@@ -27,6 +28,7 @@ BPF_CFLAGS := -O2 -g \
 	-MMD -MP \
 	-target bpf \
 	-D__TARGET_ARCH_$(ARCH) \
+	-DSCXTP_HOTPATH_TRACING=$(SCXTP_HOTPATH_TRACING) \
 	-mcpu=v3 \
 	-Iinclude \
 	-I$(BUILD) \

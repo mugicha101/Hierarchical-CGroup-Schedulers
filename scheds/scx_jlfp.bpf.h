@@ -28,6 +28,9 @@ static __always_inline bool jlfp_task_is_nmig(struct task_struct *p) {
   return is_migration_disabled(p) || p->nr_cpus_allowed == 1;
 }
 
+// running-weight metadata; min_effective uses misc bits for its selected cid
+#define JLFP_RT_IDLE_ORIGIN ((weight_tuple_t)1 << WT_MISC_SHIFT)
+
 static __always_inline u64 jlfp_nmig_dsq_id(struct jlfp_arena __arena *a, u32 cid) {
   return a->dsq_id + 1 + cid;
 }
@@ -47,7 +50,7 @@ static __always_inline bool init_jlfp_task_ctx(struct base_arena __arena *a, str
 }
 
 // cpu selection
-// first try prev cid as idle, including the per-cpu kthread wakeup shortcut
+// first try prev cid if idle or a per-cpu rt kthread entered from idle with no queued work
 // migration-disabled and single-cpu tasks then compare against prev cid's effective weight
 // other tasks search nearby idle cids allowed by both task affinity and self_cids
 // preemption searches fully allowed shards when global_search is enabled, with prev shard as fallback
@@ -67,13 +70,15 @@ static __always_inline bool init_jlfp_task_ctx(struct base_arena __arena *a, str
 // jlfp_pick_cid(A):
 //     clear A's old pending reservation on re-enqueue if A still owns it
 //     on the min-weight preemption path, reserve the target cid for A before releasing the lock
-//     idle and pinned/migration-disabled direct-dispatch paths do not create a reservation
+//     reserve the idle-origin kthread handoff before local insertion
+//     other idle and pinned/migration-disabled direct-dispatch paths do not create a reservation
 // running(A):
 //     set running_weight[cid] to A's weight
 //     clear pending weight and owner only if A owns the reservation
 //     reset A.pending_cid to NR_CPUS
 // stopping(A):
-//     clear running_weight[cid] and refresh the shard minimum
+//     retain A's weight when preempted with slice remaining
+//     clear blocked or exhausted A's weight and refresh the shard minimum
 //     leave pending reservations unchanged, even when A remains runnable
 
 #define JLFP_DEBUG 1
@@ -89,6 +94,15 @@ static __always_inline bool init_jlfp_task_ctx(struct base_arena __arena *a, str
 #ifndef SCHED_RR
 #define SCHED_RR 2
 #endif
+
+static __always_inline bool jlfp_percpu_kthread(struct task_struct *p) {
+  return (BPF_CORE_READ(p, flags) & PF_KTHREAD) && BPF_CORE_READ(p, nr_cpus_allowed) == 1;
+}
+
+static __always_inline bool jlfp_percpu_rt_kthread(struct task_struct *p) {
+  u32 policy = BPF_CORE_READ(p, policy);
+  return (policy == SCHED_FIFO || policy == SCHED_RR) && jlfp_percpu_kthread(p);
+}
 
 // from qmap
 // max number of times to try idle claim
@@ -145,8 +159,8 @@ struct {
 
 static __always_inline weight_tuple_t sctx_get_effective_weight(struct shard_ctx *sctx, u32 shard_offset) {
   // may be stale if shard lock not acquired
-  weight_tuple_t running = sctx->cid_running_weight[shard_offset];
-  weight_tuple_t pending = sctx->cid_pending_weight[shard_offset];
+  weight_tuple_t running = WT_STRIP_MISC(sctx->cid_running_weight[shard_offset]);
+  weight_tuple_t pending = WT_STRIP_MISC(sctx->cid_pending_weight[shard_offset]);
   return running > pending ? running : pending;
 };
 
@@ -690,6 +704,11 @@ static void __always_inline jlfp_pick_cid(struct jlfp_arena __arena *a, struct t
     get_jlfp_task_ctx(tctx)->pending_cid = NR_CPUS;
   }
 
+  // exhausted running tasks must compete in dispatch rather than build a local fifo
+  if (!(enq_flags & SCX_ENQ_WAKEUP) && scx_bpf_task_running(p) && !BPF_CORE_READ(p, scx.slice)) {
+    goto dispatch_fail;
+  }
+
   // IDLE SEARCH
 
   // prev cid
@@ -700,13 +719,27 @@ static void __always_inline jlfp_pick_cid(struct jlfp_arena __arena *a, struct t
       goto dispatch;
     }
 
-    // EDGE CASE: https://github.com/sched-ext/scx/pull/1094/commits/7d8b8e75812ab62454c734683de4944938b3edc2
-    // if per-cpu kthread woke up this task, then treat prev cpu as idle
-    // only trust the shortcut for wakeups, not re-enqueues
-    if ((enq_flags & SCX_ENQ_WAKEUP) && !(enq_flags & SCX_ENQ_REENQ) && prev_cid == scx_bpf_this_cid()) {
-      struct task_struct *curr = bpf_get_current_task_btf();
-      if ((curr->flags & PF_KTHREAD) && curr->nr_cpus_allowed == 1) {
-        goto dispatch;
+    if ((enq_flags & SCX_ENQ_WAKEUP) && !(enq_flags & SCX_ENQ_REENQ) &&
+        prev_cid == scx_bpf_this_cid() && jlfp_percpu_rt_kthread(bpf_get_current_task_btf())) {
+      u32 shard = a->base.topo.cids[prev_cid].shard_idx;
+      struct shard_ctx *sctx = bpf_map_lookup_elem(&shard_ctx_map, &shard);
+      u32 offset = prev_cid - a->base.topo.shards[shard].base_cid;
+      weight_tuple_t idle_rt = WT_STRIP_MISC(U128_MAX) | JLFP_RT_IDLE_ORIGIN;
+      if (sctx && offset < SCX_CID_SHARD_MAX_CPUS &&
+          READ_ONCE(sctx->cid_running_weight[offset]) == idle_rt &&
+          scx_bpf_dsq_nr_queued(SCX_DSQ_LOCAL_ON | prev_cid) == 0 &&
+          scx_bpf_dsq_nr_queued(jlfp_nmig_dsq_id(a, prev_cid)) == 0 &&
+          scx_bpf_dsq_nr_queued(a->dsq_id) == 0 && !bpf_res_spin_lock(&sctx->lock)) {
+        // consume the idle-origin handoff once; remote selections still see the rt weight
+        if (sctx->cid_running_weight[offset] == idle_rt &&
+            !sctx->cid_pending_weight[offset] && !sctx->cid_pending_owner[offset]) {
+          sctx->cid_running_weight[offset] = WT_STRIP_MISC(U128_MAX);
+          set_pending_weight_locked(a, prev_cid, shard, task_wt, sctx, p->scx.tid);
+          bpf_res_spin_unlock(&sctx->lock);
+          get_jlfp_task_ctx(tctx)->pending_cid = prev_cid;
+          goto dispatch;
+        }
+        bpf_res_spin_unlock(&sctx->lock);
       }
     }
   }
@@ -903,7 +936,7 @@ static __always_inline void jlfp_running_core(struct jlfp_arena __arena *a, stru
 
   // SHARD LOCK CS START
 
-  sctx->cid_running_weight[shard_offset] = wt;
+  sctx->cid_running_weight[shard_offset] = WT_STRIP_MISC(wt);
   if (sctx->cid_pending_owner[shard_offset] == p->scx.tid) {
     // only clear pending if this is the pending owner
     // case where its not owner: this task won the race to local dsq and pending owner got re-enqueued
@@ -918,6 +951,20 @@ static __always_inline void jlfp_running_core(struct jlfp_arena __arena *a, stru
   // SHARD LOCK CS END
 
   if (likely(tctx)) get_jlfp_task_ctx(tctx)->pending_cid = NR_CPUS;
+
+  // a higher task can enter the global queue after dispatch selected this task
+  if (!WT_IS_NMIG(wt) && scx_bpf_dsq_nr_queued(a->dsq_id) > 0) {
+    struct task_struct *next = scx_bpf_dsq_peek(a->dsq_id);
+    if (next) {
+      task_ctx_t *next_ctx = get_task_ctx(next);
+      if (next_ctx && WT_STRIP_MISC(get_jlfp_task_ctx(next_ctx)->weight) > WT_STRIP_MISC(wt) &&
+          cmask_test(cid, &next_ctx->cpus_allowed) &&
+          (!is_migration_disabled(next) || scx_bpf_task_cid(next) == cid)) {
+        scx_bpf_kick_cid(cid, SCX_KICK_PREEMPT);
+      }
+    }
+  }
+
   lstat_record(lctx, &a->stats[cid].running);
 
   SCXTP_EMIT_HOTPATH(running, a->base.cgroup_id,
@@ -935,6 +982,7 @@ static __always_inline void jlfp_stopping_core(struct jlfp_arena __arena *a, str
   lstat_start(&lctx);
 
   u32 cid = scx_bpf_this_cid();
+  bool retain_weight = runnable && BPF_CORE_READ(p, scx.slice);
 
   // update running weight only
   u32 shard = a->base.topo.cids[cid & (NR_CPUS - 1)].shard_idx;
@@ -954,7 +1002,10 @@ static __always_inline void jlfp_stopping_core(struct jlfp_arena __arena *a, str
 
   // SHARD LOCK CS START
 
-  set_running_weight_locked(a, cid, shard, 0, sctx);
+  // if slice remains, retain weight until running or sched_switch observes the replacement
+  // should only retain slice when preempted by higher priority class
+  // this prevents a gap of 0 weight when the hp class task runs
+  if (!retain_weight) set_running_weight_locked(a, cid, shard, 0, sctx);
   bpf_res_spin_unlock(&sctx->lock);
 
   // SHARD LOCK CS END
@@ -991,6 +1042,10 @@ static __always_inline void jlfp_sched_switch_core(struct jlfp_arena __arena *a,
   struct shard_ctx *sctx = bpf_map_lookup_elem(&shard_ctx_map, &shard);
   if (unlikely(!sctx)) return;
 
+  bool next_kthread = (policy == SCHED_FIFO || policy == SCHED_RR) && jlfp_percpu_kthread(next);
+  bool prev_idle = BPF_CORE_READ(prev, pid) == 0;
+  bool prev_kthread = next_kthread && jlfp_percpu_rt_kthread(prev);
+
   // misc bits hold the cached min cid rather than priority
   weight_tuple_t wt = (policy == SCHED_FIFO || policy == SCHED_RR) ? WT_STRIP_MISC(U128_MAX) : 0;
   if (unlikely(bpf_res_spin_lock(&sctx->lock))) {
@@ -1000,6 +1055,11 @@ static __always_inline void jlfp_sched_switch_core(struct jlfp_arena __arena *a,
 
   // SHARD LOCK CS START
 
+  // preserve idle origin only across per-cpu rt kthread switches
+  weight_tuple_t old_running = sctx->cid_running_weight[cid - base_cid];
+  if (next_kthread && (prev_idle || (prev_kthread && old_running == (WT_STRIP_MISC(U128_MAX) | JLFP_RT_IDLE_ORIGIN)))) {
+    wt |= JLFP_RT_IDLE_ORIGIN;
+  }
   set_running_weight_locked(a, cid, shard, wt, sctx);
   bpf_res_spin_unlock(&sctx->lock);
 
