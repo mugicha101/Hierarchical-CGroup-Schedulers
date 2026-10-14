@@ -295,10 +295,13 @@ class ExecModel:
 
 Event = namedtuple('Event', ['sched', 'time', 'cpu', 'event_type', 'details'])
 
-def parse_trace(messages):
+def parse_trace(messages, *, event_types=None):
   for message in messages:
     event = message.event
-    if not (event.name.startswith("scxtp:scxtp_") or event.name in
+    name = event.name
+    if event_types is not None and name not in event_types:
+      continue
+    if not (name.startswith("scxtp:scxtp_") or name in
             ("sched:sched_switch", "sched:sched_wakeup", "sched:sched_wakeup_new")):
       continue
     fields = {name: int(value) for name, value in event.payload_field.items() if name not in
@@ -306,7 +309,7 @@ def parse_trace(messages):
     yield Event(sched=fields.get("sched_cgrp_id"),
                 time=message.default_clock_snapshot.ns_from_origin,
                 cpu=int(event.packet.context_field["cpu_id"]),
-                event_type=event.name, details=fields)
+                event_type=name, details=fields)
 
 def main():
   if len(sys.argv) != 2:
