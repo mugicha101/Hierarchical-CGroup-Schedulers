@@ -9,6 +9,7 @@
 # - after parsing, cleanup_trace(path) or session.cleanup_trace() deletes capture files.
 
 from pathlib import Path
+from contextlib import contextmanager
 import bt2
 import json
 import os
@@ -19,6 +20,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import uuid
 import warnings
@@ -27,6 +29,30 @@ REPO_DIR = Path(__file__).resolve().parents[1]
 ROOT_OPS = Path("/sys/kernel/sched_ext/root/ops")
 CGROUP_ROOT = Path("/sys/fs/cgroup")
 TRACE_INSTANCES = Path("/sys/kernel/tracing/instances")
+
+@contextmanager
+def defer_trace_interrupts():
+  # raising from bt2 callbacks or destructors can leave native references invalid
+  interrupted = False
+  def interrupt(*_):
+    nonlocal interrupted
+    interrupted = True
+  def check_interrupt():
+    if interrupted:
+      raise KeyboardInterrupt
+
+  handlers = {}
+  try:
+    if threading.current_thread() is threading.main_thread():
+      for signum in (signal.SIGINT, signal.SIGTERM):
+        handler = signal.getsignal(signum)
+        signal.signal(signum, interrupt)
+        handlers[signum] = handler
+    yield check_interrupt
+    check_interrupt()
+  finally:
+    for signum, handler in handlers.items():
+      signal.signal(signum, handler)
 
 def _root_attached():
   try:
@@ -50,7 +76,7 @@ def cleanup_trace(trace_path):
 class TraceSession:
   # start scheduler manager
   def __init__(self, *, events=("scxtp:*", "bpf_trace:bpf_trace_printk"),
-               scx_build_path=None, timeout=30):
+               scx_build_path=None, timeout=30, monitor=False):
     self._manager = None
     self._trace = None
     self._trace_log = None
@@ -75,7 +101,7 @@ class TraceSession:
           stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
           bufsize=0, start_new_session=True)
       self._command("ack 1")
-      self._command("monitor 0")
+      self._command(f"monitor {int(monitor)}")
     except BaseException as error:
       self._close_after_error(error)
       raise
@@ -297,6 +323,11 @@ class TraceSession:
       self.close()
     except Exception as cleanup_error:
       error.add_note(str(cleanup_error))
+    if self.trace_path is not None:
+      try:
+        self.trace_path.with_name("scheduler.log").write_text("\n".join(self.manager_output) + "\n")
+      except OSError as log_error:
+        error.add_note(f"Failed to save scheduler output: {log_error}")
 
   def __enter__(self):
     return self
