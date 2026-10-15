@@ -340,21 +340,21 @@ static __always_inline void update_porder(struct jlfp_arena __arena *a, u32 cid,
       // in correct position, done
       break;
     }
-    
-    #if JLFP_DEBUG
-    bpf_for(i, 1, MAX_SUB_SCHEDS) {
-      if (unlikely(a->base.sub_scheds[cd->porder[i-1] & (MAX_SUB_SCHEDS - 1)].weight < a->base.sub_scheds[cd->porder[i] & (MAX_SUB_SCHEDS - 1)].weight)) {
-        u32 j;
-        bpf_printk("[ERROR] [JLFP] [UPDATE_PORDER] porder not sorted after update for cid %u", cid);
-        bpf_for(j, 0, MAX_SUB_SCHEDS) {
-          bpf_printk("[ERROR] [JLFP] [UPDATE_PORDER] porder[%u]=%u weight=%u", j, cd->porder[j], a->base.sub_scheds[cd->porder[j] & (MAX_SUB_SCHEDS - 1)].weight);
-        }
-        scx_bpf_error("Error in porder sorting");
-        break;
-      }
-    }
-    #endif
   }
+
+  #if JLFP_DEBUG
+  bpf_for(i, 1, MAX_SUB_SCHEDS) {
+    if (unlikely(a->base.sub_scheds[cd->porder[i-1] & (MAX_SUB_SCHEDS - 1)].weight < a->base.sub_scheds[cd->porder[i] & (MAX_SUB_SCHEDS - 1)].weight)) {
+      u32 j;
+      bpf_printk("[ERROR] [JLFP] [UPDATE_PORDER] porder not sorted after update for cid %u", cid);
+      bpf_for(j, 0, MAX_SUB_SCHEDS) {
+        bpf_printk("[ERROR] [JLFP] [UPDATE_PORDER] porder[%u]=%u weight=%u", j, cd->porder[j], a->base.sub_scheds[cd->porder[j] & (MAX_SUB_SCHEDS - 1)].weight);
+      }
+      scx_bpf_error("Error in porder sorting");
+      break;
+    }
+  }
+  #endif
 
   // write to global porder
   seqlock_update_start(&a->porder_lock);
