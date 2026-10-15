@@ -157,6 +157,8 @@ class CgroupManager:
     self.subs = {} # cgroup name -> CgroupManager
     self.sched = None # attached scheduler
     self.path = path
+    # only remove cgroups created by this manager
+    self.owned = False
 
   # add sub
   # returns sub cgroup manager
@@ -189,7 +191,9 @@ class CgroupManager:
   # create cgroup for self
   # if subtree, also creates cgroup for all in subtree
   def create(self, subtree=True):
-    self.path.mkdir(exist_ok=True)
+    if not self.path.exists():
+      self.path.mkdir()
+      self.owned = True
     with open(self.path / "cgroup.subtree_control", "w") as f:
       f.write("+cpu +cpuset")
     if subtree:
@@ -200,8 +204,6 @@ class CgroupManager:
   # if fails to delete, returns false
   # can fail if tasks still in cgroup
   def delete(self):
-    if not self.path.exists():
-      return True
     succ = True
     sub_names = list(self.subs.keys())
     for name in sub_names:
@@ -215,7 +217,7 @@ class CgroupManager:
     except Exception as e:
       print(f"ERROR: Failed to detach scheduler from cgroup {self.path}: {e}")
       succ = False
-    if succ and self.path != CGROUP_PATH:
+    if succ and self.owned and self.path.exists() and self.path != CGROUP_PATH:
       # move tasks to parent
       for pid in self.get_tasks(scx_only=False, is_process=True):
         try:
@@ -229,6 +231,7 @@ class CgroupManager:
       # delete cgroup
       try:
         self.path.rmdir()
+        self.owned = False
       except Exception as e:
         print(f"ERROR: Failed to delete cgroup {self.path}: {e}")
         traceback.print_exc()
@@ -339,7 +342,6 @@ class SchedManager(cmd.Cmd):
     delims = delims.replace('-', '')
     readline.set_completer_delims(delims)
     self.root_cgroup = CgroupManager(CGROUP_PATH)
-    self.root_cgroup.create(subtree=False)
     self.selector = selectors.DefaultSelector()
     self.print_monitor = True
     self.print_ack = False
@@ -377,16 +379,24 @@ class SchedManager(cmd.Cmd):
 
   # adds cgroup manager to hierarchy if doesn't exist
   # if create, also creates the cgroup(s) on the filesystem
-  def add_cgroup(self, path: Path, create=False) -> CgroupManager:
+  def add_cgroup(self, path: Path, create=False, created=None, existing=False) -> CgroupManager:
     path = self.validate_cgroup_path(path)
     cgroup = self.root_cgroup
+    if create:
+      cgroup.create(subtree=False)
     for part in path.parts:
       if part == '..' or part == '.':
         raise ValueError(f"Invalid cgroup path: {cgroup_path}")
       sub = cgroup.get_sub(part)
       if sub is None:
         sub = cgroup.add_sub(part)
-      if create:
+      if existing:
+        if not sub.path.is_dir():
+          raise FileNotFoundError(f"Cgroup {sub.path} does not exist.")
+        sub.owned = False
+      if create and (not sub.exists() or sub.owned):
+        if created is not None and not sub.exists():
+          created.append(sub)
         sub.create(subtree=False)
       cgroup = sub
     return cgroup
@@ -427,11 +437,30 @@ class SchedManager(cmd.Cmd):
       return None
 
   # helper to load list of (scheduler config, relative cgroup path)
-  def load_configs(self, configs, basepath: Path = Path(), force=False):
-    base_cgroup = self.add_cgroup(basepath)
+  def load_configs(self, configs, basepath: Path = Path(), force=False, existing=False):
+    if existing and force:
+      raise ValueError("--existing and --force cannot be used together")
+    basepath = self.validate_cgroup_path(basepath)
+    configs = [(dict(config), self.validate_cgroup_path(basepath / rel_path))
+               for config, rel_path in configs]
+    # check the entire hierarchy before attaching any schedulers
+    for config, path in configs:
+      if existing and not (CGROUP_PATH / path).is_dir():
+        raise FileNotFoundError(f"Cgroup {CGROUP_PATH / path} does not exist.")
+      if not existing and not force and path.parts and (CGROUP_PATH / path).exists():
+        raise ValueError(f"Cgroup {path} already exists. Use --force to overwrite.")
+      policy = config.get("policy")
+      if policy not in (None, "none") and policy not in POLICIES:
+        raise ValueError(f"Unsupported scheduler type: {policy}")
+      cgroup = self.get_cgroup(path)
+      if cgroup is not None and cgroup.sched is not None:
+        raise ValueError(f"Cgroup {CGROUP_PATH / path} already has a scheduler attached.")
+    base_cgroup = self.add_cgroup(basepath, existing=existing)
     success = False
+    attached = []
+    created = []
     try:
-      if not force:
+      if not force and not existing:
         if base_cgroup == self.root_cgroup:
           for sub in base_cgroup.subs.values():
             if sub.exists():
@@ -440,9 +469,9 @@ class SchedManager(cmd.Cmd):
           if base_cgroup.exists():
             raise ValueError(f"Cgroup {basepath} already exists. Use --force to overwrite.")
 
-      for config, rel_path in configs:
-        cgroup_path = basepath / rel_path
-        cgroup = self.add_cgroup(cgroup_path, create=True)
+      for config, cgroup_path in configs:
+        cgroup = self.add_cgroup(cgroup_path, create=not existing, created=created,
+                                 existing=existing)
         if cgroup.sched is not None:
           raise ValueError(f"Cgroup {cgroup_path} already has a scheduler attached.")
           
@@ -460,19 +489,21 @@ class SchedManager(cmd.Cmd):
           case _:
             raise ValueError(f"Unsupported scheduler type: {policy}")
         
-        weight = config.get("weight", None)
-        if weight is not None:
-          cgroup.set_weight(weight)
-        cpus = config.get("cpus", "")
-        if cgroup == self.root_cgroup:
-          if len(cpus) > 0:
-            raise ValueError(f"Cannot set cpus for root cgroup.")
-        else:
-          cgroup.set_cpus(cpus)
+        if not existing:
+          weight = config.get("weight", None)
+          if weight is not None:
+            cgroup.set_weight(weight)
+          cpus = config.get("cpus", "")
+          if cgroup == self.root_cgroup:
+            if len(cpus) > 0:
+              raise ValueError(f"Cannot set cpus for root cgroup.")
+          else:
+            cgroup.set_cpus(cpus)
         
         if sched is None:
           continue
         cgroup.attach_sched(sched)
+        attached.append(cgroup)
         sched.start(self.scx_build_path)
         os.set_blocking(sched.process.stdout.fileno(), False)
         self.selector.register(sched.process.stdout, selectors.EVENT_READ, data=sched)
@@ -484,7 +515,17 @@ class SchedManager(cmd.Cmd):
 
     finally:
       if not success:
-        base_cgroup.delete() # undo any created cgroups on failure
+        # leave cgroups and schedulers from earlier loads untouched
+        for cgroup in reversed(attached):
+          process = cgroup.sched.process
+          if process is not None:
+            try:
+              self.selector.unregister(process.stdout)
+            except KeyError:
+              pass
+          cgroup.detach_sched()
+        for cgroup in reversed(created):
+          cgroup.delete()
 
   def find_cgroup_completions(self, path: str):
     try:
@@ -710,7 +751,9 @@ class SchedManager(cmd.Cmd):
     parser.add_argument("policy", help=f"Type of scheduler to add ({', '.join(POLICIES.keys())}) or none to create a blank cgroup.")
     parser.add_argument("cgroup_path", help="Path to the cgroup relative to the root cgroup (default is root).", nargs="?", default="")
     parser.add_argument("-t", "--trace", help="Enable custom ftrace event emissions (disabled by default).", action="store_true")
-    parser.add_argument("-f", "--force", action="store_true", help="If cgroup already exists, overwrite it.")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("-f", "--force", action="store_true", help="If cgroup already exists, overwrite it.")
+    mode.add_argument("--existing", action="store_true", help="Require an existing cgroup; manage only its scheduler.")
     args = self.parse_args(parser, arg)
     if args is None:
       return
@@ -720,7 +763,8 @@ class SchedManager(cmd.Cmd):
       "trace": args.trace
     }
     cgroup_path = Path(args.cgroup_path)
-    self.load_configs([(config, Path())], basepath=cgroup_path, force=args.force)
+    self.load_configs([(config, Path())], basepath=cgroup_path, force=args.force,
+                      existing=args.existing)
 
   def complete_attach(self, text, line, begidx, endidx):
     args = shlex.split(line[:begidx])
@@ -757,7 +801,9 @@ class SchedManager(cmd.Cmd):
     )
     parser.add_argument("config_path", help="Path to the config JSON file")
     parser.add_argument("-r", "--relative-to", help="Load config relative to a specific cgroup path (default is root)", default="")
-    parser.add_argument("-f", "--force", action="store_true", help="If cgroups already exist, overwrite them.")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("-f", "--force", action="store_true", help="If cgroups already exist, overwrite them.")
+    mode.add_argument("--existing", action="store_true", help="Require existing cgroups; manage only their schedulers.")
     args = self.parse_args(parser, arg)
     if args is None:
       return
@@ -779,15 +825,13 @@ class SchedManager(cmd.Cmd):
       config, rel_path = configs[i]
       i += 1
       cgroup_path = rel_path / config.get("cgroup", "")
-      cgroup = self.add_cgroup(cgroup_path, create=False)
-      
       # add subs
       subs = config.get("subs", {})
       for name, sub_config in subs.items():
         configs.append((sub_config, cgroup_path / name))
 
     # load configs
-    self.load_configs(configs, basepath, force=args.force)
+    self.load_configs(configs, basepath, force=args.force, existing=args.existing)
 
   def complete_load_config(self, text, line, begidx, endidx):
     os.path.expanduser(text)
