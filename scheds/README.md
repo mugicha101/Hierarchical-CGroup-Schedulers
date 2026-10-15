@@ -6,7 +6,7 @@ Implementation of various sched_ext cgroup schedulers for Linux 7.3.
 
 ### Requirements
 
-- Linux kernel compatible with the one used in `scheds/setup.sh` (TODO: will be updated to 7.3 tag instead of a commit hash once 7.3 released)
+- Linux kernel compatible with the `v7.3-rc7` tag used in `scheds/setup.sh`
 - Git, make, GCC, bpftool, and clang-21
 - Development libs/headers for libbpf, libelf, and zlib
 - Kernel BTF at /sys/kernel/btf/vmlinux
@@ -86,33 +86,9 @@ Build schedulers with existing hotpath events enabled using `make -W scx_jlfp.bp
 
 JLFP/GEDF treat timer-occupied CPUs as unavailable through the switch observer. A same-core wakeup can bypass normal placement once when a per-CPU FIFO/RR kthread entered from idle, the local/global/per-CID queues are empty, and no preemption reservation exists. The observer preserves this idle origin only across qualifying kthread switches; the handoff consumes it and reserves the CPU before insertion. Other wakeups use normal priority selection. Queue counts are snapshots, so the shortcut retains the existing dispatch-race tradeoff. Running-weight metadata uses the reserved misc bits without changing the pinned map layout; rebuild JLFP and GEDF together before attaching a hierarchy.
 
-Workers preempted with slice remaining retain their cached CPU weight until the next execution state replaces it; exhausted running workers return to their priority DSQ instead of selecting another local placement. On starting migratable work, a nonempty global queue's head is checked for a higher eligible task and triggers preemption when needed. These checks reduce long dynamic inversions while retaining finite slices and the existing shard-lock model. Both tests save scheduler output in `scheduler.log` if setup or cleanup fails, including verifier diagnostics.
+Workers preempted with slice remaining retain their cached CPU weight until the next execution state replaces it; exhausted running workers return to their priority DSQ instead of selecting another local placement. On starting migratable work, a nonempty global queue's head is checked for a higher eligible task and triggers preemption when needed. These checks reduce long dynamic inversions while retaining finite slices and the existing shard-lock model.
 
 Rebuild schedulers after changing these flags. In `sched_manager`, use `attach scx_jlfp <cgroup_path> --trace` or set `"trace": true` for individual schedulers in a configuration file. This setting defaults to false and is not inherited by sub-schedulers. The emission flag does not control generic kernel events or `bpf_printk()` output.
-
-The JLFP test reports capture stages and offline analysis progress. From the repository root, use `python3 tester/run_jlfp_test.py --analyse-only tester/build/jlfp-test-<timestamp>` to analyse a saved capture without running workers again. The directory must contain `trace.dat` and `run.json`; this rewrites `analysis.log` and `results.json`. Saved captures containing placement diagnostics are still supported; those events are skipped by the inversion calculation.
-
-To test changing runnable priorities, run `sudo python3 tester/run_jlfp_dynamic_test.py`. By default, two weighted workers per allowed CPU share the full allowed CPU set, each consuming a 10 ms CPU budget per 20 ms period before sleeping. Releases are staggered across the period; preemption does not consume the CPU budget, and missed releases are skipped. Adjust `--runtime-ms`, `--period-ms`, `--tasks-per-cpu`, `--warmup`, and `--duration` to vary the load. The test uses native sleep/wakeup events to exclude blocked workers from priority comparisons and reports inversion time, longest inversion, and worker wakeup/block counts. Captures use `tester/build/jlfp-dynamic-test-<timestamp>` and save the period, budget, and phases in `run.json`; use `--analyse-only CAPTURE_DIR` to reanalyse them.
-
-The static, dynamic, wakeup, and latency test scripts default to all CPUs allowed by their inherited affinity and assume the environment is already configured to remove noise. They leave controller affinity and bandwidth server runtimes unchanged and do not create `other` or migrate background processes. Workers are still placed in the root cgroup for JLFP. The static and dynamic tests default to two workers per allowed CPU; wakeup and latency tests retain their explicit worker/thread counts. Wakeup and latency tests accept `--cpus` to override the worker CPU set without enabling isolation.
-
-Static, dynamic, and wakeup tests use the native busy-loop worker in `tester/work.c`; Python handles setup and trace analysis. They automatically build `tester/build/jlfp_worker` with `cc`, pthread support, and libbpf when missing or older than the source. Each worker is a separate C process that blocks until the controller installs affinity, weight, and SCHED_EXT policy. Periodic workloads use absolute monotonic sleeps, thread CPU-time budgets, staggered phases, and skipped missed releases. The original standalone pthread workload remains available through `tester/build.sh`; the latency harness already uses C cyclictest workers.
-
-Add `--isolate` to restrict workers to the last four allowed CPUs (the configured shard size) and set up cyclictest's `other` arrangement. Wakeup and latency `--cpus` overrides still apply. Isolation requires a CPU outside the worker set for the controller. The scripts create `/sys/fs/cgroup/other` with its CPU set limited to the non-worker CPUs, move root processes there before starting workers, and explicitly place workers in the root cgroup. PID 1, the controller, and kernel threads remain in root when already there; the controller runs on non-worker CPUs. Cleanup returns processes from `other` to root and removes the test's cgroup, including on failure or interruption. An existing `other` cgroup causes setup to fail rather than overwrite it. `cpu_isolation.json` and `run.json` record the CPU set and moved/skipped PIDs. Existing cgroup hierarchies and their CPU sets are left unchanged, so their tasks and per-CPU kernel threads can still contend with workers.
-
-With `--isolate`, the scripts temporarily disable the FAIR deadline server and SCX bandwidth server on the worker CPUs by setting their debugfs runtimes to 0. They save their original settings in `bandwidth_servers.json` and `run.json`, then restore the runtimes after scheduler detach, including on failure or interruption. Run the tests with sudo for BPF and ftrace; isolation also requires the `fair_server` and `ext_server` controls under `/sys/kernel/debug/sched`. Use `--isolate --keep-bandwidth-servers` for isolation with the original bandwidth settings.
-
-To measure idle-core wakeup migration, run `sudo python3 tester/run_jlfp_wakeup_test.py` from the repository root. By default, one migratable worker runs for a 50 us CPU budget every 1 ms across all allowed CPUs. Add `--isolate` for the isolated four-CPU comparison. The test matches native blocking, wakeup, and first-execution events, saves `wakeup-results.json`, and reports actual migration ratios and wake-to-run latency. It separately identifies local timer wakeups that followed an observed idle-to-timer transition. Use `--scx-build-path BUILD` to compare scheduler builds and `--analyse-only CAPTURE_DIR` to replay a capture. Opt-in isolation and bandwidth settings restore through the existing helpers.
-
-For cyclictest comparisons, first build a separate copy that preserves unpinned threads' inherited CPU affinity:
-
-```sh
-python3 tester/build_jlfp_cyclictest.py --output-dir tester/build/cyclictest-affinity
-sudo python3 tester/run_jlfp_latency_test.py --cyclictest tester/build/cyclictest-affinity/cyclictest --isolate --mode migratable --threads 1
-sudo python3 tester/run_jlfp_latency_test.py --cyclictest tester/build/cyclictest-affinity/cyclictest --isolate --mode pinned --threads 4
-```
-
-The builder leaves the original rt-tests checkout intact and saves its patch, build log, and hashes. The harness verifies the actual worker policy, affinity, and timer slack, saves cyclictest JSON/histograms and per-thread percentiles, and disables scheduler trace emissions. It gives SCHED_EXT workers 1 ns timer slack so inherited timer coalescing does not dominate the comparison; use `--timer-slack-ns 50000` to reproduce the usual inherited slack. It holds a temporary 0 us `/dev/cpu_dma_latency` request during the test, releasing it afterward; other power settings stay unchanged. Use `--cpu-dma-latency-us -1` for an untuned comparison, `--policy fifo` to measure ordinary RT latency while JLFP is attached, and `--scx-build-path BUILD` for alternate scheduler builds. Compare variants serially on the same CPUs with repeated runs; histograms use 1 us buckets and include startup. Existing cgroup workloads and hardware interrupts can still affect the tails.
 
 #### Capturing Ftrace Events
 
@@ -125,6 +101,10 @@ sudo trace-cmd record -e 'scxtp:*' -e 'bpf_trace:bpf_trace_printk' -o scheduler.
 Stop recording with Ctrl-C after the schedulers exit, then read the file with `trace-cmd report -i scheduler.dat`. Add generic kernel events such as `sched:sched_switch`, `sched:sched_wakeup`, and `sched:sched_wakeup_new` with additional `-e` options when needed.
 
 For integration with Babeltrace2, use an ftrace to CTF converter such as [bt2-ftrace-to-ctf](https://github.com/siemens/bt2-ftrace-to-ctf).
+
+## Testing
+
+See the [tester README](../tester/README.md) for JLFP and MC² inversion tests, CPU isolation, wakeup analysis, and cyclictest comparisons.
 
 ## Scheduling Policies
 
@@ -234,7 +214,7 @@ Cyclictest measures the delay between a timer's expected wakeup and the test thr
 
 To test JLFP/GEDF, run the measurement threads with `SCHED_EXT` inside the managed cgroup. These schedulers use `SCX_OPS_SWITCH_PARTIAL`, so threads using `SCHED_OTHER` or `SCHED_FIFO` do not exercise their scheduling policy. The [modified cyclictest](../cyclictest/modified_cyclictest.c) supports `--policy=ext`; the existing scripts in `cyclictest/` use it. Cyclictest reports microseconds by default, or nanoseconds with `-N`.
 
-Keep the workload, CPU affinity, and tracing settings consistent when comparing runs.
+Keep the workload, CPU affinity, and tracing settings consistent when comparing runs. See [cyclictest comparisons](../tester/README.md#cyclictest-comparisons) for the test harness commands.
 
 ## File structure
 
