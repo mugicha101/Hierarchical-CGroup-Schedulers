@@ -18,11 +18,13 @@ import time
 
 if __package__:
   from .run_jlfp_test import (SHARD_SIZE, controller_affinity, disabled_bandwidth_servers,
-                              isolated_root_tasks, report_progress, select_test_cpus)
+                              isolated_root_tasks, report_progress, select_test_cpus,
+                              existing_test_cgroup, cgroup_cpu_set, worker_cgroup, load_relative_config)
   from .trace_helpers import CGROUP_ROOT, REPO_DIR, TraceSession, defer_trace_interrupts
 else:
   from run_jlfp_test import (SHARD_SIZE, controller_affinity, disabled_bandwidth_servers,
-                            isolated_root_tasks, report_progress, select_test_cpus)
+                            isolated_root_tasks, report_progress, select_test_cpus,
+                            existing_test_cgroup, cgroup_cpu_set, worker_cgroup, load_relative_config)
   from trace_helpers import CGROUP_ROOT, REPO_DIR, TraceSession, defer_trace_interrupts
 
 
@@ -202,9 +204,12 @@ def check_thread_policies(process, count, cpus, mode, policy=7, timer_slack_ns=N
 
 
 def run_cyclic(command, output, cpus, duration, count, mode="migratable", policy=7,
-               timer_slack_ns=1):
+               timer_slack_ns=1, *, cgroup=None):
   launcher = [sys.executable, str(Path(__file__).resolve()), "--exec-cyclic",
-              cpu_list(cpus), str(timer_slack_ns), *command]
+              cpu_list(cpus), str(timer_slack_ns)]
+  if cgroup is not None:
+    launcher.extend(["--cgroup", str(cgroup)])
+  launcher.extend(command)
   with (output / "cyclictest.log").open("w") as log:
     with temporary_timer_slack(timer_slack_ns):
       process = subprocess.Popen(launcher, stdout=log, stderr=subprocess.STDOUT)
@@ -223,12 +228,17 @@ def run_cyclic(command, output, cpus, duration, count, mode="migratable", policy
 def capture(output, build_path, binary, cpus, mode, threads, duration, interval_us,
             histogram_us, keep_bandwidth_servers=False, policy="ext", priority=None,
             cpu_dma_latency_us=0, timer_slack_ns=1, *, isolate=False, diagnostic_trace=False,
-            spike_us=100, no_jlfp=False):
+            spike_us=100, no_jlfp=False, relative_to=None):
   if no_jlfp and policy == "ext":
     raise ValueError("EXT requires JLFP; use OTHER or FIFO with --no-jlfp")
   if spike_us <= 0:
     raise ValueError("spike threshold must be positive")
-  cpus = select_test_cpus(isolate, cpus)
+  cgroup = existing_test_cgroup(relative_to) if relative_to is not None else CGROUP_ROOT
+  relative_to = cgroup if cgroup != CGROUP_ROOT else None
+  cpus = select_test_cpus(isolate, cpus, relative_to=relative_to)
+  destination = worker_cgroup(cgroup) if relative_to is not None else cgroup
+  if relative_to is not None and destination.exists() and not cpus <= cgroup_cpu_set(destination):
+    raise ValueError(f"Worker cgroup {destination} does not allow CPUs {sorted(cpus)}")
   available = os.sched_getaffinity(0)
   other_cpus = available - set(cpus)
   config = output / "config.json"
@@ -237,7 +247,9 @@ def capture(output, build_path, binary, cpus, mode, threads, duration, interval_
   if isolate:
     settings["subs"] = {"other": {"policy": "none", "weight": 1, "cpus": cpu_list(other_cpus)}}
   config.write_text(json.dumps(settings, indent=2) + "\n")
-  command = cyclic_command(binary, output, cpus, other_cpus if isolate else available, mode, threads, duration,
+  # the cyclictest main thread must remain inside the destination cpuset
+  main_cpus = cpus if relative_to is not None else other_cpus if isolate else available
+  command = cyclic_command(binary, output, cpus, main_cpus, mode, threads, duration,
                            interval_us, histogram_us, policy, priority,
                            spike_us=spike_us if diagnostic_trace else None)
   events = LATENCY_EVENTS + (DIAGNOSTIC_EVENTS if diagnostic_trace else ())
@@ -269,11 +281,17 @@ def capture(output, build_path, binary, cpus, mode, threads, duration, interval_
                         monitor=True) as session, ExitStack() as isolation:
         session.start_trace(output / "trace.dat")
         session.load_config(config)
+        if relative_to is not None:
+          run["cgroup"] = load_relative_config(session, output, cgroup, {
+              "policy": "none" if no_jlfp else "scx_jlfp", "trace": False,
+              "max_shard_size": SHARD_SIZE}, check_shards=not no_jlfp, destination=destination)
+          run["worker_cgroup"] = str(destination)
         run["cpu_isolation"] = isolation.enter_context(
             isolated_root_tasks(output / "cpu_isolation.json")) if isolate else {"enabled": False}
         report_progress(f"Running {mode} cyclictest on CPUs {sorted(cpus)} for {duration}s...")
         run["verified_threads"] = run_cyclic(command, output, cpus, duration, threads, mode,
-                                             {"ext": 7, "fifo": 1, "other": 0}[policy], timer_slack_ns)
+                                             {"ext": 7, "fifo": 1, "other": 0}[policy], timer_slack_ns,
+                                             **({"cgroup": destination} if relative_to is not None else {}))
   finally:
     (output / "run.json").write_text(json.dumps(run, indent=2) + "\n")
     if session is not None:
@@ -284,12 +302,13 @@ def capture(output, build_path, binary, cpus, mode, threads, duration, interval_
 def main():
   parser = argparse.ArgumentParser(description=__doc__)
   parser.add_argument("--scx-build-path", type=Path, default=REPO_DIR / "scheds/build")
+  parser.add_argument("--relative-to", type=Path, help="existing workload cgroup; must contain whole CPU shards")
   parser.add_argument("--cyclictest", type=Path,
                       help="explicit binary; default: build-directory cyclictest, then repository copy")
   parser.add_argument("--output-dir", type=Path)
   parser.add_argument("--cpus", help="comma-separated test CPUs; defaults to all allowed CPUs")
   parser.add_argument("--isolate", action="store_true",
-                      help="default to the last four allowed CPUs and set up background-work isolation")
+                      help="isolate background work; default to four worker CPUs at the root")
   parser.add_argument("--mode", choices=("pinned", "migratable"), default="migratable")
   parser.add_argument("--policy", choices=("ext", "fifo", "other"), default="ext",
                       help="worker policy: EXT for JLFP, OTHER for FAIR, FIFO for RT")
@@ -333,8 +352,8 @@ def main():
   except ValueError:
     parser.error("cpus must be comma-separated integers")
   try:
-    cpus = select_test_cpus(args.isolate, requested)
-  except ValueError as error:
+    cpus = select_test_cpus(args.isolate, requested, relative_to=args.relative_to)
+  except (OSError, ValueError) as error:
     parser.error(str(error))
   output = (args.output_dir or REPO_DIR / "tester/build" /
             ("jlfp-latency-test-" + datetime.now().strftime("%Y-%m-%d_%H-%M-%S.%f"))).resolve()
@@ -345,7 +364,8 @@ def main():
                      args.threads, args.duration, args.interval_us, args.histogram_us,
                      args.keep_bandwidth_servers, args.policy, priority, args.cpu_dma_latency_us,
                      args.timer_slack_ns, isolate=args.isolate, diagnostic_trace=args.diagnostic_trace,
-                     spike_us=args.spike_us, no_jlfp=args.no_jlfp)
+                     spike_us=args.spike_us, no_jlfp=args.no_jlfp,
+                     **({"relative_to": args.relative_to} if args.relative_to is not None else {}))
     (output / "results.json").write_text(json.dumps(result, indent=2) + "\n")
     print(json.dumps(result, indent=2))
     return 0
@@ -360,9 +380,14 @@ def main():
 if __name__ == "__main__":
   if len(sys.argv) > 2 and sys.argv[1] == "--exec-cyclic":
     set_timer_slack(int(sys.argv[3]))
+    command_index = 4
+    cgroup = CGROUP_ROOT
+    if sys.argv[4] == "--cgroup":
+      cgroup = existing_test_cgroup(sys.argv[5])
+      command_index = 6
+    (cgroup / "cgroup.procs").write_text(f"{os.getpid()}\n")
     os.sched_setaffinity(0, set(map(int, sys.argv[2].split(","))))
-    (CGROUP_ROOT / "cgroup.procs").write_text(f"{os.getpid()}\n")
-    os.execv(sys.argv[4], sys.argv[4:])
+    os.execv(sys.argv[command_index], sys.argv[command_index:])
   def interrupt(*_):
     raise KeyboardInterrupt
   signal.signal(signal.SIGTERM, interrupt)

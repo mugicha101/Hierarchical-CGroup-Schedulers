@@ -97,13 +97,22 @@ def configure_workers(processes, workers):
 
 
 def capture(output, build_path, cpus, tasks_per_cpu, warmup, duration, period_ns, runtime_ns,
-            *, isolate=False, keep_bandwidth_servers=False):
-  cpus = base.select_test_cpus(isolate, cpus)
+            *, isolate=False, keep_bandwidth_servers=False, relative_to=None):
+  cgroup = base.existing_test_cgroup(relative_to) if relative_to is not None else base.CGROUP_ROOT
+  relative_to = cgroup if cgroup != base.CGROUP_ROOT else None
+  cpus = base.select_test_cpus(isolate, cpus, relative_to=relative_to)
   binary = base.build_worker()
   settings, classes = mc2_layout(cpus)
+  workload_settings = None
+  if relative_to is not None:
+    workload_settings = {"policy": "none", "subs": settings.pop("subs")}
+    for group in classes:
+      path = cgroup / group["path"]
+      if path.exists():
+        raise FileExistsError(f"MC² test cgroup already exists: {path}")
   other_cpus = os.sched_getaffinity(0) - cpus
   if isolate:
-    settings["subs"]["other"] = {"policy": "none", "weight": 1,
+    settings.setdefault("subs", {})["other"] = {"policy": "none", "weight": 1,
                                   "cpus": ",".join(map(str, sorted(other_cpus)))}
   config = output / "config.json"
   config.write_text(json.dumps(settings, indent=2) + "\n")
@@ -118,9 +127,16 @@ def capture(output, build_path, cpus, tasks_per_cpu, warmup, duration, period_ns
       session.start_trace(output / "trace.dat")
       base.report_progress("Loading MC²: pinned JLFP A, pinned GEDF B, global GEDF C...")
       session.load_config(config)
+      cgroup_state = None
+      if workload_settings is not None:
+        cgroup_state = base.load_relative_config(session, output, cgroup, {"policy": "none"})
+        for name, node in workload_settings["subs"].items():
+          class_config = output / f"{name}_config.json"
+          class_config.write_text(json.dumps(node, indent=2) + "\n")
+          session.load_config(class_config, relative_to=cgroup / name)
       cgroups = [{"path": "", "id": 0, "weight": 0xffff, "policy": "scx_jlfp"}]
       for group in classes:
-        path = base.CGROUP_ROOT / group["path"]
+        path = cgroup / group["path"]
         if int((path / "cpu.weight").read_text()) != group["weight"]:
           raise RuntimeError(f"Cgroup weight did not apply: {path}")
         cgroups.append({**group, "id": path.stat().st_ino})
@@ -132,6 +148,8 @@ def capture(output, build_path, cpus, tasks_per_cpu, warmup, duration, period_ns
             for slot in range(tasks_per_cpu):
               pinned = group["affinity"] == "pinned"
               path = group["path"] + (f"/cpu{cpu}" if pinned else "")
+              if relative_to is not None:
+                path = str((cgroup / path).relative_to(base.CGROUP_ROOT))
               worker_cpus = {cpu} if pinned else cpus
               command = "--gedf-worker" if group["policy"] == "scx_gedf" else "--jlfp-worker"
               process = subprocess.Popen([str(binary), command], stdin=subprocess.PIPE,
@@ -163,6 +181,8 @@ def capture(output, build_path, cpus, tasks_per_cpu, warmup, duration, period_ns
                "cpu_isolation": isolation_state,
                "workload": {"kind": "periodic-releases", "release_ns": release,
                             "gedf_is_periodic": False, "tasks_per_cpu_per_class": tasks_per_cpu}}
+        if cgroup_state is not None:
+          run["cgroup"] = cgroup_state
         (output / "run.json").write_text(json.dumps(run, indent=2) + "\n")
         base.report_progress(f"Running {len(workers)} MC² workers: {warmup:g}s warmup + {duration:g}s measurement...")
         for process, _ in processes:
@@ -371,7 +391,9 @@ def main():
   outputs.add_argument("--output-dir", type=Path)
   outputs.add_argument("--analyse-only", type=Path, metavar="CAPTURE_DIR")
   parser.add_argument("--scx-build-path", type=Path, default=base.REPO_DIR / "scheds/build")
-  parser.add_argument("--isolate", action="store_true", help="use the last four allowed CPUs and isolate background work")
+  parser.add_argument("--relative-to", type=Path, help="existing base cgroup; must contain whole CPU shards")
+  parser.add_argument("--isolate", action="store_true",
+                      help="isolate background work; default to four worker CPUs at the root")
   parser.add_argument("--keep-bandwidth-servers", action="store_true")
   parser.add_argument("--duration", type=float, default=5)
   parser.add_argument("--warmup", type=float, default=1)
@@ -393,12 +415,13 @@ def main():
     else:
       if os.geteuid() != 0:
         parser.error("root is required for BPF, ftrace, and cgroup setup")
-      cpus = base.select_test_cpus(args.isolate)
+      cpus = base.select_test_cpus(args.isolate, relative_to=args.relative_to)
       output.mkdir(parents=True, exist_ok=False)
       print(f"Capture and results: {output}", flush=True)
       run = capture(output, args.scx_build_path, cpus, args.tasks_per_cpu, args.warmup,
                     args.duration, period, runtime, isolate=args.isolate,
-                    keep_bandwidth_servers=args.keep_bandwidth_servers)
+                    keep_bandwidth_servers=args.keep_bandwidth_servers,
+                    **({"relative_to": args.relative_to} if args.relative_to is not None else {}))
     base.report_progress("Reading MC² trace and checking affinity-aware inversions...")
     with base.defer_trace_interrupts() as check_interrupt:
       with (output / "analysis.log").open("w") as log, redirect_stdout(log):

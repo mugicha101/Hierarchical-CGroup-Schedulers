@@ -16,6 +16,7 @@ import os
 from pathlib import Path
 import select
 import signal
+import struct
 import subprocess
 import sys
 import tempfile
@@ -114,14 +115,116 @@ def stop_workers(workers):
       process.stdout.close()
 
 
-def select_test_cpus(isolate=False, cpus=None):
-  available = os.sched_getaffinity(0)
+def existing_test_cgroup(relative_to):
+  path = (CGROUP_ROOT / relative_to).resolve(strict=True)
+  if not path.is_relative_to(CGROUP_ROOT) or not (path / "cgroup.procs").is_file():
+    raise ValueError(f"Not a cgroup under {CGROUP_ROOT}: {path}")
+  return path
+
+
+def parse_cpu_list(value):
+  cpus = set()
+  for item in value.strip().split(","):
+    bounds = item.split("-")
+    if len(bounds) not in (1, 2) or any(not bound.isdecimal() for bound in bounds):
+      raise ValueError(f"Invalid CPU list: {value!r}")
+    first, last = int(bounds[0]), int(bounds[-1])
+    if first > last:
+      raise ValueError(f"Invalid CPU range: {item}")
+    cpus.update(range(first, last + 1))
+  return cpus
+
+
+def cgroup_cpu_set(cgroup):
+  return parse_cpu_list((cgroup / "cpuset.cpus.effective").read_text())
+
+
+def worker_cgroup(cgroup):
+  if (cgroup / "cgroup.subtree_control").read_text().strip() or (cgroup / "tasks").exists():
+    cgroup = cgroup / "tasks"
+  if cgroup.exists() and (cgroup / "cgroup.subtree_control").read_text().strip():
+    raise ValueError(f"Worker cgroup {cgroup} distributes controllers; select a leaf "
+                     "cgroup for workers")
+  return cgroup
+
+
+def scheduler_shards():
+  library = ctypes.util.find_library("bpf")
+  if library is None:
+    raise RuntimeError("libbpf is required to check shard alignment")
+  bpf = ctypes.CDLL(library, use_errno=True)
+  bpf.bpf_obj_get.argtypes = [ctypes.c_char_p]
+  bpf.bpf_obj_get.restype = ctypes.c_int
+  bpf.bpf_obj_get_info_by_fd.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p]
+  bpf.bpf_map_lookup_elem.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p]
+  fd = bpf.bpf_obj_get(b"/sys/fs/bpf/scx/topo")
+  if fd < 0:
+    error = ctypes.get_errno()
+    raise OSError(error, os.strerror(error), "open scheduler topology")
+  try:
+    # the map info prefix contains type, id, key size, and value size
+    info = (ctypes.c_uint32 * 4)()
+    size = ctypes.c_uint32(ctypes.sizeof(info))
+    if bpf.bpf_obj_get_info_by_fd(fd, ctypes.byref(info), ctypes.byref(size)) < 0:
+      error = ctypes.get_errno()
+      raise OSError(error, os.strerror(error), "read topology map info")
+    if info[2] != 4 or info[3] < 20:
+      raise RuntimeError("Unexpected scheduler topology map layout")
+    value = ctypes.create_string_buffer(info[3])
+    key = ctypes.c_uint32(0)
+    if bpf.bpf_map_lookup_elem(fd, ctypes.byref(key), value) < 0:
+      error = ctypes.get_errno()
+      raise OSError(error, os.strerror(error), "read scheduler topology")
+    nr_cids, nr_shards = struct.unpack_from("=II", value)
+    if not nr_cids or nr_cids > (len(value) - 20) // 20 or not nr_shards:
+      raise RuntimeError("Invalid scheduler topology")
+    shards = {}
+    for cid in range(nr_cids):
+      cpu, shard = struct.unpack_from("=Ii", value, 20 + cid * 20)
+      if not 0 <= shard < nr_shards:
+        raise RuntimeError("Invalid scheduler shard index")
+      shards.setdefault(shard, set()).add(cpu)
+    return shards
+  finally:
+    os.close(fd)
+
+
+def check_cgroup_shards(cgroup):
+  cpus = cgroup_cpu_set(cgroup)
+  shards = scheduler_shards()
+  if cpus - set().union(*shards.values()):
+    raise ValueError(f"Cgroup {cgroup} includes CPUs outside the scheduler topology")
+  for shard, members in shards.items():
+    if cpus & members and not members <= cpus:
+      raise ValueError(f"Cgroup {cgroup} is not shard aligned: shard {shard} has CPUs "
+                       f"{sorted(members)}, missing {sorted(members - cpus)}")
+  return {"path": str(cgroup), "cpus": sorted(cpus),
+          "shards": [shard for shard, members in shards.items() if members <= cpus]}
+
+
+def load_relative_config(session, output, cgroup, settings, *, check_shards=True, destination=None):
+  state = check_cgroup_shards(cgroup) if check_shards else {
+      "path": str(cgroup), "cpus": sorted(cgroup_cpu_set(cgroup))}
+  config = output / "workload_config.json"
+  config.write_text(json.dumps(settings, indent=2) + "\n")
+  if destination is not None and destination != cgroup:
+    base_config = output / "workload_base_config.json"
+    base_config.write_text(json.dumps({"policy": "none"}) + "\n")
+    session.load_config(base_config, relative_to=cgroup, existing=True)
+  target = destination or cgroup
+  session.load_config(config, relative_to=target, existing=target.exists())
+  return state
+
+
+def select_test_cpus(isolate=False, cpus=None, *, relative_to=None):
+  cgroup = existing_test_cgroup(relative_to) if relative_to is not None else CGROUP_ROOT
+  available = cgroup_cpu_set(cgroup)
   if cpus is None:
-    cpus = sorted(available)[-SHARD_SIZE:] if isolate else available
+    cpus = sorted(available)[-SHARD_SIZE:] if isolate and cgroup == CGROUP_ROOT else available
   selected = set(cpus)
   if not selected or not selected <= available:
     raise ValueError("worker CPUs must be nonempty and available")
-  if isolate and not available - selected:
+  if isolate and not os.sched_getaffinity(0) - selected:
     raise ValueError("isolation requires at least one CPU outside the worker set")
   return selected
 
@@ -369,8 +472,13 @@ def disabled_bandwidth_servers(cpus, state_path):
 
 
 def capture(output, build_path, cpus, count, warmup, duration, *, keep_bandwidth_servers=False,
-            periodic=None, isolate=False):
-  cpus = select_test_cpus(isolate, cpus)
+            periodic=None, isolate=False, relative_to=None):
+  cgroup = existing_test_cgroup(relative_to) if relative_to is not None else CGROUP_ROOT
+  relative_to = cgroup if cgroup != CGROUP_ROOT else None
+  cpus = select_test_cpus(isolate, cpus, relative_to=relative_to)
+  destination = worker_cgroup(cgroup) if relative_to is not None else cgroup
+  if relative_to is not None and destination.exists() and not cpus <= cgroup_cpu_set(destination):
+    raise ValueError(f"Worker cgroup {destination} does not allow CPUs {sorted(cpus)}")
   worker_binary = build_worker()
   other_cpus = os.sched_getaffinity(0) - set(cpus)
   config = output / "config.json"
@@ -390,6 +498,12 @@ def capture(output, build_path, cpus, count, warmup, duration, *, keep_bandwidth
       session.start_trace(output / "trace.dat")
       report_progress("Loading JLFP...")
       session.load_config(config)
+      cgroup_state = None
+      scheduler_id = 0
+      if relative_to is not None:
+        cgroup_state = load_relative_config(session, output, cgroup, {
+            "policy": "scx_jlfp", "trace": True, "max_shard_size": SHARD_SIZE}, destination=destination)
+        scheduler_id = destination.stat().st_ino
       isolation_state = isolation.enter_context(isolated_root_tasks(output / "cpu_isolation.json")) \
           if isolate else {"enabled": False}
       try:
@@ -399,8 +513,10 @@ def capture(output, build_path, cpus, count, warmup, duration, *, keep_bandwidth
                                      stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=log, text=True)
           workers.append((process, weight))
           # workers must not inherit the controller's existing cgroup
-          (CGROUP_ROOT / "cgroup.procs").write_text(f"{process.pid}\n")
+          (destination / "cgroup.procs").write_text(f"{process.pid}\n")
           os.sched_setaffinity(process.pid, cpus)
+          if relative_to is not None and os.sched_getaffinity(process.pid) != cpus:
+            raise RuntimeError(f"Worker affinity did not apply: {process.pid}")
           ready, _, _ = select.select([process.stdout], [], [], 30)
           if not ready or process.stdout.readline().strip() != "ready":
             raise RuntimeError(f"Worker {process.pid} did not become ready; see {log.name}")
@@ -416,6 +532,9 @@ def capture(output, build_path, cpus, count, warmup, duration, *, keep_bandwidth
                "cpus": sorted(cpus), "start_ns": start, "end_ns": end,
                "worker_binary": str(worker_binary),
                "bandwidth_servers": server_state, "cpu_isolation": isolation_state}
+        if cgroup_state is not None:
+          run.update(cgroup=cgroup_state, worker_cgroup=str(destination),
+                     scheduler_id=scheduler_id, scheduler_ids=[0, scheduler_id])
         phases = {process.pid: index * periodic["period_ns"] // count
                   for index, (process, _) in enumerate(workers)} if periodic is not None else {}
         run["workload"] = {"kind": "continuous"} if periodic is None else {
@@ -451,15 +570,16 @@ def trace_events(trace, *, check_interrupt=None):
         yield from parse_trace((message,), event_types=ANALYSIS_EVENTS)
 
 
-def analyse(events, weights, start, end, *, progress=None):
+def analyse(events, weights, start, end, *, progress=None, scheduler_id=0, scheduler_ids=None):
   model = ExecModel(0, use_sched_switch=True)
+  expected = set(scheduler_ids or [scheduler_id])
   for pid, weight in weights.items():
-    model.assign_sched(pid, 0)
+    model.assign_sched(pid, scheduler_id)
     model.update_task_weight(pid, weight)
   previous = start
   total = longest = current = intervals = switches = 0
   wakeups = blocks = 0
-  saw_init = False
+  initialized = set()
   saw_switch = False
   observed_execution = False
   observed_weights = set()
@@ -476,9 +596,10 @@ def analyse(events, weights, start, end, *, progress=None):
     if event.time < last_time:
       raise RuntimeError("Trace events are not ordered across CPUs; use the mono trace clock")
     last_time = event.time
-    if event.event_type == "scxtp:scxtp_exit" and event.sched == 0 and event.time < end:
+    if event.event_type == "scxtp:scxtp_exit" and event.sched in expected and event.time < end:
       raise RuntimeError("JLFP detached before the measurement interval ended; check scheduler/kernel logs")
-    saw_init |= event.event_type == "scxtp:scxtp_init" and event.sched == 0
+    if event.event_type == "scxtp:scxtp_init":
+      initialized.add(event.sched)
     saw_switch |= event.event_type == "sched:sched_switch"
     if event.event_type in ("scxtp:scxtp_set_task_weight", "scxtp:scxtp_running"):
       tid = event.details["tid"]
@@ -512,7 +633,7 @@ def analyse(events, weights, start, end, *, progress=None):
     model.handle_event(event)
   if previous < end:
     raise RuntimeError("Capture ended before the measurement interval")
-  if not saw_init or not saw_switch or not observed_weights or not observed_execution:
+  if not expected <= initialized or not saw_switch or not observed_weights or not observed_execution:
     raise RuntimeError("Missing JLFP emissions, applied worker weights, or worker switches; check tracing setup")
   if progress is not None:
     progress(100, event_count, time.monotonic() - started)
@@ -531,11 +652,12 @@ def main(*, periodic=False):
   output_args.add_argument("--analyse-only", type=Path, metavar="CAPTURE_DIR",
                            help="analyse an existing trace.dat and run.json without running workers")
   parser.add_argument("--scx-build-path", type=Path, default=REPO_DIR / "scheds/build")
+  parser.add_argument("--relative-to", type=Path, help="existing workload cgroup; must contain whole CPU shards")
   parser.add_argument("--duration", type=float, default=5, help="measurement seconds (default: 5)")
   parser.add_argument("--warmup", type=float, default=1, help="warmup seconds (default: 1)")
   parser.add_argument("--tasks-per-cpu", type=int, default=2)
   parser.add_argument("--isolate", action="store_true",
-                      help="use the last four allowed CPUs and set up background-work isolation")
+                      help="isolate background work; default to four worker CPUs at the root")
   if periodic:
     parser.add_argument("--period-ms", type=float, default=20,
                         help="worker release period in milliseconds (default: 20)")
@@ -566,13 +688,15 @@ def main(*, periodic=False):
       print(f"Analysing existing capture: {output}", flush=True)
     else:
       try:
-        cpus = select_test_cpus(args.isolate)
-      except ValueError as error:
+        cpus = select_test_cpus(args.isolate, relative_to=args.relative_to)
+      except (OSError, ValueError) as error:
         parser.error(str(error))
       output.mkdir(parents=True, exist_ok=False)
       print(f"Capture and results: {output}", flush=True)
       print(f"Worker CPUs: {sorted(cpus)}; JLFP shard size: {SHARD_SIZE}", flush=True)
       options = {"keep_bandwidth_servers": args.keep_bandwidth_servers, "isolate": args.isolate}
+      if args.relative_to is not None:
+        options["relative_to"] = args.relative_to
       if periodic:
         options["periodic"] = workload
         print(f"Periodic workers: {args.runtime_ms:g} ms CPU budget / {args.period_ms:g} ms period; "
@@ -585,7 +709,9 @@ def main(*, periodic=False):
       with (output / "analysis.log").open("w") as log, redirect_stdout(log):
         with closing(trace_events(output / "trace.dat", check_interrupt=check_interrupt)) as events:
           result = analyse(events, run["weights"], run["start_ns"], run["end_ns"],
-                           progress=report_analysis_progress)
+                           progress=report_analysis_progress,
+                           **({"scheduler_id": run["scheduler_id"], "scheduler_ids": run["scheduler_ids"]}
+                              if "scheduler_id" in run else {}))
     (output / "results.json").write_text(json.dumps(result, indent=2) + "\n")
     print(f"Time spent inverted: {result['inversion_percent']:.3f}% of measurement time")
     print(f"Inversions: {result['inversion_intervals']}; total {result['inversion_ns'] / 1000:.3f} us; "

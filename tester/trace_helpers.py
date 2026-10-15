@@ -243,29 +243,44 @@ class TraceSession:
 
   # load sched_manager config
   # this attaches schedulers
-  def load_config(self, config_path):
+  def load_config(self, config_path, *, relative_to=None, existing=False):
     try:
       if self._trace is None or self._trace.poll() is not None:
         raise RuntimeError("Start recording before loading scheduler config")
       config_path = Path(config_path).resolve(strict=True)
-      configs = [(json.loads(config_path.read_text()), Path())]
+      root = (CGROUP_ROOT / (relative_to or "")).resolve()
+      if not root.is_relative_to(CGROUP_ROOT):
+        raise ValueError(f"Invalid cgroup path: {root}")
+      boundary = root.parent if relative_to is not None else CGROUP_ROOT
+      if relative_to is not None and not existing and not (boundary / "cgroup.procs").is_file():
+        raise FileNotFoundError(f"Cgroup {boundary} does not exist")
+      configs = [(json.loads(config_path.read_text()), root.relative_to(CGROUP_ROOT))]
       # the manager's failed-load rollback must not delete existing cgroups
       for config, relative in configs:
         base = (CGROUP_ROOT / relative / config.get("cgroup", "")).resolve()
         if not base.is_relative_to(CGROUP_ROOT):
           raise ValueError(f"Invalid cgroup path: {base}")
-        for parent in (base, *base.parents):
-          if parent == CGROUP_ROOT:
-            break
-          if parent.exists():
-            raise FileExistsError(parent)
+        if existing:
+          if not (base / "cgroup.procs").is_file():
+            raise FileNotFoundError(f"Cgroup {base} does not exist")
+        else:
+          for parent in (base, *base.parents):
+            if parent == CGROUP_ROOT or parent == boundary:
+              break
+            if parent.exists():
+              raise FileExistsError(parent)
         for name, child in config.get("subs", {}).items():
           path = (base / name).resolve()
           if not path.is_relative_to(CGROUP_ROOT) or path == CGROUP_ROOT:
             raise ValueError(f"Invalid cgroup path: {path}")
           configs.append((child, path.relative_to(CGROUP_ROOT)))
-      self._command("load_config " + shlex.quote(str(config_path)))
-      self._root_loaded = configs[0][0].get("policy") in ("scx_jlfp", "scx_gedf")
+      command = ["load_config", str(config_path)]
+      if relative_to is not None:
+        command.extend(["--relative-to", str(root.relative_to(CGROUP_ROOT))])
+      if existing:
+        command.append("--existing")
+      self._command(shlex.join(command))
+      self._root_loaded |= root == CGROUP_ROOT and configs[0][0].get("policy") in ("scx_jlfp", "scx_gedf")
     except BaseException as error:
       self._close_after_error(error)
       raise

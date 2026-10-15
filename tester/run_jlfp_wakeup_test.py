@@ -147,9 +147,10 @@ def main():
   outputs.add_argument("--output-dir", type=Path)
   outputs.add_argument("--analyse-only", type=Path)
   parser.add_argument("--scx-build-path", type=Path, default=REPO_DIR / "scheds/build")
+  parser.add_argument("--relative-to", type=Path, help="existing workload cgroup; must contain whole CPU shards")
   parser.add_argument("--cpus", help="worker affinity, e.g. 12-15; default all allowed CPUs")
   parser.add_argument("--isolate", action="store_true",
-                      help="default to the last four allowed CPUs and set up background-work isolation")
+                      help="isolate background work; default to four worker CPUs at the root")
   parser.add_argument("--workers", type=int, default=1)
   parser.add_argument("--duration", type=float, default=5)
   parser.add_argument("--warmup", type=float, default=1)
@@ -168,8 +169,8 @@ def main():
   period, runtime = round(args.period_ms * 1e6), round(args.runtime_us * 1e3)
   if not args.analyse_only:
     try:
-      cpus = select_test_cpus(args.isolate, cpus)
-    except ValueError as error:
+      cpus = select_test_cpus(args.isolate, cpus, relative_to=args.relative_to)
+    except (OSError, ValueError) as error:
       parser.error(str(error))
     if args.duration <= 0 or args.warmup < 0 or not 1 <= args.workers <= 32 or not 0 < runtime < period:
       parser.error("require positive duration, nonnegative warmup, 1-32 workers, 0 < runtime < period")
@@ -184,7 +185,8 @@ def main():
       run = capture(output, args.scx_build_path, cpus, args.workers, args.warmup, args.duration,
                     keep_bandwidth_servers=args.keep_bandwidth_servers,
                     isolate=args.isolate,
-                    periodic={"period_ns": period, "runtime_ns": runtime})
+                    periodic={"period_ns": period, "runtime_ns": runtime},
+                    **({"relative_to": args.relative_to} if args.relative_to is not None else {}))
     with defer_trace_interrupts() as check_interrupt:
       with closing(trace_events(output / "trace.dat", check_interrupt)) as events:
         result = analyse(events, run["weights"], run["cpus"], run["start_ns"], run["end_ns"])
