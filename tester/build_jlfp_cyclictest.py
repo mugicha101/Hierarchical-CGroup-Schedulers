@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build a separate cyclictest that preserves unpinned workers' CPU affinity."""
+"""Fetch and build a separate SCHED_EXT cyclictest that preserves worker affinity."""
 
 import argparse
 import difflib
@@ -9,10 +9,24 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+import tempfile
 
 REPO_DIR = Path(__file__).resolve().parents[1]
+RT_TESTS_REPO = "https://git.kernel.org/pub/scm/utils/rt-tests/rt-tests.git"
+RT_TESTS_REVISION = "fd45df830803dd7f26d2ca8bdcf05fd7e0d62ae8"
+MODIFIED_SOURCE = REPO_DIR / "cyclictest/modified_cyclictest.c"
 HEADER = Path("src/cyclictest/rt_numa.h")
 SOURCE = Path("src/cyclictest/cyclictest.c")
+
+
+def clone_source(source):
+  source.parent.mkdir(parents=True, exist_ok=True)
+  with tempfile.TemporaryDirectory(prefix=".rt-tests-", dir=source.parent) as directory:
+    checkout = Path(directory) / "rt-tests"
+    subprocess.run(["git", "clone", "--no-checkout", RT_TESTS_REPO, str(checkout)], check=True)
+    subprocess.run(["git", "-C", str(checkout), "checkout", "--detach", RT_TESTS_REVISION],
+                   check=True)
+    checkout.rename(source)
 
 
 def guard_header(text):
@@ -32,27 +46,30 @@ def sha256(path):
 
 
 def prepare_copy(source, output):
-  source, output = source.resolve(strict=True), output.absolute()
-  original = (source / HEADER).read_text()
-  modified = guard_header(original)
-  if "SCHED_EXT" not in (source / SOURCE).read_text():
-    raise ValueError("source cyclictest lacks the repository's SCHED_EXT support")
+  source, output = source.resolve(), output.absolute()
   if output.exists():
     raise FileExistsError(output)
   if output.resolve().is_relative_to(source):
     raise ValueError("output directory must be outside the rt-tests source")
+  if not source.exists():
+    clone_source(source)
+  original = (source / HEADER).read_text()
+  modified = guard_header(original)
   watched = [HEADER, SOURCE]
   if (source / "cyclictest").is_file():
     watched.append(Path("cyclictest"))
   metadata = {"source_directory": str(source),
               "source_sha256": {str(path): sha256(source / path) for path in watched},
-              "change": "skip NUMA CPU rebinding when cpu == -1; pinned handling unchanged",
+              "cyclictest_source": str(MODIFIED_SOURCE),
+              "cyclictest_source_sha256": sha256(MODIFIED_SOURCE),
+              "change": "apply repository SCHED_EXT cyclictest; skip NUMA CPU rebinding when cpu == -1",
               "command": ["make", "-j2", "cyclictest"],
               "output_binary": str(output / "cyclictest")}
   def ignore(directory, names):
     return set(names) & {".git", "bld", "cyclictest"} if Path(directory) == source else set()
   output.parent.mkdir(parents=True, exist_ok=True)
   shutil.copytree(source, output, ignore=ignore)
+  shutil.copyfile(MODIFIED_SOURCE, output / SOURCE)
   (output / HEADER).write_text(modified)
   patch = difflib.unified_diff(original.splitlines(keepends=True),
                                modified.splitlines(keepends=True),
@@ -82,14 +99,15 @@ def build(source, output):
 
 def main():
   parser = argparse.ArgumentParser(description=__doc__)
-  parser.add_argument("--source-dir", type=Path, default=REPO_DIR / "cyclictest/rt-tests")
+  parser.add_argument("--source-dir", type=Path, default=REPO_DIR / "cyclictest/rt-tests",
+                      help="rt-tests checkout; cloned at a pinned revision if missing")
   parser.add_argument("--output-dir", type=Path, required=True,
                       help="new directory outside the original rt-tests checkout")
   args = parser.parse_args()
   try:
-    print(build(args.source_dir.resolve(strict=True), args.output_dir.absolute()))
+    print(build(args.source_dir, args.output_dir))
     return 0
-  except (OSError, ValueError, RuntimeError) as error:
+  except (OSError, ValueError, RuntimeError, subprocess.CalledProcessError) as error:
     print(f"ERROR: {error}", file=sys.stderr)
     return 2
 
