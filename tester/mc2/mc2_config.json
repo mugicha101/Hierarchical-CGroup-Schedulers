@@ -1,0 +1,21 @@
+{
+  "policy": "scx_jlfp",
+  "trace": false,
+  "subs": {
+    "class_a": {
+      "policy": "scx_jlfp",
+      "weight": 4,
+      "trace": false
+    },
+    "class_b": {
+      "policy": "scx_gedf",
+      "weight": 3,
+      "trace": false
+    },
+    "class_c": {
+      "policy": "scx_gedf",
+      "weight": 2,
+      "trace": false
+    }
+  }
+}

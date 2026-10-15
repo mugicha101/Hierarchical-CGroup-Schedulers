@@ -1,7 +1,6 @@
 #include <scx/common.bpf.h>
 
 #include "trace_events.h"
-CREATE_TRACE_BUFF();
 
 char _license[] SEC("license") = "GPL";
 

@@ -19,8 +19,6 @@ from typing import Dict, Any
 from pathlib import Path
 import pwd
 
-SCX_BUILD_PATH = None
-USER = None
 CGROUP_PATH = Path("/sys/fs/cgroup").resolve(strict=True)
 BPF_PATH = Path("/sys/fs/bpf").resolve(strict=True)
 
@@ -41,6 +39,26 @@ def validate_perms():
   validate_file(CGROUP_PATH / "cgroup.procs")
   validate_file(CGROUP_PATH / "cgroup.threads")
 
+# validate capabilities of scheduler binaries
+def check_sched_capabilities(bin_path):
+  try:
+    result = subprocess.run(["getcap", bin_path], capture_output=True, text=True)
+    if result.returncode != 0:
+      print(f"WARNING: Failed to get capabilities for {bin_path}: {result.stderr.strip()}")
+      return False
+    if "cap_bpf" not in result.stdout:
+      print(f"WARNING: {bin_path} does not have cap_bpf capability. Scheduler may fail to attach due to permission issues.")
+      return False
+    if "cap_perfmon" not in result.stdout:
+      print(f"WARNING: {bin_path} does not have cap_perfmon capability. Scheduler may fail to attach due to permission issues.")
+      return False
+    if "=ep" not in result.stdout:
+      print(f"WARNING: {bin_path} does not have effective capabilities. Scheduler may fail to attach due to permission issues.")
+      return False
+  except FileNotFoundError:
+    print(f"WARNING: 'getcap' command not found. Cannot check capabilities for {bin_path}.")
+    return False
+
 def cgname(cgroup):
   return cgroup if cgroup is not None else "<root>"
 
@@ -48,11 +66,11 @@ class Scheduler:
   def __init__(self, config: Dict[str, Any]):
     self.policy = config.get("policy", None)
     self.cgroup = config.get("cgroup", None)
-    self.trace_path = config.get("trace_path", None)
+    self.trace = config.get("trace", False)
     self.process: subprocess.Popen = None
     self.attached = False # set to true once monitor reads ack_output
 
-  def popen(self):
+  def popen(self, scx_build_path):
     # runs command to launch scheduler process for this cgroup, using the provided config
     # after returning, stdout is handled by a separate thread within SchedManager
     # dont need to block until thread starts, just need to ensure the process is launched with piped output
@@ -70,15 +88,11 @@ class Scheduler:
   def is_attached(self) -> bool:
     return self.attached and self.is_running()
 
-  def start(self):
+  def start(self, scx_build_path):
     if self.is_running():
       raise ValueError(f"Scheduler for cgroup {cgname(self.cgroup)} is already running.")
 
-    if self.trace_path:
-      dir_path = Path(self.trace_path).parent
-      dir_path.mkdir(parents=True, exist_ok=True)
-
-    self.popen()
+    self.popen(scx_build_path)
     if not self.is_running():
       raise RuntimeError(f"Failed to start scheduler for cgroup {cgname(self.cgroup)}")
 
@@ -101,52 +115,41 @@ class Scheduler:
 
   def status(self):
     s = f"{self.policy} [{'ON' if self.is_attached() else 'OFF'}]"
-    if self.trace_path is not None:
-      s += f" [TRACE: {self.trace_path}]"
+    if self.trace:
+      s += " [TRACE EMISSIONS ENABLED]"
     else:
-      s += " [NO TRACE]"
+      s += " [TRACE EMISSIONS DISABLED]"
     return s
 
-class ScxFP(Scheduler):
-  def popen(self):
-    cmd = [f"{SCX_BUILD_PATH}/bin/scx_fp"]
+class ScxScheduler(Scheduler):
+  def __init__(self, config):
+    super().__init__(config)
+    self.max_shard_size = config.get("max_shard_size", None)
+
+  def popen(self, scx_build_path):
+    bin_path = str(Path(scx_build_path) / self.binary)
+    check_sched_capabilities(bin_path)
+    cmd = [bin_path]
     if self.cgroup:
       cmd += ["-c", self.cgroup]
-    if self.trace_path:
-      cmd += ["-t", self.trace_path]
+    if self.trace:
+      cmd += ["-t"]
+    if self.max_shard_size is not None:
+      cmd += ["-S", str(self.max_shard_size)]
     self.process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
 
   def ack_output(self):
     return "Scheduler Attached"
 
-class ScxWRR(Scheduler):
-  def popen(self):
-    cmd = [f"{SCX_BUILD_PATH}/bin/scx_wrr"]
-    if self.cgroup:
-      cmd += ["-c", self.cgroup]
-    if self.trace_path:
-      cmd += ["-t", self.trace_path]
-    self.process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+class ScxJLFP(ScxScheduler):
+  binary = "scx_jlfp"
 
-  def ack_output(self):
-    return "Scheduler Attached"
-
-class ScxEAF(Scheduler):
-  def popen(self):
-    cmd = [f"{SCX_BUILD_PATH}/bin/scx_eaf"]
-    if self.cgroup:
-      cmd += ["-c", self.cgroup]
-    if self.trace_path:
-      cmd += ["-t", self.trace_path]
-    self.process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-
-  def ack_output(self):
-    return "Scheduler Attached"
+class ScxGEDF(ScxScheduler):
+  binary = "scx_gedf"
 
 POLICIES = {
-  "scx_fp": ScxFP,
-  "scx_wrr": ScxWRR,
-  "scx_eaf": ScxEAF
+  "scx_jlfp": ScxJLFP,
+  "scx_gedf": ScxGEDF
 }
 
 class CgroupManager:
@@ -154,6 +157,8 @@ class CgroupManager:
     self.subs = {} # cgroup name -> CgroupManager
     self.sched = None # attached scheduler
     self.path = path
+    # only remove cgroups created by this manager
+    self.owned = False
 
   # add sub
   # returns sub cgroup manager
@@ -186,7 +191,9 @@ class CgroupManager:
   # create cgroup for self
   # if subtree, also creates cgroup for all in subtree
   def create(self, subtree=True):
-    self.path.mkdir(exist_ok=True)
+    if not self.path.exists():
+      self.path.mkdir()
+      self.owned = True
     with open(self.path / "cgroup.subtree_control", "w") as f:
       f.write("+cpu +cpuset")
     if subtree:
@@ -197,8 +204,6 @@ class CgroupManager:
   # if fails to delete, returns false
   # can fail if tasks still in cgroup
   def delete(self):
-    if not self.path.exists():
-      return True
     succ = True
     sub_names = list(self.subs.keys())
     for name in sub_names:
@@ -212,7 +217,7 @@ class CgroupManager:
     except Exception as e:
       print(f"ERROR: Failed to detach scheduler from cgroup {self.path}: {e}")
       succ = False
-    if succ and self.path != CGROUP_PATH:
+    if succ and self.owned and self.path.exists() and self.path != CGROUP_PATH:
       # move tasks to parent
       for pid in self.get_tasks(scx_only=False, is_process=True):
         try:
@@ -226,6 +231,7 @@ class CgroupManager:
       # delete cgroup
       try:
         self.path.rmdir()
+        self.owned = False
       except Exception as e:
         print(f"ERROR: Failed to delete cgroup {self.path}: {e}")
         traceback.print_exc()
@@ -272,6 +278,13 @@ class CgroupManager:
       raise ValueError(f"Cgroup {self.path} does not support cpu.weight.")
     with open(weight_file, "w") as f:
       f.write(str(weight))
+  
+  def get_cpus(self):
+    cpuset_file = self.path / "cpuset.cpus"
+    if not cpuset_file.exists():
+      return None
+    with open(cpuset_file, "r") as f:
+      return f.read().strip()
 
   def set_cpus(self, cpus):
     if not self.path.exists():
@@ -285,12 +298,14 @@ class CgroupManager:
   def subtree_status(self, indent=0):
     sched_str = self.sched.status() if self.sched else "<No Scheduler>"
     weight = self.get_weight()
-    weight = f" (weight: {weight}) " if weight is not None else ""
+    weight = f" weight={weight}" if weight is not None else ""
+    cpuset = self.get_cpus()
+    cpuset = f" cpuset={cpuset}" if cpuset is not None else ""
     cgroup = self.path.relative_to(CGROUP_PATH) if self.path != CGROUP_PATH else "<root>"
-    print(f"{' ' * indent}{cgroup}{weight}: {sched_str} num tasks: {len(self.get_tasks(scx_only=False, is_process=False))}")
-    
+    s = f"{' ' * indent}{cgroup}{weight}{cpuset}: {sched_str} num tasks: {len(self.get_tasks(scx_only=False, is_process=False))}\n"
     for sub in self.subs.values():
-      sub.subtree_status(indent=indent+2)
+      s += sub.subtree_status(indent=indent+2)
+    return s
 
   # attach scheduler to this cgroup, raises error if already attached
   def attach_sched(self, sched: Scheduler):
@@ -312,23 +327,33 @@ class CgroupManager:
 class SchedManager(cmd.Cmd):
   intro = "Hierarchical Cgroup sched_ext Scheduler Manager. Type help or ? to list commands.\n"
   prompt = f"{Path.cwd()} (sched_manager) "
+
+  def output(self, msg, end="\n", flush=False):
+    if self.output_queue:
+      self.output_queue.put(msg)
+    else:
+      print(msg, end=end, flush=flush)
   
-  def __init__(self):
+  def __init__(self, scx_build_path, output_queue=None):
     super().__init__()
+    self.scx_build_path = scx_build_path
     delims = readline.get_completer_delims()
     delims = delims.replace('/', '')
     delims = delims.replace('-', '')
     readline.set_completer_delims(delims)
     self.root_cgroup = CgroupManager(CGROUP_PATH)
-    self.root_cgroup.create(subtree=False)
     self.selector = selectors.DefaultSelector()
-    self.print_monitor = False
+    self.print_monitor = True
+    self.print_ack = False
+    self.output_queue = output_queue
     self.monitor_thread = threading.Thread(target=self.monitor_thread_func, daemon=True)
     self.monitor_thread.start()
 
   def monitor_thread_func(self):
+    print("Monitor thread running on TID", threading.get_native_id())
     while True:
-      events = self.selector.select(timeout=0.5)
+      time.sleep(0.1)
+      events = self.selector.select(timeout=0)
       written = False
       for key, mask in events:
         pipe = key.fileobj
@@ -354,16 +379,24 @@ class SchedManager(cmd.Cmd):
 
   # adds cgroup manager to hierarchy if doesn't exist
   # if create, also creates the cgroup(s) on the filesystem
-  def add_cgroup(self, path: Path, create=False) -> CgroupManager:
+  def add_cgroup(self, path: Path, create=False, created=None, existing=False) -> CgroupManager:
     path = self.validate_cgroup_path(path)
     cgroup = self.root_cgroup
+    if create:
+      cgroup.create(subtree=False)
     for part in path.parts:
       if part == '..' or part == '.':
         raise ValueError(f"Invalid cgroup path: {cgroup_path}")
       sub = cgroup.get_sub(part)
       if sub is None:
         sub = cgroup.add_sub(part)
-      if create:
+      if existing:
+        if not sub.path.is_dir():
+          raise FileNotFoundError(f"Cgroup {sub.path} does not exist.")
+        sub.owned = False
+      if create and (not sub.exists() or sub.owned):
+        if created is not None and not sub.exists():
+          created.append(sub)
         sub.create(subtree=False)
       cgroup = sub
     return cgroup
@@ -402,27 +435,43 @@ class SchedManager(cmd.Cmd):
       print()
       parser.print_help()
       return None
-    except Exception as e:
-      print(f"ERROR: {e}")
-      traceback.print_exc()
-      return None
 
   # helper to load list of (scheduler config, relative cgroup path)
-  def load_configs(self, configs, basepath: Path = Path(), force=False):
-    base_cgroup = self.add_cgroup(basepath)
+  def load_configs(self, configs, basepath: Path = Path(), force=False, existing=False):
+    if existing and force:
+      raise ValueError("--existing and --force cannot be used together")
+    basepath = self.validate_cgroup_path(basepath)
+    configs = [(dict(config), self.validate_cgroup_path(basepath / rel_path))
+               for config, rel_path in configs]
+    # check the entire hierarchy before attaching any schedulers
+    for config, path in configs:
+      if existing and not (CGROUP_PATH / path).is_dir():
+        raise FileNotFoundError(f"Cgroup {CGROUP_PATH / path} does not exist.")
+      if not existing and not force and path.parts and (CGROUP_PATH / path).exists():
+        raise ValueError(f"Cgroup {path} already exists. Use --force to overwrite.")
+      policy = config.get("policy")
+      if policy not in (None, "none") and policy not in POLICIES:
+        raise ValueError(f"Unsupported scheduler type: {policy}")
+      cgroup = self.get_cgroup(path)
+      if cgroup is not None and cgroup.sched is not None:
+        raise ValueError(f"Cgroup {CGROUP_PATH / path} already has a scheduler attached.")
+    base_cgroup = self.add_cgroup(basepath, existing=existing)
     success = False
+    attached = []
+    created = []
     try:
-      if not force:
+      if not force and not existing:
         if base_cgroup == self.root_cgroup:
-          if any(sub.exists() for sub in base_cgroup.subs.values()):
-            raise ValueError(f"Root cgroup already has attached sub-cgroups. Use --force to overwrite.")
+          for sub in base_cgroup.subs.values():
+            if sub.exists():
+              raise ValueError(f"Root cgroup already has attached sub-cgroup {sub.path}. Use --force to overwrite.")
         else:
           if base_cgroup.exists():
             raise ValueError(f"Cgroup {basepath} already exists. Use --force to overwrite.")
 
-      for config, rel_path in configs:
-        cgroup_path = basepath / rel_path
-        cgroup = self.add_cgroup(cgroup_path, create=True)
+      for config, cgroup_path in configs:
+        cgroup = self.add_cgroup(cgroup_path, create=not existing, created=created,
+                                 existing=existing)
         if cgroup.sched is not None:
           raise ValueError(f"Cgroup {cgroup_path} already has a scheduler attached.")
           
@@ -439,20 +488,23 @@ class SchedManager(cmd.Cmd):
             sched = POLICIES[policy](config)
           case _:
             raise ValueError(f"Unsupported scheduler type: {policy}")
+        
+        if not existing:
+          weight = config.get("weight", None)
+          if weight is not None:
+            cgroup.set_weight(weight)
+          cpus = config.get("cpus", "")
+          if cgroup == self.root_cgroup:
+            if len(cpus) > 0:
+              raise ValueError(f"Cannot set cpus for root cgroup.")
+          else:
+            cgroup.set_cpus(cpus)
+        
         if sched is None:
           continue
-        
-        weight = config.get("weight", None)
-        if weight is not None:
-          cgroup.set_weight(weight)
-        cpus = config.get("cpus", "")
-        if cgroup == self.root_cgroup:
-          if len(cpus) > 0:
-            raise ValueError(f"Cannot set cpus for root cgroup.")
-        else:
-          cgroup.set_cpus(cpus)
         cgroup.attach_sched(sched)
-        sched.start()
+        attached.append(cgroup)
+        sched.start(self.scx_build_path)
         os.set_blocking(sched.process.stdout.fileno(), False)
         self.selector.register(sched.process.stdout, selectors.EVENT_READ, data=sched)
         while sched.is_running() and not sched.is_attached():
@@ -463,8 +515,17 @@ class SchedManager(cmd.Cmd):
 
     finally:
       if not success:
-        print("FAILED")
-        base_cgroup.delete() # undo any created cgroups on failure
+        # leave cgroups and schedulers from earlier loads untouched
+        for cgroup in reversed(attached):
+          process = cgroup.sched.process
+          if process is not None:
+            try:
+              self.selector.unregister(process.stdout)
+            except KeyError:
+              pass
+          cgroup.detach_sched()
+        for cgroup in reversed(created):
+          cgroup.delete()
 
   def find_cgroup_completions(self, path: str):
     try:
@@ -475,8 +536,23 @@ class SchedManager(cmd.Cmd):
         return []
       return [str(parent_path / name).removeprefix("./") for name in cgroup.subs.keys() if name.startswith(prefix)]
     except Exception as e:
-      print(e)
+      self.output(e)
       return []
+
+  # override default to print ERR: <error>
+  def default(self, line):
+    self.output(f"ERR: Unknown command '{line}'. Type 'help' to see available commands.")
+
+  # override onecmd to catch exceptions and print status
+  def onecmd(self, line):
+    try:
+      res = super().onecmd(line)
+      if self.print_ack:
+        self.output(f"ACK")
+      return res
+    except Exception as e:
+      traceback.print_exc()
+      self.output(f"ERR: {e}")
 
   # CLI Commands
 
@@ -491,11 +567,29 @@ class SchedManager(cmd.Cmd):
     if args is None:
       return
 
-    try:
-      self.root_cgroup.subtree_status()
-    except Exception as e:
-      print(f"ERROR: {e}")
-      traceback.print_exc()
+    lines = self.root_cgroup.subtree_status().strip().split("\n")
+    for line in lines:
+      self.output(line)
+
+  def do_sched(self, arg):
+    'Print the scheduler attached to a cgroup.'
+    parser = argparse.ArgumentParser(
+      prog="sched",
+      description="Print the scheduler attached to a cgroup.",
+      add_help=True
+    )
+    parser.add_argument("cgroup_path", help="Path to the cgroup relative to the root cgroup (default is root).", nargs="?", default="")
+    args = self.parse_args(parser, arg)
+    if args is None:
+      return
+
+    cgroup = self.get_cgroup(args.cgroup_path)
+    if cgroup is None:
+      self.output("no cgroup")
+    elif cgroup.sched is None:
+      self.output("none")
+    else:
+      self.output(f"{cgroup.sched.policy}")
 
   def do_monitor(self, arg):
     'Toggle live output from scheduler programs.'
@@ -515,7 +609,27 @@ class SchedManager(cmd.Cmd):
       self.print_monitor = False
     else:
       self.print_monitor = not self.print_monitor
-    print(f"Scheduler Output: {'ON' if self.print_monitor else 'OFF'}")
+    self.output(f"Scheduler Output: {'ON' if self.print_monitor else 'OFF'}")
+
+  def do_ack(self, arg):
+    'Toggle printing ACK on success (ERR: <reason> will occur if fails regardless).'
+    parser = argparse.ArgumentParser(
+      prog="monitor",
+      description="Print ACK on success",
+      add_help=True
+    )
+    parser.add_argument("value", help="1 to turn on, 0 to turn off, -1 to toggle", nargs="?", default=-1)
+    args = self.args = self.parse_args(parser, arg)
+    if args is None:
+      return
+
+    if args.value == "1":
+      self.print_ack = True
+    elif args.value == "0":
+      self.print_ack = False
+    else:
+      self.print_ack = not self.print_ack
+    print(f"ACK Response: {'ON' if self.print_ack else 'OFF'}")
 
   def do_tasks(self, arg):
     'List tasks (sched_ext threads) in a cgroup.'
@@ -531,40 +645,36 @@ class SchedManager(cmd.Cmd):
     if args is None:
       return
 
-    try:
-      cgroup = self.get_cgroup(args.cgroup_path)
-      if cgroup is None:
-        print(f"ERROR: Cgroup {args.cgroup_path} does not exist.")
-        return
-      threads = cgroup.get_tasks(scx_only=not args.all, is_process=False)
-      
-      thread_info = [{} for _ in threads]
-      for tid, tinfo in zip(threads, thread_info):
-        tinfo['alive'] = True
-        try:
-          with open(f"/proc/{str(tid)}/status", 'r') as f:
-            for line in f:
-              # Split only on the first colon
-              parts = line.split(":", 1)
-              if len(parts) == 2:
-                  key = parts[0].strip()
-                  value = parts[1].strip()
-                  tinfo[key] = value
-          tinfo['Policy'] = os.sched_getscheduler(tid)
-        except (FileNotFoundError, ProcessLookupError):
-          tinfo["alive"] = False
-          continue # thread exited
-      thread_info = [tinfo for tinfo in thread_info if tinfo.get("alive", False)]
-      thread_info.sort(key=lambda t: t.get("Pid", -1))
-      print(f"num tasks: {len(thread_info)}")
-      for tinfo in thread_info:
-        if args.raw:
-          print(tinfo)
-        else:
-          print(f"pid={tinfo.get('Tgid', -1)} tid={tinfo['Pid']} name={tinfo.get('Name', '???')} state={tinfo.get('State', '???')} policy={tinfo.get('Policy', '???')}")
-    except Exception as e:
-      print(f"ERROR: {e}")
-      traceback.print_exc()
+    cgroup = self.get_cgroup(args.cgroup_path)
+    if cgroup is None:
+      print(f"ERROR: Cgroup {args.cgroup_path} does not exist.")
+      return
+    threads = cgroup.get_tasks(scx_only=not args.all, is_process=False)
+    
+    thread_info = [{} for _ in threads]
+    for tid, tinfo in zip(threads, thread_info):
+      tinfo['alive'] = True
+      try:
+        with open(f"/proc/{str(tid)}/status", 'r') as f:
+          for line in f:
+            # Split only on the first colon
+            parts = line.split(":", 1)
+            if len(parts) == 2:
+                key = parts[0].strip()
+                value = parts[1].strip()
+                tinfo[key] = value
+        tinfo['Policy'] = os.sched_getscheduler(tid)
+      except (FileNotFoundError, ProcessLookupError):
+        tinfo["alive"] = False
+        continue # thread exited
+    thread_info = [tinfo for tinfo in thread_info if tinfo.get("alive", False)]
+    thread_info.sort(key=lambda t: t.get("Pid", -1))
+    print(f"num tasks: {len(thread_info)}")
+    for tinfo in thread_info:
+      if args.raw:
+        print(tinfo)
+      else:
+        print(f"pid={tinfo.get('Tgid', -1)} tid={tinfo['Pid']} name={tinfo.get('Name', '???')} state={tinfo.get('State', '???')} policy={tinfo.get('Policy', '???')}")
 
   def do_move(self, arg):
     # NOTE: in 7.2 patchset, since enqueue path not implemented, doesn't actually enqueue into the cgroup subscheduler
@@ -582,16 +692,12 @@ class SchedManager(cmd.Cmd):
     if args is None:
       return
 
-    try:
-      tid = int(args.tid)
-      cgroup = self.get_cgroup(args.cgroup_path)
-      if cgroup is None:
-        print(f"ERROR: Cgroup {args.cgroup_path} does not exist.")
-        return
-      cgroup.add_task(tid, is_process=args.process)
-    except Exception as e:
-      print(f"ERROR: {e}")
-      traceback.print_exc()
+    tid = int(args.tid)
+    cgroup = self.get_cgroup(args.cgroup_path)
+    if cgroup is None:
+      print(f"ERROR: Cgroup {args.cgroup_path} does not exist.")
+      return
+    cgroup.add_task(tid, is_process=args.process)
 
   def complete_move(self, text, line, begidx, endidx):
     args = shlex.split(line[:begidx])
@@ -614,15 +720,11 @@ class SchedManager(cmd.Cmd):
     if args is None:
       return
 
-    try:
-      cgroup = self.get_cgroup(args.cgroup_path)
-      if cgroup is None:
-        print(f"ERROR: Cgroup {args.cgroup_path} does not exist.")
-        return
-      cgroup.detach_sched(recursive=args.recursive)
-    except Exception as e:
-      print(f"ERROR: {e}")
-      traceback.print_exc()
+    cgroup = self.get_cgroup(args.cgroup_path)
+    if cgroup is None:
+      print(f"ERROR: Cgroup {args.cgroup_path} does not exist.")
+      return
+    cgroup.detach_sched(recursive=args.recursive)
 
   def do_delete(self, arg):
     'Delete a cgroup, its scheduler, and all sub-cgroups.'
@@ -636,12 +738,8 @@ class SchedManager(cmd.Cmd):
     if args is None:
       return
 
-    try:
-      if not self.delete_cgroup(args.cgroup_path):
-        print(f"ERROR: Failed to fully delete cgroup {args.cgroup_path}. It may still exist with some threads or sub-cgroups.")
-    except Exception as e:
-      print(f"ERROR: {e}")
-      traceback.print_exc()
+    if not self.delete_cgroup(Path(args.cgroup_path)):
+      print(f"ERROR: Failed to fully delete cgroup {args.cgroup_path}. It may still exist with some threads or sub-cgroups.")
 
   def do_attach(self, arg):
     'Attach a sched_ext scheduler to a cgroup or as root.'
@@ -652,22 +750,21 @@ class SchedManager(cmd.Cmd):
     )
     parser.add_argument("policy", help=f"Type of scheduler to add ({', '.join(POLICIES.keys())}) or none to create a blank cgroup.")
     parser.add_argument("cgroup_path", help="Path to the cgroup relative to the root cgroup (default is root).", nargs="?", default="")
-    parser.add_argument("-t", "--trace_dir", help="Directory to write scheduler trace output to (default is no tracing).", default=None)
-    parser.add_argument("-f", "--force", action="store_true", help="If cgroup already exists, overwrite it.")
+    parser.add_argument("-t", "--trace", help="Enable custom ftrace event emissions (disabled by default).", action="store_true")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("-f", "--force", action="store_true", help="If cgroup already exists, overwrite it.")
+    mode.add_argument("--existing", action="store_true", help="Require an existing cgroup; manage only its scheduler.")
     args = self.parse_args(parser, arg)
     if args is None:
       return
     
-    try:
-      config = {
-        "policy": args.policy
-      }
-      if args.trace_dir is not None:
-        config["trace_dir"] = args.trace_dir
-      self.load_configs([(config, Path())], basepath=Path(args.cgroup_path), force=args.force)
-    except Exception as e:
-      print(f"ERROR: {e}")
-      traceback.print_exc()
+    config = {
+      "policy": args.policy,
+      "trace": args.trace
+    }
+    cgroup_path = Path(args.cgroup_path)
+    self.load_configs([(config, Path())], basepath=cgroup_path, force=args.force,
+                      existing=args.existing)
 
   def complete_attach(self, text, line, begidx, endidx):
     args = shlex.split(line[:begidx])
@@ -704,54 +801,37 @@ class SchedManager(cmd.Cmd):
     )
     parser.add_argument("config_path", help="Path to the config JSON file")
     parser.add_argument("-r", "--relative-to", help="Load config relative to a specific cgroup path (default is root)", default="")
-    parser.add_argument("-f", "--force", action="store_true", help="If cgroups already exist, overwrite them.")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("-f", "--force", action="store_true", help="If cgroups already exist, overwrite them.")
+    mode.add_argument("--existing", action="store_true", help="Require existing cgroups; manage only their schedulers.")
     args = self.parse_args(parser, arg)
     if args is None:
       return
 
-    try:
-      basepath = Path(args.relative_to)
+    basepath = Path(args.relative_to)
 
-      args.config_path = Path(args.config_path).resolve(strict=True)
-      if not args.config_path.is_file():
-        print(f"ERROR: Config file {args.config_path} does not exist.")
-        return
-      
-      with open(args.config_path, "r") as f:
-        root_config = json.load(f)
-      
-      # get list of configs
-      configs = [(root_config, Path())]
-      i = 0
-      while i < len(configs):
-        config, rel_path = configs[i]
-        i += 1
-        cgroup_path = rel_path / config.get("cgroup", "")
-        cgroup = self.add_cgroup(cgroup_path, create=False)
-        trace = config.get("trace", False)
+    args.config_path = Path(args.config_path).resolve(strict=True)
+    if not args.config_path.is_file():
+      print(f"ERROR: Config file {args.config_path} does not exist.")
+      return
+    
+    with open(args.config_path, "r") as f:
+      root_config = json.load(f)
+    
+    # get list of configs
+    configs = [(root_config, Path())]
+    i = 0
+    while i < len(configs):
+      config, rel_path = configs[i]
+      i += 1
+      cgroup_path = rel_path / config.get("cgroup", "")
+      # add subs
+      subs = config.get("subs", {})
+      for name, sub_config in subs.items():
+        configs.append((sub_config, cgroup_path / name))
 
-        # add trace path
-        trace_dir = None
-        if "trace_dir" in config:
-          trace_dir = Path(config["trace_dir"]).expanduser().resolve(strict=False)
-        if "trace_path" in config:
-          del config["trace_path"]
-        if trace and trace_dir is not None:
-          config["trace_path"] = str((Path(trace_dir) / ("trace_" + "__".join(cgroup_path.parts))).with_suffix(".trace"))
-        
-        # add subs
-        subs = config.get("subs", {})
-        for name, sub_config in subs.items():
-          if trace_dir is not None and "trace_dir" not in sub_config:
-            sub_config["trace_dir"] = str(trace_dir)
-          configs.append((sub_config, cgroup_path / name))
-
-      # load configs
-      self.load_configs(configs, basepath, force=args.force)
-
-    except Exception as e:
-      print(f"ERROR: {e}")
-      traceback.print_exc()
+    # load configs
+    self.load_configs(configs, basepath, force=args.force, existing=args.existing)
 
   def complete_load_config(self, text, line, begidx, endidx):
     os.path.expanduser(text)
@@ -793,21 +873,18 @@ def signal_handler(sig, frame):
   except Exception as e:
     print(f"ERROR during cleanup: {e}")
     traceback.print_exc()
-  sys.exit(0)
+  if sig == signal.SIGINT:
+    sys.exit(0)
 
 def main():
-  validate_perms()
   parser = argparse.ArgumentParser(description="Manage sched_ext schedulers attached to cgroups.")
-  parser.add_argument("scx_build_path", help="Path to the sched_ext build directory containing the scheduler binaries.")
-  parser.add_argument("user", help="User to chown created trace files to (default is current user).", nargs="?", default=os.getenv("SUDO_USER", os.getenv("USER")))
+  parser.add_argument("scx_build_path", nargs="?", default=str(Path(__file__).resolve().parents[1] / "scheds" / "build"),
+                      help="Directory containing scx_jlfp and scx_gedf binaries (default: scheds/build).")
   args = parser.parse_args()
-
-  global SCX_BUILD_PATH, USER
-  SCX_BUILD_PATH = args.scx_build_path
-  USER = pwd.getpwnam(args.user)
+  validate_perms()
 
   global manager
-  manager = SchedManager()
+  manager = SchedManager(scx_build_path=args.scx_build_path)
   signal.signal(signal.SIGINT, signal_handler)
 
   try:

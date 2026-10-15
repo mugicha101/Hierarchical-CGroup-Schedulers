@@ -1,53 +1,45 @@
+## Project Goal
+
+The goal of this project is to provide a framework for implementing realtime schedulers using the latest Linux scheduling features planned for kernel version 7.3. Specifically, we utilize Linux's native extendible scheduling framework (sched_ext) with new features such as hierarchical cgroup schedulers, userspace-shared arena memory, and topologically aware CPU to CID mappings, to implement various realtime scheduling policies such as Global Earliest Deadline First. The benefits of using mainline Linux over forks such as LITMUS-RT is maintenance cost: It's a lot easier to update to the newest kernel build and keep the system stable if there's minimal kernel modifications. As such, this project uses kernel modifications sparingly, and most features work without kmods/patches. Additionally, non-realtime sched_ext schedulers such as the community-made Rust userspace schedulers can be used as sub-policies for mixed-criticality scheduling.
+
 ## Linux Schedulers Setup
 
-### Setup Environment
+See the scheduler README for:
 
-clone https://github.com/torvalds/linux.git or git://git.kernel.org/pub/scm/linux/kernel/git/tj/sched_ext.git and select branch with cgroup sub-scheduling (linux 7.1 has cgroup subscheduling v3)
+- [Kernel environment setup](scheds/README.md#setup-environment).
+- [Dependencies, build instructions, and capability setup](scheds/README.md#running-the-schedulers).
+- [Scheduling policies and task-weight updates](scheds/README.md#scheduling-policies).
+- [Tracing setup and capture](scheds/README.md#tracing).
+- [Limitations and behavior](scheds/README.md#limitations-and-behavior).
+- [Measuring overhead](scheds/README.md#measuring-overhead).
 
-install clang-21
-make sure pahole is 1.31+ since uses KF_IMPLICIT_ARGS
-install kernel
+## Scheduler Manager Setup (Outside of ROS 2)
 
-go to tools/sched_ext
+`sched_manager.py` lives in `tools/`.
 
-copy everything in `scheds` into `tools/sched_ext`
+The `sched_manager.py` script manages cgroups and SCHED_EXT schedulers without requiring sudo.
 
-modify in Makefile:
-```
-c-sched-targets = scx_simple scx_cpu0 scx_qmap scx_central scx_flatcg scx_userland scx_pair scx_sdt scx_eaf scx_wrr scx_fp
-```
-
-Built schedulers can be run like so: `./build/bin/scx_wrr`
-
-To enable/disable tracing, modify `trace_events.h` to define `TRACING` to 1 or 0 respectively.
-
-To limit CPUs, uncomment out the NR_CPU redefine in `trace_events.h`.
-
-### Build Schedulers
-
-```
-sudo bear -- make CC="clang-21 -Wno-unused-command-line-argument" CLANG=clang-21 LLVM_STRIP=llvm-strip-21 VMLINUX_BTF=/sys/kernel/btf/vmlinux
-```
-
-## Scheduler Manager Setup
+An instance is created by the `cgroup_server` ROS2 node in order to manage cgroups and schedulers.
 
 ### Dependencies
 
 Python 3
 
-Python libraries: `pip install -r requirements.txt`
+### Use Scheduler Manager CLI
 
-### Use Scheduler Manager
+Run `sudo sh tools/perm_setup.sh` to set permissions for `/sys/fs/bpf` and `/sys/fs/cgroup` to allow the current user to create/manage cgroups and access bpf maps. Allows you to run `sched_manager` without sudo.
 
-Run `sudo sh perm_setup.sh` to set permissions for `/sys/fs/bpf` and `/sys/fs/cgroup` to allow the current user to create/manage cgroups and access bpf maps. Allows you to run `sched_manager` without sudo.
+Run `python3 tools/sched_manager.py` from the repository root to manage the scheduler hierarchy using binaries in `scheds/build`. Follow the [scheduler build instructions](scheds/README.md#setup) first.
 
-Run `sched_manager.py <scx build dir>` as a Python 3 program, which acts as an CLI for managing the scheduler hierarchy.
+To use a different build, run `python3 tools/sched_manager.py <scheduler binary dir>`. The directory must contain `scx_jlfp` and `scx_gedf` directly.
 
-`<scx build dir>` should look something like `/home/.../linux/tools/sched_ext/` if using mainline kernel.
+NOTE: if you get `ERR: Root cgroup already has attached sub-cgroup /sys/fs/cgroup/<cgroup>. Use --force to overwrite.`
 
-### Configuration Files
+run `echo S | sudo tee /proc/sysrq-trigger` to detach SCHED_EXT schedulers.
 
-Example hierarchy defined in `cgroup_config.json`.
+### Loading Configuration Files
+
+Example hierarchy defined in `example_cgroup_config.json`.
 
 Format is defined hierarchically, with root as top level and direct subschedulers defined within `subs` field.
 
@@ -55,11 +47,9 @@ Run `load_config -h` for more details from within `sched_manager`.
 
 #### Schedulers have the following fields
 
-`trace_dir`: string, path to the directory to dump the trace output to. file name created by replacing `/` with `__`. If not provided, no trace is written to. Takes precedence over ancestor `trace_dir` fields. Creates if doesn't exist.
+`policy`: string, which sched_ext policy to use, supports `scx_jlfp`, `scx_gedf`, and `none`. JLFP supports sub-schedulers; GEDF is a leaf scheduler.
 
-`policy`: string, which sched_ext policy to use, currently supports scx_fp, scx_wrr, scx_eaf, none.
-
-`trace`: boolean, specifies whether to record traces or not. If schedulers were built without tracing, will not trace. Likewise, if schedulers were built with tracing, will incur trace overehads but will not store the trace output anywhere.
+`trace`: boolean, enables custom ftrace event emissions for this scheduler (default: false). See [Tracing in the scheduler README](scheds/README.md#tracing).
 
 `weight`: int, cgroup weight (1 to 10000), can also be set externally using the cgroup fs interface.
 
@@ -67,4 +57,4 @@ Run `load_config -h` for more details from within `sched_manager`.
 
 ## ROS 2 Component Scheduling Setup
 
-TODO
+`rosrtmc` is currently unfinished code for integrating cgroup scheduling into ROS2.

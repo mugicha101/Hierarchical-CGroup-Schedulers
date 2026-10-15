@@ -38,7 +38,8 @@ const volatile u64 cgroup_id;
 u64 self_cgroup_weight;
 
 #define MAX_SUB_SCHEDS 64 // must be power of 2
-#define DEFAULT_WEIGHT 1
+#define DEFAULT_CGROUP_WEIGHT 1
+#define DEFAULT_TASK_WEIGHT (~0ULL)
 #define MAX_PENDING_UPDATES 1024
 // #define NMIG_TIMER_PERIOD_NS (1 * 1000000ULL) // 1ms
 #define NTRIALS 10000 // enough trials to be functionally infinite for rare race-conditioned events
@@ -176,6 +177,8 @@ struct {
 	__type(value, struct cpu_sched_state);
 } sched_state SEC(".maps");
 
+// per-cpu runtime data
+
 inline struct global_data *fetch_global() {
 	const u32 idx = 0;
 	return bpf_map_lookup_elem(&global, &idx);
@@ -247,7 +250,7 @@ void __always_inline update_cpu_cgroup_weight(u32 cpu, struct cpu_task_state *ct
 	// running task, fetch cgroup
 	u64 cgrp_id = BPF_CORE_READ(cpu_task, cgroups, dfl_cgrp, kn, id);
 	u32 *cgrp_weight = bpf_map_lookup_elem(&cgroup_weights, &cgrp_id);
-	cts->cgrp_weight = cgrp_weight ? *cgrp_weight : DEFAULT_WEIGHT;
+	cts->cgrp_weight = cgrp_weight ? *cgrp_weight : DEFAULT_CGROUP_WEIGHT;
 }
 
 // periodically checks if task is still non-migrateable
@@ -336,9 +339,13 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(fp_init)
 {
 	TRACE_FUNC_START("init");
 	bpf_printk("[INFO] [FP] [INIT] cgroup=%d", cgroup_id);
+	TRACE_EVENT(struct sched_trace_event_self, SCHED_TRACE_SELF,
+		e->cgrp_id = cgroup_id;
+		e->weight = DEFAULT_CGROUP_WEIGHT;
+	);
 	
 	// init cgroup data structs
-	self_cgroup_weight = DEFAULT_WEIGHT;
+	self_cgroup_weight = DEFAULT_CGROUP_WEIGHT;
 	s32 err = 0;
 	u32 cpu;
 	bpf_for(cpu, 0, NR_CPUS) {
@@ -418,7 +425,7 @@ s32 BPF_STRUCT_OPS(fp_sub_attach, struct scx_sub_attach_args *args)
 	if (unlikely(!global)) return -EINVAL; // for verifier, should not happen
 
 	u32 *cached_weight = bpf_map_lookup_elem(&cgroup_weights, &cgrp_id);
-	u64 weight = cached_weight ? *cached_weight : DEFAULT_WEIGHT;
+	u64 weight = cached_weight ? *cached_weight : DEFAULT_CGROUP_WEIGHT;
 	
 	struct global_sub_params *global_subs = global->global_subs;
 	struct bpf_spin_lock *global_subs_write_lock = &global->global_subs_write_lock;
@@ -502,6 +509,10 @@ void BPF_STRUCT_OPS(fp_cgroup_set_weight, struct cgroup *cgrp, u32 weight)
 	u64 cgrp_id = cgrp->kn->id;
 	if (cgrp_id == cgroup_id) {
 		self_cgroup_weight = weight;
+		TRACE_EVENT(struct sched_trace_event_self, SCHED_TRACE_SELF,
+			e->cgrp_id = cgroup_id;
+			e->weight = weight;
+		);
 	}
 	// bpf_printk("[INFO] [FP] [SET_WEIGHT] Setting cgroup %llu weight to %u", cgrp_id, weight);
 	TRACE_FUNC_START("cgroup_set_weight");
@@ -724,6 +735,10 @@ s32 BPF_STRUCT_OPS(fp_cgroup_init, struct cgroup *cgrp, struct scx_cgroup_init_a
 	u32 weight = args->weight;
 	if (cgrp_id == cgroup_id) {
 		self_cgroup_weight = weight;
+		TRACE_EVENT(struct sched_trace_event_self, SCHED_TRACE_SELF,
+			e->cgrp_id = cgroup_id;
+			e->weight = weight;
+		);
 	}
 	TRACE_EVENT(struct sched_trace_event_cgroup_init_args, SCHED_TRACE_CGROUP_INIT_ARGS,
 		e->cgrp_id = cgrp_id;
@@ -743,7 +758,7 @@ s32 BPF_STRUCT_OPS(fp_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake_
 }
 
 u64 __always_inline get_task_weight(struct task_struct *p) {
-	u64 weight = DEFAULT_WEIGHT;
+	u64 weight = DEFAULT_TASK_WEIGHT;
 	u64 *lookup_weight = bpf_task_storage_get(&task_weights, p, 0, 0);
 	if (lookup_weight) {
 		weight = *lookup_weight;
@@ -765,7 +780,7 @@ void BPF_STRUCT_OPS(fp_enqueue, struct task_struct *p, u64 enq_flags)
 	);
 
 	// setup struct pointers
-	u32 cpu = bpf_get_smp_processor_id();
+	u32 cpu = bpf_get_smp_processor_id() & (NR_CPUS - 1); // if NR_CPUS redefined, this prevents enqueue failures
 	struct global_task_data *gtd = fetch_global_task_data();
 	struct cpu_sched_state *ss = bpf_map_lookup_elem(&sched_state, &cpu);
 	if (unlikely(!gtd || !ss)) return; // for verifier, should not happen
@@ -774,6 +789,10 @@ void BPF_STRUCT_OPS(fp_enqueue, struct task_struct *p, u64 enq_flags)
 	u64 weight = get_task_weight(p);
 	u64 vtime = ~0ULL - weight;
 	u32 task_cpu = scx_bpf_task_cpu(p) & (NR_CPUS - 1);
+	TRACE_EVENT(struct sched_trace_event_set_task_weight, SCHED_TRACE_SET_TASK_WEIGHT,
+		e->pid = p->pid;
+		e->weight = weight;
+	);
 
 	// check if must run on local CPU due to migration disabled (bypasses priority system)
 	if (is_migration_disabled(p)) {
@@ -820,6 +839,30 @@ void BPF_STRUCT_OPS(fp_enqueue, struct task_struct *p, u64 enq_flags)
 	// worst case just an extra enqueue to sort out
 	// should be rare since time between kick and dispatch is small
 	// if all CPUs are kicked (extremely unlikely) try again
+
+	// optimization: first check if any idle and kick that one
+	// check prev CPU first to avoid migrations
+	s32 idle_cpu = scx_bpf_test_and_clear_cpu_idle(task_cpu) ? task_cpu : scx_bpf_pick_idle_cpu(p->cpus_ptr, 0);
+	if (idle_cpu >= 0 && idle_cpu < NR_CPUS) {
+		struct cpu_task_state *cts = &gtd->cpu_task_states[idle_cpu & (NR_CPUS - 1)];
+
+		// kick cpu
+		bpf_spin_lock(&gtd->global_task_lock); // prevent other enqueues from claiming same CPU
+		bool do_kick = !cts->kicked;
+		cts->kicked = true;
+		bpf_spin_unlock(&gtd->global_task_lock);
+		
+		if (do_kick) {
+			scx_bpf_kick_cpu(idle_cpu, (u64)SCX_KICK_PREEMPT);
+			TRACE_EVENT(struct sched_trace_event_kick_cpu, SCHED_TRACE_KICK_CPU,
+				e->cpu = idle_cpu;
+			);
+			TRACE_FUNC_END("enqueue", "kicked idle");
+			return;
+		}
+	}
+
+	// then do the slow search
 	u32 trials;
 	bpf_for(trials, 0, NTRIALS) {
 		// first fetch a snapshot of what cgroups each cpu is running to avoid preempting ones with higher weight
@@ -907,7 +950,6 @@ void BPF_STRUCT_OPS(fp_cpu_release, s32 cpu, struct scx_cpu_release_args *args)
 
 void BPF_STRUCT_OPS(fp_running, struct task_struct *p)
 {
-	TRACE_FUNC_START("running");
   // bpf_printk("[INFO] [FP] [RUNNING] cgroup=%d pid=%d comm=%s", cgroup_id, p->pid, p->comm);
 	TRACE_EVENT(struct sched_trace_event_run_task, SCHED_TRACE_RUN_TASK,
 		e->pid = p->pid;
@@ -1010,7 +1052,7 @@ int BPF_PROG(trace_migrate_enable, struct task_struct *p, struct affinity_contex
 // can probably improve this by loading a new instance per FP scheduler
 SEC("syscall")
 int BPF_PROG(update_weight, u64 pid, u64 weight) {
-	bpf_printk("[INFO] [FP] [UPDATE_WEIGHT] Updating weight of task %d to %llu\n", pid, weight);
+	// bpf_printk("[INFO] [FP] [UPDATE_WEIGHT] Updating weight of task %d to %llu\n", pid, weight);
 	// update weight in map
 	struct task_struct *p = bpf_task_from_pid(pid);
 	if (unlikely(!p)) {
@@ -1022,13 +1064,16 @@ int BPF_PROG(update_weight, u64 pid, u64 weight) {
 		bpf_task_release(p);
 		return 0; // for verifier, should not happen
 	}
-
+	u32 cpu = scx_bpf_task_cpu(p);
 	*task_weight_ptr = weight;
-
 	bpf_task_release(p);
 
+	TRACE_EVENT(struct sched_trace_event_set_task_weight, SCHED_TRACE_SET_TASK_WEIGHT,
+		e->pid = pid;
+		e->weight = weight;
+	);
+
 	// kick cpu
-	u32 cpu = bpf_get_smp_processor_id();
 	scx_bpf_kick_cpu(cpu, (u64)SCX_KICK_PREEMPT);
 	TRACE_EVENT(struct sched_trace_event_kick_cpu, SCHED_TRACE_KICK_CPU,
 		e->cpu = cpu;
@@ -1049,7 +1094,7 @@ SCX_OPS_DEFINE(fp_ops,
 	// SCX_OPS_SWITCH_PARTIAL: does not assign tasks to sched_ext by default
 	// SCX_OPS_ENQ_LAST: if no work on subscheduler, enqueues current running task rather than continuing it and calls dispatch again
 	//									 allows for skipping an idle sub and running next sub instead of continuing prev sub
-	.flags			= SCX_OPS_SWITCH_PARTIAL | SCX_OPS_ENQ_LAST,
+	.flags			= SCX_OPS_SWITCH_PARTIAL | SCX_OPS_ENQ_LAST | SCX_OPS_ENQ_MIGRATION_DISABLED,
 	// .dump			= (void *)fp_dump,
 
 	// task scheduling (should not be called)
