@@ -11,12 +11,14 @@
 from pathlib import Path
 from contextlib import contextmanager
 import bt2
+import errno
 import json
 import os
 import re
 import select
 import shlex
 import signal
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -29,6 +31,7 @@ REPO_DIR = Path(__file__).resolve().parents[1]
 ROOT_OPS = Path("/sys/kernel/sched_ext/root/ops")
 CGROUP_ROOT = Path("/sys/fs/cgroup")
 TRACE_INSTANCES = Path("/sys/kernel/tracing/instances")
+KALLSYMS = Path("/proc/kallsyms")
 
 @contextmanager
 def defer_trace_interrupts():
@@ -81,6 +84,7 @@ class TraceSession:
     self._trace = None
     self._trace_log = None
     self._instance_path = None
+    self._restore_directory = None
     self._pending = b""
     self._manager_failed = False
     self._root_loaded = False
@@ -185,9 +189,57 @@ class TraceSession:
           if time.monotonic() >= deadline:
             raise TimeoutError(f"Recorder startup timed out; see {self._trace_log.name}")
           time.sleep(0.05)
+      self._prepare_restore()
     except BaseException as error:
       self._close_after_error(error)
       raise
+
+  def _prepare_restore(self):
+    self._restore_directory = tempfile.TemporaryDirectory(
+        prefix=".scxtp-headers-", dir=self.trace_path.parent)
+    directory = Path(self._restore_directory.name)
+    symbols = directory / "kallsyms"
+    # older trace-cmd counts and rereads kallsyms, which races BPF symbol removal
+    with KALLSYMS.open("rb") as source, symbols.open("xb") as target:
+      shutil.copyfileobj(source, target)
+    command = ["trace-cmd", "restore", "-c", "-k", str(symbols),
+               "-t", str(self._instance_path), "-o", str(directory / "headers.dat")]
+    result = subprocess.run(command, stdout=self._trace_log, stderr=subprocess.STDOUT,
+                            timeout=self.timeout)
+    if result.returncode != 0:
+      raise RuntimeError(f"Failed to save trace headers; see {self._trace_log.name}")
+
+  def _restore_after_kallsyms_error(self):
+    if self._restore_directory is None:
+      return False
+    self._trace_log.flush()
+    if "error in size of file '/proc/kallsyms'" not in Path(self._trace_log.name).read_text():
+      return False
+    prefix = self.trace_path.name + "." + self._instance_path.name + ".cpu"
+    streams = {int(path.name[len(prefix):]): path for path in self.trace_path.parent.iterdir()
+               if path.name.startswith(prefix) and path.name[len(prefix):].isdigit()}
+    if not streams or sorted(streams) != list(range(len(streams))):
+      raise RuntimeError("Cannot restore trace: private CPU streams are missing")
+    directory = Path(self._restore_directory.name)
+    restored = directory / "restored.dat"
+    command = ["trace-cmd", "restore", "-i", str(directory / "headers.dat"),
+               "-o", str(restored), *(str(streams[cpu]) for cpu in sorted(streams))]
+    self._trace_log.seek(0, os.SEEK_END)
+    self._trace_log.write("Restoring private CPU streams after trace-cmd kallsyms size race.\n"
+                          "Header symbols were saved before BPF attachment; later BPF symbols may be absent.\n")
+    self._trace_log.flush()
+    result = subprocess.run(command, stdout=self._trace_log, stderr=subprocess.STDOUT,
+                            timeout=self.timeout)
+    if result.returncode != 0:
+      raise RuntimeError(f"Failed to restore trace; see {self._trace_log.name}")
+    restored.replace(self.trace_path)
+    for path in streams.values():
+      path.unlink()
+    for cpu in streams:
+      unused = self.trace_path.with_name(self.trace_path.name + f".cpu{cpu}")
+      if unused.is_file() and unused.stat().st_size == 0:
+        unused.unlink()
+    return True
 
   # load sched_manager config
   # this attaches schedulers
@@ -257,14 +309,19 @@ class TraceSession:
     errors = []
     try:
       if process is not None:
-        # allow deferred BPF cleanup before trace-cmd reads kallsyms
-        time.sleep(1)
         status = self._finish_process(process)
-        if status != 0:
+        if status != 0 and (status != errno.EINVAL or not self._restore_after_kallsyms_error()):
           raise RuntimeError(f"Recorder exited with status {status}; see {self._trace_log.name}")
     except Exception as error:
       errors.append(error)
     finally:
+      if self._restore_directory is not None:
+        try:
+          self._restore_directory.cleanup()
+        except OSError as error:
+          errors.append(error)
+        finally:
+          self._restore_directory = None
       if self._trace_log is not None:
         self._trace_log.close()
         self._trace_log = None
@@ -356,6 +413,8 @@ class TraceParser:
     if self.messages is None:
       raise ValueError("TraceParser is closed")
     for message in self.messages:
+      if isinstance(message, (bt2._DiscardedEventsMessageConst, bt2._DiscardedPacketsMessageConst)):
+        raise RuntimeError("Capture lost events or packets; analysis would be incomplete")
       if isinstance(message, bt2._EventMessageConst):
         return message
     return None

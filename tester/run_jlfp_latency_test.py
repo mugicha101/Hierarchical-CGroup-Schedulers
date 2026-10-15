@@ -26,6 +26,14 @@ else:
   from trace_helpers import CGROUP_ROOT, REPO_DIR, TraceSession, defer_trace_interrupts
 
 
+LATENCY_EVENTS = ("sched:sched_process_exit",)
+DIAGNOSTIC_EVENTS = ("sched:sched_switch", "sched:sched_wakeup", "sched:sched_wakeup_new",
+                     "timer:hrtimer_start", "timer:hrtimer_expire_entry", "timer:hrtimer_expire_exit",
+                     "irq:irq_handler_entry", "irq:irq_handler_exit",
+                     "irq:softirq_entry", "irq:softirq_exit",
+                     "workqueue:workqueue_execute_start", "workqueue:workqueue_execute_end")
+
+
 def cpu_list(cpus):
   return ",".join(map(str, sorted(cpus)))
 
@@ -88,16 +96,18 @@ def temporary_cpu_dma_latency(latency_us):
 
 
 def cyclic_command(binary, output, cpus, controller_cpus, mode, threads, duration,
-                   interval_us, histogram_us, policy="ext", priority=None):
+                   interval_us, histogram_us, policy="ext", priority=None, *, spike_us=None):
   priority = (50 if policy == "fifo" else 0) if priority is None else priority
   # cyclictest's priority option resets other policies to FIFO; set the requested policy afterward
   command = [str(binary), f"--priority={priority}", f"--policy={policy}", f"--threads={threads}",
              f"--interval={interval_us}", f"--duration={duration}s", "--mlockall",
-             "--quiet", "--default-system", f"--mainaffinity={cpu_list(controller_cpus)}",
+             "--quiet", "--clock=monotonic", "--default-system", f"--mainaffinity={cpu_list(controller_cpus)}",
              f"--histogram={histogram_us}", f"--histfile={output / 'histogram.txt'}",
              f"--json={output / 'cyclictest.json'}"]
   if mode == "pinned":
     command.append(f"--affinity={cpu_list(cpus)}")
+  if spike_us is not None:
+    command.extend([f"--spike={spike_us}", "--spike-nodes=16384"])
   return command
 
 
@@ -212,24 +222,37 @@ def run_cyclic(command, output, cpus, duration, count, mode="migratable", policy
 
 def capture(output, build_path, binary, cpus, mode, threads, duration, interval_us,
             histogram_us, keep_bandwidth_servers=False, policy="ext", priority=None,
-            cpu_dma_latency_us=0, timer_slack_ns=1, *, isolate=False):
+            cpu_dma_latency_us=0, timer_slack_ns=1, *, isolate=False, diagnostic_trace=False,
+            spike_us=100, no_jlfp=False):
+  if no_jlfp and policy == "ext":
+    raise ValueError("EXT requires JLFP; use OTHER or FIFO with --no-jlfp")
+  if spike_us <= 0:
+    raise ValueError("spike threshold must be positive")
   cpus = select_test_cpus(isolate, cpus)
   available = os.sched_getaffinity(0)
   other_cpus = available - set(cpus)
   config = output / "config.json"
-  settings = {"policy": "scx_jlfp", "trace": False, "max_shard_size": SHARD_SIZE}
+  settings = {"policy": "none" if no_jlfp else "scx_jlfp", "trace": False,
+              "max_shard_size": SHARD_SIZE}
   if isolate:
     settings["subs"] = {"other": {"policy": "none", "weight": 1, "cpus": cpu_list(other_cpus)}}
   config.write_text(json.dumps(settings, indent=2) + "\n")
   command = cyclic_command(binary, output, cpus, other_cpus if isolate else available, mode, threads, duration,
-                           interval_us, histogram_us, policy, priority)
+                           interval_us, histogram_us, policy, priority,
+                           spike_us=spike_us if diagnostic_trace else None)
+  events = LATENCY_EVENTS + (DIAGNOSTIC_EVENTS if diagnostic_trace else ())
   run = {"mode": mode, "cpus": sorted(cpus), "scx_build_path": str(build_path.resolve()),
          "command": command, "threads": threads, "duration_s": duration,
          "interval_us": interval_us, "histogram_us": histogram_us, "policy": policy,
+         "measurement_clock": "CLOCK_MONOTONIC",
          "power_settings": "governors unchanged; cyclictest --default-system",
          "cpu_dma_latency_requested_us": cpu_dma_latency_us,
          "timer_slack_requested_ns": timer_slack_ns,
-         "trace_events": ["sched:sched_process_exit"],
+         "jlfp_attached": not no_jlfp, "diagnostic_trace": diagnostic_trace,
+         "trace_events": list(events),
+         "spike_logging": {"threshold_us": spike_us, "max_records": 16384,
+                           "timestamp_clock": "CLOCK_MONOTONIC", "timestamp_unit": "us",
+                           "output": "cyclictest.log"} if diagnostic_trace else None,
          "samples_include_startup": True}
   (output / "run.json").write_text(json.dumps(run, indent=2) + "\n")
   servers = nullcontext({"disabled": False}) if not isolate or keep_bandwidth_servers else \
@@ -241,8 +264,8 @@ def capture(output, build_path, binary, cpus, mode, threads, duration, interval_
          controller, servers as state:
       run["cpu_dma_latency"] = qos
       run["bandwidth_servers"] = state
-      # only process exits are recorded; scheduler hotpath emissions remain disabled
-      with TraceSession(events=("sched:sched_process_exit",), scx_build_path=build_path,
+      # diagnostic runs record timer delivery separately from runnable scheduling delay
+      with TraceSession(events=events, scx_build_path=build_path,
                         monitor=True) as session, ExitStack() as isolation:
         session.start_trace(output / "trace.dat")
         session.load_config(config)
@@ -269,7 +292,13 @@ def main():
                       help="default to the last four allowed CPUs and set up background-work isolation")
   parser.add_argument("--mode", choices=("pinned", "migratable"), default="migratable")
   parser.add_argument("--policy", choices=("ext", "fifo", "other"), default="ext",
-                      help="worker policy: EXT for JLFP, OTHER for FAIR, FIFO for RT; JLFP stays attached")
+                      help="worker policy: EXT for JLFP, OTHER for FAIR, FIFO for RT")
+  parser.add_argument("--no-jlfp", action="store_true",
+                      help="run an OTHER/FIFO baseline without attaching JLFP")
+  parser.add_argument("--diagnostic-trace", action="store_true",
+                      help="record scheduler/timer/IRQ events and timestamped spikes; adds tracing overhead")
+  parser.add_argument("--spike-us", type=int, default=100,
+                      help="log samples above this threshold with --diagnostic-trace (default: 100 us)")
   parser.add_argument("--priority", type=int, help="default: 0 for EXT/OTHER, 50 for FIFO")
   parser.add_argument("--threads", type=int, default=1,
                       help="one thread leaves idle CPUs available for same-core wakeup testing")
@@ -289,6 +318,10 @@ def main():
   priority = (50 if args.policy == "fifo" else 0) if args.priority is None else args.priority
   if args.policy in ("ext", "other") and priority != 0 or args.policy == "fifo" and not 1 <= priority <= 99:
     parser.error("EXT/OTHER require priority 0; FIFO requires priority 1..99")
+  if args.no_jlfp and args.policy == "ext":
+    parser.error("EXT requires JLFP; use OTHER or FIFO with --no-jlfp")
+  if args.spike_us <= 0:
+    parser.error("spike threshold must be positive")
   if not -1 <= args.cpu_dma_latency_us <= 2**31 - 1:
     parser.error("cpu-dma-latency-us must be -1 or a nonnegative signed 32-bit integer")
   if not 1 <= args.timer_slack_ns <= ctypes.c_ulong(-1).value:
@@ -311,7 +344,8 @@ def main():
     result = capture(output, args.scx_build_path, args.cyclictest, cpus, args.mode,
                      args.threads, args.duration, args.interval_us, args.histogram_us,
                      args.keep_bandwidth_servers, args.policy, priority, args.cpu_dma_latency_us,
-                     args.timer_slack_ns, isolate=args.isolate)
+                     args.timer_slack_ns, isolate=args.isolate, diagnostic_trace=args.diagnostic_trace,
+                     spike_us=args.spike_us, no_jlfp=args.no_jlfp)
     (output / "results.json").write_text(json.dumps(result, indent=2) + "\n")
     print(json.dumps(result, indent=2))
     return 0

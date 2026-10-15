@@ -44,6 +44,8 @@ SCHED_EXT = 7
 PF_KTHREAD = 0x00200000
 SHARD_SIZE = 4
 SCHED_DEBUG = Path("/sys/kernel/debug/sched")
+SYS_NET = Path("/sys/class/net")
+SYS_MODULE = Path("/sys/module")
 
 
 def report_progress(message):
@@ -139,6 +141,133 @@ def controller_affinity(worker_cpus):
 
 @contextmanager
 def isolated_root_tasks(state_path):
+  with temporary_wifi_isolation(state_path.with_name("wifi_isolation.json")):
+    with _isolated_root_tasks(state_path) as state:
+      yield state
+
+
+def wifi_devices():
+  devices = []
+  for interface in sorted(SYS_NET.iterdir()):
+    if not (interface / "wireless").is_dir() and not (interface / "phy80211").exists():
+      continue
+    candidates = (interface / "device/driver/module", interface / "phy80211/device/driver/module")
+    module = next((path.resolve().name for path in candidates if path.exists()), None)
+    devices.append({"interface": interface.name, "module": module})
+  return devices
+
+
+def wifi_command(command):
+  try:
+    result = subprocess.run(command, check=True, capture_output=True, text=True, timeout=30,
+                            env={**os.environ, "LC_ALL": "C"})
+  except (OSError, subprocess.SubprocessError) as error:
+    detail = getattr(error, "stderr", None) or str(error)
+    raise RuntimeError(f"Wi-Fi isolation command {' '.join(command)} failed: {detail.strip()}") from error
+  return result.stdout.strip()
+
+
+@contextmanager
+def temporary_wifi_isolation(state_path):
+  devices = wifi_devices()
+  modules = sorted({device["module"] for device in devices if device["module"] is not None})
+  state = {"enabled": bool(devices), "interfaces": devices, "original_radio": None,
+           "current_radio": None, "radio_restored": None, "removed_modules": [],
+           "modules": {module: {"original_loaded": (SYS_MODULE / module).exists(),
+                                 "current_loaded": (SYS_MODULE / module).exists(), "restored": False}
+                       for module in modules},
+           "setup_complete": False, "cleanup_complete": False, "restored": False}
+  state_path.write_text(json.dumps(state, indent=2) + "\n")
+  radio_touched = False
+  try:
+    if devices:
+      if os.geteuid() != 0:
+        raise PermissionError("root is required to isolate Wi-Fi")
+      unsupported = [device["interface"] for device in devices if device["module"] is None]
+      if unsupported:
+        raise RuntimeError("Cannot isolate Wi-Fi: no removable driver module for " +
+                           ", ".join(unsupported) + " (built-in or unmanaged driver)")
+      original = wifi_command(["nmcli", "-t", "radio", "wifi"])
+      if original not in ("enabled", "disabled"):
+        raise RuntimeError(f"Cannot determine NetworkManager Wi-Fi radio state: {original!r}")
+      state["original_radio"] = state["current_radio"] = original
+      state_path.write_text(json.dumps(state, indent=2) + "\n")
+      report_progress("Disabling Wi-Fi and unloading driver modules: " + ", ".join(modules) + "...")
+      with defer_trace_interrupts():
+        radio_touched = True
+        wifi_command(["nmcli", "radio", "wifi", "off"])
+        state["current_radio"] = wifi_command(["nmcli", "-t", "radio", "wifi"])
+        if state["current_radio"] != "disabled":
+          raise RuntimeError("Wi-Fi radio did not disable")
+        for module in modules:
+          if not state["modules"][module]["original_loaded"]:
+            raise RuntimeError(f"Wi-Fi driver module {module} disappeared before isolation")
+          try:
+            wifi_command(["rmmod", module])
+          finally:
+            loaded = (SYS_MODULE / module).exists()
+            state["modules"][module]["current_loaded"] = loaded
+            if not loaded:
+              state["removed_modules"].append(module)
+          if loaded:
+            raise RuntimeError(f"Wi-Fi driver module {module} did not unload")
+          state_path.write_text(json.dumps(state, indent=2) + "\n")
+    state["setup_complete"] = True
+    state_path.write_text(json.dumps(state, indent=2) + "\n")
+    yield state
+  except BaseException as error:
+    state["error"] = str(error) or type(error).__name__
+    raise
+  finally:
+    with defer_trace_interrupts():
+      errors = []
+      if radio_touched:
+        report_progress("Restoring Wi-Fi driver modules and radio state...")
+      for module in reversed(state["removed_modules"]):
+        try:
+          wifi_command(["modprobe", module])
+          if not (SYS_MODULE / module).exists():
+            raise RuntimeError(f"Wi-Fi driver module {module} did not reload")
+        except (OSError, RuntimeError) as error:
+          errors.append(str(error))
+      for module, saved in state["modules"].items():
+        saved["current_loaded"] = (SYS_MODULE / module).exists()
+        saved["restored"] = saved["current_loaded"] == saved["original_loaded"]
+      if radio_touched:
+        try:
+          wifi_command(["nmcli", "radio", "wifi", "on" if state["original_radio"] == "enabled" else "off"])
+          state["current_radio"] = wifi_command(["nmcli", "-t", "radio", "wifi"])
+          state["radio_restored"] = state["current_radio"] == state["original_radio"]
+          if not state["radio_restored"]:
+            raise RuntimeError("Wi-Fi radio state did not restore")
+        except (OSError, RuntimeError) as error:
+          errors.append(str(error))
+      pending = {device["interface"] for device in devices
+                 if device["module"] in state["removed_modules"]}
+      deadline = time.monotonic() + 5
+      while pending:
+        pending = {name for name in pending if not (SYS_NET / name).exists()}
+        if not pending or time.monotonic() >= deadline:
+          break
+        time.sleep(.05)
+      state["interfaces_restored"] = not pending
+      if pending:
+        errors.append("Wi-Fi interfaces did not reappear: " + ", ".join(sorted(pending)))
+      state["cleanup_complete"] = True
+      state["restored"] = all(saved["restored"] for saved in state["modules"].values()) and \
+          (not radio_touched or state["radio_restored"] is True) and state["interfaces_restored"]
+      if errors:
+        state["cleanup_errors"] = errors
+      try:
+        state_path.write_text(json.dumps(state, indent=2) + "\n")
+      except OSError as error:
+        errors.append(f"Failed to save Wi-Fi restoration state: {error}")
+      if errors:
+        raise RuntimeError("Failed to restore Wi-Fi isolation: " + "; ".join(errors))
+
+
+@contextmanager
+def _isolated_root_tasks(state_path):
   root_procs = CGROUP_ROOT / "cgroup.procs"
   other = CGROUP_ROOT / "other"
   other_procs = other / "cgroup.procs"
