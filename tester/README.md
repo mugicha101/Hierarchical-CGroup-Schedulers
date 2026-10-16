@@ -19,7 +19,9 @@ tester/experiments/
     run_jlfp_wakeup_test.py    wakeup placement and latency
     run_jlfp_latency_test.py   existing traced cyclictest comparison
   overhead/
-    plan.py                   upcoming overhead E1–E4; no runnable benchmarks
+    run_e1.py                 trace-free cyclictest E1 matrix
+    analyse_e1.py             standalone raw-histogram statistics
+    plan.py                   implemented E1 and upcoming E2–E4
 ```
 
 The JLFP and MC² runners delegate worker capture, cgroup placement and offline
@@ -36,8 +38,8 @@ the shared CLI wrapper handles termination signals.
 
 The overhead/inversion experiment driver and its configuration live in
 `tester/experiments/`, with build, preflight, lifecycle and tracing helpers in
-`tester/utils/`. Benchmark cases are still pending later stages;
-these commands inspect prerequisites or build private artifacts:
+`tester/utils/`. Overhead E1 is implemented; E2–E4 remain pending.
+These commands inspect prerequisites or build private artifacts:
 
 ```sh
 python3 tester/experiments/run.py plan
@@ -125,7 +127,8 @@ install dependencies or prepare cgroups.
 
 The new cyclictest build uses upstream revision
 `62da2befac98f811af8e56f2b7992fb09faa33d6` in a private checkout with only EXT
-policy support and the existing inherited-affinity fix applied. Its patch is
+policy support, correct EXT worker policy selection, the inherited-affinity fix,
+and an optional E1 worker startup gate. Its patch is
 saved with the build. It does not replace `cyclictest/rt-tests` or build/use
 cyclicdeadline. Preflight returns status 2 and preserves a JSON report when
 prerequisites are missing; `preflight --traced` additionally checks trace tools.
@@ -160,7 +163,8 @@ Experiment-specific parameters live under three explicit `experiments` groups:
 | `inversion.jlfp_static` | Workers per CPU; continuous runnable workers with distinct JLFP weights. |
 | `inversion.jlfp_dynamic` | Workers per CPU, period and CPU budget in milliseconds. |
 | `inversion.mc2.classes` | Each class's utilization percentage, task count per CPU, periods in milliseconds, and release staggering. |
-| `overhead` | Upcoming E1–E4: measurement CPU (`cyclictest_cpu`) and aggregate stress utilization target. Remaining methodology is pending. |
+| `overhead` | Measurement CPU (`cyclictest_cpu`) and aggregate stress utilization target (95% by default). |
+| `overhead.e1` | Cyclictest interval/histogram, timer slack, CPU DMA latency request, repetitions, quantile/stddev conventions, stress-ng settings and per-scheduler priorities. |
 | `diagnostics.wakeup` | Worker count, period in milliseconds, CPU budget in microseconds. |
 | `diagnostics.latency` | Pinning mode, policy/priority, thread count, interval, histogram range, timer slack, temporary CPU DMA latency, scheduler attachment and diagnostics. |
 
@@ -192,17 +196,86 @@ release times, thread CPU-time budgets and skipped missed releases. Cleanup reap
 workers before detaching schedulers or finalizing the private trace. Scheduler
 and capture failures retain diagnostic output.
 
-## Upcoming Overhead Experiments
+## Overhead E1
 
-`experiments.overhead` contains the agreed overhead settings. The read-only
-matrix in `tester/experiments/overhead/plan.py` describes E1 (trace-free cyclictest
-latency), E2 (scheduling class operations), E3 (JLFP callback/class operation
-timing), and E4 (operation timing with migratable workers). View it with
-`python3 tester/experiments/run.py plan`.
+```sh
+sudo python3 tester/experiments/run.py e1
+sudo python3 tester/experiments/overhead/run_e1.py --config tester/experiments/debug.json --scheduler other --stress off
+python3 tester/experiments/overhead/run_e1.py --analyse-only SUITE_DIR
+```
 
-These benchmarks are not implemented. Remaining methodology and tracing
-prerequisites must be resolved before adding their runners. The existing
-`diagnostics/` scripts retain their current capture behavior and are not E1–E4.
+The default matrix has twelve cases: OTHER, FIFO, RR, qmap, simple and JLFP,
+each without stress-ng and with a 95% aggregate system-utilization target across
+the workload cgroup's effective CPUs. No additional utilization levels are run.
+The no-stress condition does not assert zero system utilization. Config controls
+the target through `experiments.overhead.stress_utilization_percent`.
+Final cases last 60 seconds; the debug profile uses 3 seconds. `--scheduler` and
+`--stress off|on` select partial reruns. DEADLINE remains deferred.
+
+Each invocation builds fresh cyclictest and the selected EXT schedulers, using
+trace profile `off`. EXT attaches at root with partial switching; native cases
+require EXT detached. No recorder, trace instance, scheduler manager or tracing
+parser is used. E1 checks available tracefs controls and refuses enabled events
+or function tracers; it does not change them. Kernel BPF timer support and host
+preparation remain external prerequisites. E1 never installs kernel patches.
+
+One cyclictest measurement thread is pinned to CPU 9. Its main thread stays
+within the workload cgroup's effective cpuset. A private cyclictest startup gate
+lets the controller verify the measurement TID's policy, priority, nice, affinity
+and timer slack, and set/read back its JLFP task weight before the first sample.
+The gate is inactive for ordinary cyclictest users. It discards no samples.
+
+E1 starts one pinned stress-ng CPU worker per workload CPU by default, using the
+`loop` CPU method and 10 ms busy slices. `workers_per_cpu`, method and busy slice
+are configurable. Per-worker load is rounded from target/workers-per-CPU; this
+is only the initial offered load. The shared warmup precedes measurement on
+stressed cases. `/proc/stat` counters cover only the effective workload CPUs,
+from cyclictest gate release through observed process exit, including shutdown.
+Raw counters and monotonic timestamps are saved. Trials outside the configured
+2 percentage point utilization tolerance fail and retain their artifacts for
+bounded retries. The runner does not silently equate `--cpu-load` with achieved
+system utilization. All stress-ng supervisors, workers and threads are checked
+for the requested policy, priority, nice, affinity and cgroup.
+
+Initial priority settings are explicit in `overhead.e1.policies`: FIFO/RR use
+50 for cyclictest and 10 for stress-ng; OTHER/qmap/simple use nice 0 versus 19;
+JLFP uses task weights 100 versus 1. JLFP and qmap use 1 ms slices, and JLFP uses
+four-CPU shards. Simple retains its existing weighted-vtime mode and built-in
+`SCX_SLICE_DFL` slice; it has no runtime slice option. Qmap/simple weight service
+is approximate and does not become strict fixed-priority scheduling. Scheduler
+algorithms are unchanged. Qmap's normal timers remain part of its execution.
+
+Measurement defaults are a 1 ms interval, integer microsecond histogram samples
+with a 10 ms histogram range, 1 ns timer slack, and a temporary 0 us CPU DMA
+latency request. All samples, including the first, are included. One fixed-order
+trial per case is configured initially. These values live in `overhead.e1` and
+can be changed in either complete profile. Timer slack and CPU DMA latency are
+restored/released, and owned workloads stop before the scheduler detaches.
+
+Each suite retains builds, commands, per-thread/process checks, histograms,
+cyclictest JSON and failed attempts. Successful suites produce `results.json`
+and `results.csv`: max, mean, median, p99, p99.9 and standard deviation in us,
+plus sample counts and achieved utilization. Means and standard deviation use
+the integer sample histogram, not cyclictest's rounded JSON average. Defaults
+are nearest-rank quantiles and population standard deviation. `linear` quantiles
+use interpolation at `(n-1)*p`; `sample` standard deviation uses `n-1`.
+Overflowed or inconsistent histograms, short runs, incorrect placement/policy,
+unexpected process exits or incomplete cleanup invalidate the attempt. Offline
+suite replay requires successful capture/cleanup records and unchanged raw hashes.
+
+For histogram-only inspection:
+
+```sh
+python3 tester/experiments/overhead/analyse_e1.py CYCLICTEST_JSON
+```
+
+This writes `e1-results.json` beside the raw JSON and labels the report analysis
+only: a valid histogram does not by itself validate an experimental trial.
+Live FIFO/RR/EXT E1 validation is still pending on the prepared target machine.
+
+The read-only `overhead/plan.py` also describes upcoming E2–E4. Their remaining
+methodology and tracing prerequisites must be resolved before implementation.
+The existing `diagnostics/` scripts remain separate from these experiments.
 
 ## Manual Noise Isolation
 

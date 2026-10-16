@@ -12,7 +12,7 @@ from .common import cgroup_cpus, workload_cgroup
 POLICIES = {"other": os.SCHED_OTHER, "fifo": os.SCHED_FIFO, "rr": os.SCHED_RR, "ext": 7}
 
 
-def set_weight(weight):
+def set_weight(weight, *, tid=None):
   library = ctypes.util.find_library("bpf")
   if library is None:
     raise RuntimeError("libbpf is required for JLFP task weights")
@@ -28,7 +28,8 @@ def set_weight(weight):
   if fd < 0:
     raise OSError(ctypes.get_errno(), "open JLFP task_weights")
   try:
-    pidfd = os.pidfd_open(os.getpid())
+    # PIDFD_THREAD is O_EXCL in linux/pidfd.h; task storage is per task
+    pidfd = os.pidfd_open(os.getpid()) if tid is None else os.pidfd_open(tid, os.O_EXCL)
     try:
       key, value = ctypes.c_int(pidfd), ctypes.c_uint64(weight)
       if bpf.bpf_map_update_elem(fd, ctypes.byref(key), ctypes.byref(value), 0):

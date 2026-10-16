@@ -136,9 +136,9 @@ def repository_state(path):
           "status": git("status", "--short", "--untracked-files=normal")}
 
 
-def new_run(config, name):
+def new_run(config, name, *, parent=None):
   stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
-  path = OUTPUT / f"{name}-{stamp}-{uuid.uuid4().hex[:8]}"
+  path = Path(parent or OUTPUT) / f"{name}-{stamp}-{uuid.uuid4().hex[:8]}"
   path.mkdir(parents=True, exist_ok=False)
   write_json(path / "run.json", {
       "kind": name, "config": config, "kernel": os.uname().release,
@@ -239,8 +239,8 @@ class Processes:
       raise CleanupError("; ".join(errors))
 
 
-def run_attempts(config, name, action):
-  root = new_run(config, name)
+def run_attempts(config, name, action, *, parent=None, measurement=False):
+  root = new_run(config, name, parent=parent)
   print(f"Artifacts: {root}", flush=True)
   for number in range(1, config["max_attempts"] + 1):
     directory = root / f"attempt-{number:02d}"
@@ -266,8 +266,12 @@ def run_attempts(config, name, action):
         state.update(status="cleanup_failed", cleanup="incomplete")
       else:
         state["status"] = "failed" if error else "succeeded"
+        state["measurement"] = bool(measurement and error is None)
       write_json(directory / "status.json", state)
     if error is None:
+      if measurement:
+        metadata = read_json(root / "run.json")
+        write_json(root / "run.json", {**metadata, "measurement": True})
       return root
     if not isinstance(error, Exception) or isinstance(error, CleanupError):
       raise error

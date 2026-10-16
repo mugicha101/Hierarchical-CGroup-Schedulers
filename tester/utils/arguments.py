@@ -86,6 +86,30 @@ def parse_driver(description):
   smoke.add_argument("--traced", action="store_true")
   smoke.add_argument("--basic", action="store_true",
                      help="development check without housekeeping-slice validation")
+  e1 = commands.add_parser("e1", help="run trace-free cyclictest E1 cases")
+  add_e1_options(e1)
+  return parser.parse_args()
+
+
+def add_e1_options(parser):
+  parser.add_argument("--scheduler", choices=("other", "fifo", "rr", "qmap", "simple", "jlfp"),
+                      help="rerun one scheduler; default: all six")
+  parser.add_argument("--stress", choices=("off", "on"), help="rerun one load condition; default: both")
+  parser.add_argument("--analyse-only", type=Path, metavar="SUITE_DIR")
+
+
+def parse_e1(description):
+  parser = argparse.ArgumentParser(description=description)
+  parser.add_argument("--config", type=Path, default=common.DEFAULT_CONFIG)
+  add_e1_options(parser)
+  return parser.parse_args()
+
+
+def parse_e1_analysis(description):
+  parser = argparse.ArgumentParser(description=description)
+  parser.add_argument("cyclictest_json", type=Path)
+  parser.add_argument("--config", type=Path, default=common.DEFAULT_CONFIG)
+  parser.add_argument("--output", type=Path, help="default: e1-results.json beside the input")
   return parser.parse_args()
 
 

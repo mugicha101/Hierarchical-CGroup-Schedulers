@@ -6,7 +6,7 @@ import json
 import os
 import struct
 
-from .trace_helpers import CGROUP_ROOT
+from .common import CGROUP_ROOT
 
 SHARD_SIZE = 4
 

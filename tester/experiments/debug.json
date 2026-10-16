@@ -41,7 +41,51 @@
     },
     "overhead": {
       "cyclictest_cpu": 9,
-      "stress_utilization_percent": 95
+      "stress_utilization_percent": 95,
+      "e1": {
+        "interval_us": 1000,
+        "histogram_us": 10000,
+        "timer_slack_ns": 1,
+        "cpu_dma_latency_us": 0,
+        "repetitions": 1,
+        "quantile_method": "nearest_rank",
+        "stddev": "population",
+        "stress": {
+          "cpu_method": "loop",
+          "busy_slice_ms": 10,
+          "workers_per_cpu": 1,
+          "utilization_tolerance_percent": 2
+        },
+        "policies": {
+          "other": {
+            "cyclictest_nice": 0,
+            "stress_nice": 19
+          },
+          "fifo": {
+            "cyclictest_priority": 50,
+            "stress_priority": 10
+          },
+          "rr": {
+            "cyclictest_priority": 50,
+            "stress_priority": 10
+          },
+          "qmap": {
+            "cyclictest_nice": 0,
+            "stress_nice": 19,
+            "slice_ns": 1000000
+          },
+          "simple": {
+            "cyclictest_nice": 0,
+            "stress_nice": 19
+          },
+          "jlfp": {
+            "cyclictest_weight": 100,
+            "stress_weight": 1,
+            "slice_ns": 1000000,
+            "max_shard_size": 4
+          }
+        }
+      }
     },
     "diagnostics": {
       "wakeup": {

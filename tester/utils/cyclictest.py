@@ -13,7 +13,7 @@ import sys
 import time
 
 from . import cgroups as placement, common
-from .trace_helpers import REPO_DIR, TraceSession, defer_trace_interrupts
+from .common import REPO as REPO_DIR
 
 LATENCY_EVENTS = ("sched:sched_process_exit",)
 DIAGNOSTIC_EVENTS = ("sched:sched_switch", "sched:sched_wakeup", "sched:sched_wakeup_new",
@@ -90,7 +90,7 @@ def cyclic_command(binary, output, cpus, main_cpus, mode, threads, duration,
   # cyclictest's priority option resets other policies to FIFO; set the requested policy afterward
   command = [str(binary), f"--priority={priority}", f"--policy={policy}", f"--threads={threads}",
              f"--interval={interval_us}", f"--duration={duration}s", "--mlockall",
-             "--quiet", "--clock=monotonic", "--default-system", f"--mainaffinity={cpu_list(main_cpus)}",
+             "--quiet", "--clock=0", "--default-system", f"--mainaffinity={cpu_list(main_cpus)}",
              f"--histogram={histogram_us}", f"--histfile={output / 'histogram.txt'}",
              f"--json={output / 'cyclictest.json'}"]
   if mode == "pinned":
@@ -192,6 +192,7 @@ def check_thread_policies(process, count, cpus, mode, policy=7, timer_slack_ns=N
 
 def run_cyclic(command, output, cpus, duration, count, mode="migratable", policy=7,
                timer_slack_ns=1, *, cgroup=None):
+  from .trace_helpers import defer_trace_interrupts
   launcher = [sys.executable, str(Path(__file__).with_name("cyclictest_launch.py")), "--exec-cyclic",
               cpu_list(cpus), str(timer_slack_ns)]
   if cgroup is not None:
@@ -216,6 +217,7 @@ def capture(output, build_path, binary, cpus, mode, threads, duration, interval_
             histogram_us, policy="ext", priority=None,
             cpu_dma_latency_us=0, timer_slack_ns=1, *, diagnostic_trace=False,
             spike_us=100, no_jlfp=False, relative_to):
+  from .trace_helpers import TraceSession
   if no_jlfp and policy == "ext":
     raise ValueError("EXT requires JLFP; use OTHER or FIFO with --no-jlfp")
   if spike_us <= 0:

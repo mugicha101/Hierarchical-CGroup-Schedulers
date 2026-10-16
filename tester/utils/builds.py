@@ -63,6 +63,42 @@ def patch_cyclictest(checkout):
       '\tcase SCHED_EXT:\n\t\tpolicystr = "ext";\n\t\tbreak;\n\tcase SCHED_BATCH:\n')
   modified = patch_once(modified, "of: other, normal, batch, idle, fifo or rr.",
                         "of: other, normal, batch, idle, fifo, rr or ext.")
+  modified = patch_once(modified,
+      "\t\tif (priority && (policy == SCHED_FIFO || policy == SCHED_RR))\n"
+      "\t\t\tpar->policy = policy;",
+      "\t\tif ((priority && (policy == SCHED_FIFO || policy == SCHED_RR)) ||\n"
+      "\t\t    policy == SCHED_EXT)\n"
+      "\t\t\tpar->policy = policy;")
+  gate = r'''
+static void e1_wait_for_start(void)
+{
+	const char *ready = getenv("CGS_E1_READY");
+	const char *gate = getenv("CGS_E1_GATE");
+	char buffer[32], go;
+	int fd, length;
+
+	if (!ready && !gate)
+		return;
+	if (!ready || !gate)
+		fatal("incomplete E1 startup gate\n");
+	fd = open(ready, O_WRONLY | O_CREAT | O_EXCL, 0600);
+	if (fd < 0)
+		fatal("cannot publish E1 worker readiness\n");
+	length = snprintf(buffer, sizeof(buffer), "%d\n", gettid());
+	if (write(fd, buffer, length) != length)
+		fatal("cannot write E1 worker readiness\n");
+	close(fd);
+	fd = open(gate, O_RDONLY);
+	if (fd < 0 || read(fd, &go, 1) != 1 || go != 'g')
+		fatal("E1 controller closed the startup gate\n");
+	close(fd);
+}
+
+'''
+  modified = patch_once(modified, "static void *timerthread(void *param)\n", gate +
+                        "static void *timerthread(void *param)\n")
+  modified = patch_once(modified, "\t/* Get current time */\n",
+                        "\te1_wait_for_start();\n\n\t/* Get current time */\n")
   header = checkout / "src/cyclictest/rt_numa.h"
   for path, before, after in ((source, original, modified),
                               (header, header.read_text(), guard_header(header.read_text()))):
@@ -146,7 +182,8 @@ print('BUILD_RESULT=' + str(builds.build(load_config(sys.argv[1]), sys.argv[2], 
 
 def build(config, target, trace="off"):
   if os.geteuid() == 0:
-    return user_build(config, target, trace)
+    with controller_placement(config):
+      return user_build(config, target, trace)
   def action(directory, processes):
     timeout = config["build_timeout_s"]
     metadata = {"target": target, "trace_profile": trace, "latency_statistics": False}
@@ -222,6 +259,7 @@ def build(config, target, trace="off"):
       run(["make", "-j2", "cyclictest"], cwd=checkout)
       binary = checkout / "cyclictest"
       metadata["patched_source_sha256"] = sha256(checkout / "src/cyclictest/cyclictest.c")
+      metadata["e1_startup_gate"] = True
     metadata.update(binary=str(binary), binary_sha256=sha256(binary))
     write_json(directory / "build.json", metadata)
     return metadata
