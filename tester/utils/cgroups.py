@@ -35,15 +35,6 @@ def cgroup_cpu_set(cgroup):
   return parse_cpu_list((cgroup / "cpuset.cpus.effective").read_text())
 
 
-def worker_cgroup(cgroup):
-  if (cgroup / "cgroup.subtree_control").read_text().strip() or (cgroup / "tasks").exists():
-    cgroup = cgroup / "tasks"
-  if cgroup.exists() and (cgroup / "cgroup.subtree_control").read_text().strip():
-    raise ValueError(f"Worker cgroup {cgroup} distributes controllers; select a leaf "
-                     "cgroup for workers")
-  return cgroup
-
-
 def scheduler_shards():
   library = ctypes.util.find_library("bpf")
   if library is None:
@@ -112,14 +103,10 @@ def load_relative_config(session, output, cgroup, settings, *, check_shards=True
   return state
 
 
-def select_test_cpus(isolate=False, cpus=None, *, relative_to=None):
-  cgroup = existing_test_cgroup(relative_to) if relative_to is not None else CGROUP_ROOT
+def select_test_cpus(cpus=None, *, relative_to):
+  cgroup = existing_test_cgroup(relative_to)
   available = cgroup_cpu_set(cgroup)
-  if cpus is None:
-    cpus = sorted(available)[-SHARD_SIZE:] if isolate and cgroup == CGROUP_ROOT else available
-  selected = set(cpus)
+  selected = set(cpus) if cpus is not None else available
   if not selected or not selected <= available:
-    raise ValueError("worker CPUs must be nonempty and available")
-  if isolate and not os.sched_getaffinity(0) - selected:
-    raise ValueError("isolation requires at least one CPU outside the worker set")
+    raise ValueError("worker CPUs must be nonempty and available in the configured cgroup")
   return selected

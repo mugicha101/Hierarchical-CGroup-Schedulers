@@ -1,0 +1,62 @@
+{
+  "workload_cgroup": null,
+  "test_cpus": "8-15",
+  "controller_cpus": "0-7",
+  "cyclictest_cpu": 9,
+  "duration_s": 3,
+  "warmup_s": 0.2,
+  "stress_utilization_percent": 95,
+  "max_attempts": 1,
+  "process_timeout_s": 10,
+  "build_timeout_s": 300,
+  "experiments": {
+    "jlfp_static": {
+      "tasks_per_cpu": 2
+    },
+    "jlfp_dynamic": {
+      "tasks_per_cpu": 2,
+      "period_ms": 20,
+      "runtime_ms": 10
+    },
+    "mc2": {
+      "classes": {
+        "class_a": {
+          "utilization_percent": 15,
+          "tasks_per_cpu": 2,
+          "periods_ms": [20, 40],
+          "stagger": true
+        },
+        "class_b": {
+          "utilization_percent": 15,
+          "tasks_per_cpu": 2,
+          "periods_ms": [20, 40],
+          "stagger": true
+        },
+        "class_c": {
+          "utilization_percent": 15,
+          "tasks_per_cpu": 2,
+          "periods_ms": [20, 40],
+          "stagger": true
+        }
+      }
+    },
+    "wakeup": {
+      "workers": 1,
+      "period_ms": 1,
+      "runtime_us": 50
+    },
+    "latency": {
+      "mode": "migratable",
+      "policy": "ext",
+      "no_jlfp": false,
+      "priority": null,
+      "threads": 1,
+      "interval_us": 1000,
+      "histogram_us": 10000,
+      "cpu_dma_latency_us": 0,
+      "timer_slack_ns": 1,
+      "diagnostic_trace": false,
+      "spike_us": 100
+    }
+  }
+}

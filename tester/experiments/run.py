@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Prepare experiments and check their lifecycle; no benchmark cases run yet."""
 
-import argparse
 import json
 from pathlib import Path
 import signal
@@ -9,37 +8,24 @@ import sys
 
 if not __package__:
   sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from tester.utils import builds, preflight
-from tester.utils.common import DEFAULT_CONFIG, load_config, new_run, write_json
+from tester.utils import arguments, builds, preflight
+from tester.utils.common import load_config, new_run, write_json
 
 
 def plan(config):
-  return {"duration_s": config["duration_s"], "workload_cgroup": config["workload_cgroup"],
+  return {"duration_s": config["duration_s"], "warmup_s": config["warmup_s"], "workload_cgroup": config["workload_cgroup"],
           "test_cpus": config["test_cpus"], "controller_cpus": config["controller_cpus"],
           "utilization_cpus": config["test_cpus"],
           "stress_utilization_percent": config["stress_utilization_percent"],
           "overhead_e1": ["other", "fifo", "rr", "qmap", "simple", "jlfp"],
           "overhead_e2": ["other", "fifo", "qmap", "jlfp"],
           "overhead_e3_e4": ["jlfp"], "deferred_policies": {"deadline": "pending methodology"},
-          "benchmark_implementation": "pending stages 3-6"}
+          "benchmark_implementation": "pending stages 3-6",
+          "legacy_experiments": config["experiments"]}
 
 
 def main():
-  parser = argparse.ArgumentParser(description=__doc__)
-  parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
-  commands = parser.add_subparsers(dest="command", required=True)
-  commands.add_parser("plan", help="show the non-DEADLINE case matrix without running anything")
-  check = commands.add_parser("preflight", help="read and record live-run prerequisites")
-  check.add_argument("--traced", action="store_true")
-  build = commands.add_parser("build", help="build isolated artifacts without attaching schedulers")
-  build.add_argument("target", choices=("worker", "jlfp", "qmap", "simple", "cyclictest"))
-  build.add_argument("--trace", choices=("off", "events", "hotpath"), default="off")
-  smoke = commands.add_parser("smoke", help="check lifecycle with an expired worker schedule")
-  smoke.add_argument("scheduler", choices=("none", "jlfp", "qmap", "simple"))
-  smoke.add_argument("--traced", action="store_true")
-  smoke.add_argument("--basic", action="store_true",
-                     help="setup check on a development host without housekeeping isolation")
-  args = parser.parse_args()
+  args = arguments.parse_driver(__doc__)
   try:
     config = load_config(args.config)
     if args.command == "plan":

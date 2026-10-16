@@ -99,81 +99,168 @@ policy support and the existing inherited-affinity fix applied. Its patch is
 saved with the build. It does not replace `cyclictest/rt-tests` or build/use
 cyclicdeadline. Preflight returns status 2 and preserves a JSON report when
 prerequisites are missing; `preflight --traced` additionally checks trace tools.
-The harnesses described below retain their existing behavior.
+The harnesses below use the same configuration file for placement and timing.
 
 Follow the [scheduler build instructions](../scheds/README.md#setup). Inversion tests also require the [tracing module](../scheds/README.md#structured-scheduler-tracepoints). Live captures require sudo for BPF, ftrace, and cgroup setup.
 
 Trace analysis uses Python 3, `bt2`, and the Babeltrace2 ftrace plugin. [setup_bt2_ftrace.sh](setup_bt2_ftrace.sh) builds the plugin; its comments list the required development packages.
 
-## Common Behavior
+## Configured Experiments
 
-The static, dynamic, wakeup, and latency test scripts default to the root cgroup’s effective cpuset, or the effective cpuset of an existing cgroup selected with `--relative-to`. Worker CPUs may differ from the controller’s inherited affinity. The environment is assumed to be configured to remove noise. They leave controller affinity and bandwidth server runtimes unchanged and do not create `other` or migrate background processes. Workers are still placed in the root cgroup for JLFP. The static and dynamic tests default to two workers per allowed CPU; wakeup and latency tests retain their explicit worker/thread counts. Wakeup and latency tests accept `--cpus` to override the worker CPU set without enabling isolation.
+All entry points read `tester/experiments/config.json`. Set `workload_cgroup` to
+an existing prepared cgroup allowing CPUs 8-15. Ordinary JLFP, wakeup and latency
+runs require a process cgroup leaf. MC² uses that configured path as the base of
+its owned class hierarchy and refuses existing `class_a`, `class_b` or `class_c`
+children. The controller uses CPUs 0-7 and restores its original affinity afterward.
+The runners never create `other`, migrate unrelated processes or change host
+noise controls. MC²'s per-CPU child cgroups inherit from the configured base and
+restrict the pinned A/B workers to their assigned CPUs.
 
-Static, dynamic, and wakeup tests use the native busy-loop worker in `tester/work.c`; Python handles setup and trace analysis. They automatically build `tester/build/jlfp_worker` with `cc`, pthread support, and libbpf when missing or older than the source. Each worker is a separate C process that blocks until the controller installs affinity, weight, and SCHED_EXT policy. Periodic workloads use absolute monotonic sleeps, thread CPU-time budgets, staggered phases, and skipped missed releases. The original standalone pthread workload remains available through `tester/build.sh`; the latency harness already uses C cyclictest workers.
+Shared `duration_s` is 60 seconds; `warmup_s` is 1 second for native-worker runs.
+Cyclictest histograms include startup and do not use the native-worker warmup.
+Experiment-specific parameters live under `experiments`:
 
-JLFP inversion tests save scheduler output in `scheduler.log` if setup or cleanup fails, including verifier diagnostics.
+| Section | Settings |
+| --- | --- |
+| `jlfp_static` | Workers per CPU; continuous runnable workers with distinct JLFP weights. |
+| `jlfp_dynamic` | Workers per CPU, period and CPU budget in milliseconds. |
+| `wakeup` | Worker count, period in milliseconds, CPU budget in microseconds. |
+| `mc2.classes` | Each class's utilization percentage, task count per CPU, periods in milliseconds, and release staggering. |
+| `latency` | Pinning mode, policy/priority, thread count, interval, histogram range, timer slack, temporary CPU DMA latency, scheduler attachment and diagnostics. |
 
-## Isolation
+`tester/experiments/debug.json` is a complete alternate config with 3-second runs,
+0.2-second native-worker warmup and one attempt. Set its cgroup for the development
+machine too. It is loaded explicitly; there is no implicit merge or auto-detection.
 
-Add `--isolate` to restrict workers to the last four allowed CPUs (the configured shard size) and set up cyclictest's `other` arrangement. Wakeup and latency `--cpus` overrides still apply. Isolation requires a CPU outside the worker set for the controller. The scripts create `/sys/fs/cgroup/other` with its CPU set limited to the non-worker CPUs, move root processes there before starting workers, and explicitly place workers in the root cgroup. PID 1, the controller, and kernel threads remain in root when already there; the controller runs on non-worker CPUs. Cleanup returns processes from `other` to root and removes the test's cgroup, including on failure or interruption. An existing `other` cgroup causes setup to fail rather than overwrite it. Isolation also saves the Wi-Fi radio state, disables it, and unloads the wireless device driver during the test; cleanup reloads the driver and restores the previous radio state. This briefly disconnects Wi-Fi. `wifi_isolation.json` records setup and restoration. `cpu_isolation.json` and `run.json` record the CPU set and moved/skipped PIDs. Existing cgroup hierarchies and their CPU sets are left unchanged, so their tasks and per-CPU kernel threads can still contend with workers.
+```sh
+python3 tester/experiments/run.py --config tester/experiments/debug.json plan
+sudo python3 tester/experiments/run_jlfp_dynamic_test.py --config tester/experiments/debug.json
+```
 
-With `--isolate`, the scripts temporarily disable the FAIR deadline server and SCX bandwidth server on the worker CPUs by setting their debugfs runtimes to 0. They save their original settings in `bandwidth_servers.json` and `run.json`, then restore the runtimes after scheduler detach, including on failure or interruption. Run the tests with sudo for BPF and ftrace; isolation also requires the `fair_server` and `ext_server` controls under `/sys/kernel/debug/sched`. Use `--isolate --keep-bandwidth-servers` for isolation with the original bandwidth settings.
+Durations, CPU sets, cgroups and workload parameters come from config rather than
+CLI flags. `--output-dir` and `--analyse-only CAPTURE_DIR` remain available; saved
+inversion/wakeup captures can be analysed without root or a live workload cgroup.
+Each new capture saves the resolved config and command in `experiment.json`.
+`--scx-build-path` is an optional debug build override. Latency also retains
+`--cyclictest`, `--mode`, `--policy`, `--no-jlfp`, `--diagnostic-trace` and
+`--spike-us`; absent overrides use the config values.
 
-The MC² test uses the same background isolation while keeping workers in their class cgroups.
+Native workers come from `tester/work.c`, built automatically into
+`tester/build/jlfp_worker`. They wait for cgroup placement, CPU affinity, weights
+and SCHED_EXT policy before running. Periodic workers use absolute monotonic
+release times, thread CPU-time budgets and skipped missed releases. Cleanup reaps
+workers before detaching schedulers or finalizing the private trace. Scheduler
+and capture failures retain diagnostic output.
 
-## Static JLFP Inversions
+## Manual Noise Isolation
+
+These commands are separate from every experiment:
+
+```sh
+sudo python3 tester/utils/isolation.py --config tester/experiments/debug.json enable
+sudo python3 tester/utils/isolation.py status
+sudo python3 tester/utils/isolation.py disable
+```
+
+`enable` saves original settings to `/run/cgs-tester-isolation.json`, disables the
+Wi-Fi radio, unloads the detected Wi-Fi driver modules, and sets FAIR/SCX bandwidth
+server runtimes to zero on the configured test CPUs. It needs those debugfs runtime
+controls and removable Wi-Fi modules when Wi-Fi is present. Driver removal
+interrupts Wi-Fi until restored. It makes no cgroup, cpuset, governor or background
+process changes. CPU placement always comes from the prepared cgroup and config.
+
+`disable` restores the saved driver/radio state and bandwidth runtimes, then
+removes the snapshot. It uses the original snapshot even if config has changed.
+Repeated `enable` refuses to overwrite an outstanding snapshot. Setup failure rolls
+back; incomplete restoration retains the snapshot for another `disable` attempt.
+The utility exits after enabling, so restore explicitly when development tests end.
+
+## JLFP Inversions and Wakeups
 
 ```sh
 sudo python3 tester/experiments/run_jlfp_test.py
+sudo python3 tester/experiments/run_jlfp_dynamic_test.py
+sudo python3 tester/experiments/run_jlfp_wakeup_test.py
 ```
 
-The JLFP test reports capture stages and offline analysis progress. From the repository root, use `python3 tester/experiments/run_jlfp_test.py --analyse-only tester/build/jlfp-test-<timestamp>` to analyse a saved capture without running workers again. The directory must contain `trace.dat` and `run.json`; this rewrites `analysis.log` and `results.json`. Saved captures containing placement diagnostics are still supported; those events are skipped by the inversion calculation.
+Static JLFP defaults to two continuous workers per CPU. Dynamic JLFP defaults to
+two workers per CPU, a 20 ms period and 10 ms CPU budget, with staggered releases.
+Wakeup defaults to one migratable worker, a 1 ms period and 50 us CPU budget.
+Native switch/wakeup events distinguish blocking from preemption. Wakeup analysis
+retains individual samples and reports wake-to-run latency and migration ratios.
 
-## Dynamic JLFP Inversions
+Replay a saved capture with the same runner's `--analyse-only CAPTURE_DIR`. Its
+`trace.dat` and `run.json` supply measurement metadata; analysis rewrites the
+analysis log/results while preserving raw captures. Existing saved captures remain
+supported. JLFP placement diagnostics are excluded from inversion calculations.
+
+## MC² Hierarchy and Utilization
 
 ```sh
-sudo python3 tester/experiments/run_jlfp_dynamic_test.py --isolate
+sudo python3 tester/experiments/run_mc2_dynamic_test.py
 ```
 
-To test periodic blocking and wakeups, run `sudo python3 tester/experiments/run_jlfp_dynamic_test.py`. By default, two weighted workers per allowed CPU share the full allowed CPU set, each consuming a 10 ms CPU budget per 20 ms period before sleeping. Releases are staggered across the period; preemption does not consume the CPU budget, and missed releases are skipped. Adjust `--runtime-ms`, `--period-ms`, `--tasks-per-cpu`, `--warmup`, and `--duration` to vary the load. The test uses native sleep/wakeup events to exclude blocked workers from priority comparisons and reports inversion time, longest inversion, and worker wakeup/block counts. Captures use `tester/build/jlfp-dynamic-test-<timestamp>` and save the period, budget, and phases in `run.json`; use `--analyse-only CAPTURE_DIR` to reanalyse them.
+The fixed hierarchy is root JLFP, pinned JLFP/RM class A (weight 4), pinned GEDF
+class B (weight 3), and migratable GEDF class C (weight 2). Each class has its own
+config entry, for example:
 
-## MC² Hierarchy
-
-For inversions between MC² classes and between tasks within each class, run from the repository root. The terminal summary prints explicit percentages of measurement time and durations in milliseconds. Each class has its own task-inversion time, count, longest interval, and top three task pairs. A uses RM priorities; B/C follow changing EDF deadlines. Detailed nanosecond values and all task pairs remain in `results.json` under `within_class_inversions`. Per-class and task-pair totals can overlap; the combined within-class time counts their union:
-
-```sh
-sudo python3 tester/experiments/run_mc2_dynamic_test.py --isolate
+```json
+"class_a": {
+  "utilization_percent": 15,
+  "tasks_per_cpu": 2,
+  "periods_ms": [20, 40],
+  "stagger": true
+}
 ```
 
-The test expands `tester/mc2/mc2_config.json` into root JLFP without workers, class A pinned JLFP (weight 4), class B pinned GEDF (weight 3), and class C global GEDF (weight 2). Class D is omitted. Per-CPU child cgroups enforce A/B affinity; C shares the worker CPU set. Each class defaults to two workers per CPU, with 20/40 ms periods and 2 ms CPU budgets. Class A uses rate-monotonic weights. B/C use implicit-deadline sporadic EDF parameters and atomic job-completion notifications, allowing the native workers to skip missed releases. Matching initial phases make the classes compete on wakeup. Use `--tasks-per-cpu`, `--period-ms`, and `--runtime-ms` to change the load.
+A class's percentage is relative to the capacity of the entire configured CPU set:
+15% of eight CPUs is 1.2 CPU-seconds per second. `tasks_per_cpu` repeats the period
+mix on each CPU; C's resulting workers can migrate across the full set. There must
+be one period per configured task. The class gets one common CPU-time budget so
+`sum(runtime / period) / number_of_CPUs * 100` equals its utilization target, subject
+to nanosecond rounding. Thus the example gives each task a 2 ms budget. Changing a
+class's target scales its budgets without changing the other classes. RM weights
+follow period order, equal periods have equal priority, and optional staggering
+retains the existing phase layout. A zero-load class stays attached without workers.
 
-Results separately report inversions between and within classes, per-class CPU time, and offending class pairs. A waiting worker counts only when it outranks a running worker on a CPU allowed by its affinity. The category times can overlap; the overall inversion time counts their union. Captures use `tester/build/mc2-dynamic-test-<timestamp>`; replay with `python3 tester/experiments/run_mc2_dynamic_test.py --analyse-only CAPTURE_DIR`. The test verifies initialization of all four schedulers and traced weights for every worker; missing tracing or premature detach fails analysis. Current non-root JLFP/GEDF initialization uses a self-weight of 100 rather than the configured class weight; this test compares against the configured MC² priorities so it can expose that behavior.
+The default remains 15% per class, or 45% total offered load, preserving the old
+2 ms, 20/40 ms workload. Class contributions can sum above 100% for deliberate
+overload; each task must still have a positive budget shorter than its period.
+These are offered workload targets. Missed releases, preemption and unrelated
+activity can change achieved utilization. Metadata retains requested/rounded class
+loads plus raw `/proc/stat` counters and their actual sampling window across CPUs
+8-15, excluding warmup. Offline results report each class's executed CPU time as a
+percentage of total configured CPU capacity, separately from system utilization.
 
-## Wakeup Latency and Migration
-
-```sh
-sudo python3 tester/experiments/run_jlfp_wakeup_test.py --isolate
-```
-
-To measure idle-core wakeup migration, run `sudo python3 tester/experiments/run_jlfp_wakeup_test.py` from the repository root. By default, one migratable worker runs for a 50 us CPU budget every 1 ms across all allowed CPUs. Add `--isolate` for the isolated four-CPU comparison. The test matches native blocking, wakeup, and first-execution events, saves `wakeup-results.json`, and reports actual migration ratios and wake-to-run latency. It separately identifies local timer wakeups that followed an observed idle-to-timer transition. Use `--scx-build-path BUILD` to compare scheduler builds and `--analyse-only CAPTURE_DIR` to replay a capture. Opt-in isolation and bandwidth settings restore through the existing helpers.
+Analysis reports inversions between classes and within each class, including class
+and task pairs. Overlapping category times use a union for the overall inversion
+time. Missing initialization, applied weights, tracing or premature scheduler
+detach invalidates the capture. Non-root JLFP/GEDF self-weight initialization remains
+an existing scheduler issue that this harness can expose; scheduler logic is unchanged.
 
 ## Cyclictest Comparisons
 
-The older `tester/utils/build_jlfp_cyclictest.py` builder uses `cyclictest/rt-tests`, cloning a
-pinned checkout when it is absent and applying the repository's modified source
-in a separate build copy. The staged setup above instead patches upstream source.
-
-For cyclictest comparisons, first build a separate copy that preserves unpinned threads' inherited CPU affinity:
+The older utility builder uses `cyclictest/rt-tests` and the repository's modified
+source in a private copy. The staged build instead patches pinned upstream source.
 
 ```sh
 python3 tester/utils/build_jlfp_cyclictest.py --output-dir tester/build/cyclictest-affinity
-sudo python3 tester/experiments/run_jlfp_latency_test.py --cyclictest tester/build/cyclictest-affinity/cyclictest --isolate --mode migratable --threads 1
-sudo python3 tester/experiments/run_jlfp_latency_test.py --cyclictest tester/build/cyclictest-affinity/cyclictest --isolate --mode migratable --threads 1 --policy other
-sudo python3 tester/experiments/run_jlfp_latency_test.py --cyclictest tester/build/cyclictest-affinity/cyclictest --isolate --mode pinned --threads 4
+sudo python3 tester/experiments/run_jlfp_latency_test.py --cyclictest tester/build/cyclictest-affinity/cyclictest
 ```
 
-Use `--policy other` for FAIR (SCHED_OTHER) workers with the same isolation and timing settings. JLFP remains attached for this comparison, but its partial-switch mode leaves SCHED_OTHER workers under FAIR. Add `--no-jlfp` for a FAIR or FIFO baseline with sched_ext disabled. EXT workers require JLFP.
+Set `experiments.latency` in the config for recurring comparisons. Its default is
+one migratable EXT thread, a 1000 us interval, 10000 us histogram range, 1 ns timer
+slack and a temporary 0 us CPU DMA latency request. Set `cpu_dma_latency_us` to -1
+to omit that request. The request is released after capture. The harness verifies
+actual worker policies, affinities and slack, uses CLOCK_MONOTONIC and saves pooled
+and per-thread histogram summaries. Cyclictest's main thread also stays inside the
+configured workload cpuset.
 
-To investigate individual outliers, add `--diagnostic-trace --spike-us 100`. This records native scheduler, hrtimer, IRQ, and workqueue events in the private trace instance and logs samples above 100 us with their observed CLOCK_MONOTONIC timestamps in `cyclictest.log`. The trace uses nanoseconds; spike timestamps and latencies use microseconds. Match the worker's timer expiry, wakeup, and first execution to distinguish late timer delivery from runnable scheduling delay. Diagnostic tracing adds overhead, so compare equally traced runs and keep ordinary runs as a reference. These options do not use cyclictest's global `--breaktrace` controls.
-
-The builder leaves the original rt-tests checkout intact and saves its patch, build log, and hashes. The harness explicitly selects CLOCK_MONOTONIC, verifies the actual worker policy, affinity, and timer slack, saves cyclictest JSON/histograms and per-thread percentiles, and disables scheduler trace emissions. It gives SCHED_EXT workers 1 ns timer slack so inherited timer coalescing does not dominate the comparison; use `--timer-slack-ns 50000` to reproduce the usual inherited slack. It holds a temporary 0 us `/dev/cpu_dma_latency` request during the test, releasing it afterward; other power settings stay unchanged. Use `--cpu-dma-latency-us -1` for an untuned comparison, `--policy fifo` to measure ordinary RT latency while JLFP is attached, and `--scx-build-path BUILD` for alternate scheduler builds. On PREEMPT_RT, FIFO sleepers use hard timer delivery while EXT and OTHER sleepers use soft timer delivery; differences include that timer path as well as scheduling. Compare variants serially on the same CPUs with repeated runs; histograms use 1 us buckets and include startup. Existing cgroup workloads and hardware interrupts can still affect the tails.
+`policy: "other"` retains JLFP attachment for a FAIR comparison; `no_jlfp: true`
+selects a native OTHER/FIFO baseline. EXT requires JLFP. `priority: null` selects
+0 for EXT/OTHER and 50 for FIFO. To inspect outliers, set `diagnostic_trace: true`
+and `spike_us` in debug config, or use the corresponding CLI overrides. Diagnostic
+runs record native scheduler/timer/IRQ/workqueue events and timestamped spikes in
+`cyclictest.log`; timestamps use CLOCK_MONOTONIC microseconds, while trace events
+use nanoseconds. These legacy latency runs always record an exit event and are
+separate from the pending trace-free E1 implementation.

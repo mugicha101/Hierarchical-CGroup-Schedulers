@@ -142,6 +142,8 @@ def analyse(events, run, *, progress=None):
              "inversion_intervals": value["intervals"],
              "longest_inversion_ns": value["longest"], "task_pairs_ns": task_pair_time[name]}
       for name, value in class_stats.items()}
+  result["class_utilization_percent"] = {name: 100 * elapsed / ((end - start) * len(run["cpus"]))
+                                        for name, elapsed in cpu_time.items()}
   return result
 
 
@@ -195,4 +197,11 @@ def print_report(result, run, output):
     print(f"  Class {class_name(name)}: {elapsed / 1e9:.3f} CPU-seconds")
   print(f"Worker activity: {result['worker_switches']:,} switches; "
         f"{result['worker_wakeups']:,} wakeups; {result['worker_blocks']:,} blocks")
+  for name, load in run.get("workload", {}).get("class_utilization", {}).items():
+    achieved = result["class_utilization_percent"][name]
+    print(f"  Class {class_name(name)} load: target {load['target_percent']:.3f}%, "
+          f"nominal {load['nominal_percent']:.3f}%, observed worker execution {achieved:.3f}%")
+  if "system_utilization" in run:
+    print(f"Observed system utilization: {run['system_utilization']['busy_percent']:.3f}% "
+          f"across CPUs {run['cpus']}")
   print(f"Detailed results: {output / 'results.json'}")

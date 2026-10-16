@@ -1,7 +1,7 @@
 """Cyclictest launch, validation, temporary controls and histogram analysis."""
 
 from collections import Counter
-from contextlib import ExitStack, contextmanager, nullcontext
+from contextlib import contextmanager
 import ctypes
 import json
 import math
@@ -12,7 +12,7 @@ import subprocess
 import sys
 import time
 
-from . import cgroups as placement, common, isolation as host
+from . import cgroups as placement, common
 from .trace_helpers import REPO_DIR, TraceSession, defer_trace_interrupts
 
 LATENCY_EVENTS = ("sched:sched_process_exit",)
@@ -207,35 +207,27 @@ def run_cyclic(command, output, cpus, duration, count, mode="migratable", policy
         raise RuntimeError(f"cyclictest exited with {status}; see {log.name}")
       return workers
     finally:
-      # workloads must stop before the scheduler and isolation contexts unwind
+      # workloads must stop before the scheduler and temporary controls unwind
       with defer_trace_interrupts():
         stop_process(process)
 
 
 def capture(output, build_path, binary, cpus, mode, threads, duration, interval_us,
-            histogram_us, keep_bandwidth_servers=False, policy="ext", priority=None,
-            cpu_dma_latency_us=0, timer_slack_ns=1, *, isolate=False, diagnostic_trace=False,
-            spike_us=100, no_jlfp=False, relative_to=None):
+            histogram_us, policy="ext", priority=None,
+            cpu_dma_latency_us=0, timer_slack_ns=1, *, diagnostic_trace=False,
+            spike_us=100, no_jlfp=False, relative_to):
   if no_jlfp and policy == "ext":
     raise ValueError("EXT requires JLFP; use OTHER or FIFO with --no-jlfp")
   if spike_us <= 0:
     raise ValueError("spike threshold must be positive")
-  cgroup = placement.existing_test_cgroup(relative_to) if relative_to is not None else placement.CGROUP_ROOT
-  relative_to = cgroup if cgroup != placement.CGROUP_ROOT else None
-  cpus = placement.select_test_cpus(isolate, cpus, relative_to=relative_to)
-  destination = placement.worker_cgroup(cgroup) if relative_to is not None else cgroup
-  if relative_to is not None and destination.exists() and not cpus <= placement.cgroup_cpu_set(destination):
-    raise ValueError(f"Worker cgroup {destination} does not allow CPUs {sorted(cpus)}")
-  available = os.sched_getaffinity(0)
-  other_cpus = available - set(cpus)
+  cgroup = placement.existing_test_cgroup(relative_to)
+  cpus = placement.select_test_cpus(cpus, relative_to=cgroup)
   config = output / "config.json"
   settings = {"policy": "none" if no_jlfp else "scx_jlfp", "trace": False,
               "max_shard_size": placement.SHARD_SIZE}
-  if isolate:
-    settings["subs"] = {"other": {"policy": "none", "weight": 1, "cpus": cpu_list(other_cpus)}}
   config.write_text(json.dumps(settings, indent=2) + "\n")
-  # the cyclictest main thread must remain inside the destination cpuset
-  main_cpus = cpus if relative_to is not None else other_cpus if isolate else available
+  # the cyclictest main thread must remain inside the configured cpuset
+  main_cpus = cpus
   command = cyclic_command(binary, output, cpus, main_cpus, mode, threads, duration,
                            interval_us, histogram_us, policy, priority,
                            spike_us=spike_us if diagnostic_trace else None)
@@ -252,33 +244,25 @@ def capture(output, build_path, binary, cpus, mode, threads, duration, interval_
          "spike_logging": {"threshold_us": spike_us, "max_records": 16384,
                            "timestamp_clock": "CLOCK_MONOTONIC", "timestamp_unit": "us",
                            "output": "cyclictest.log"} if diagnostic_trace else None,
-         "samples_include_startup": True}
+         "samples_include_startup": True, "host_controls": "external"}
   (output / "run.json").write_text(json.dumps(run, indent=2) + "\n")
-  servers = nullcontext({"disabled": False}) if not isolate or keep_bandwidth_servers else \
-      host.disabled_bandwidth_servers(cpus, output / "bandwidth_servers.json")
-  controller = host.controller_affinity(cpus) if isolate else nullcontext()
   session = None
   try:
-    with temporary_cpu_dma_latency(cpu_dma_latency_us) as qos, \
-         controller, servers as state:
+    with temporary_cpu_dma_latency(cpu_dma_latency_us) as qos:
       run["cpu_dma_latency"] = qos
-      run["bandwidth_servers"] = state
       # diagnostic runs record timer delivery separately from runnable scheduling delay
       with TraceSession(events=events, scx_build_path=build_path,
-                        monitor=True) as session, ExitStack() as isolation:
+                        monitor=True) as session:
         session.start_trace(output / "trace.dat")
         session.load_config(config)
-        if relative_to is not None:
-          run["cgroup"] = placement.load_relative_config(session, output, cgroup, {
-              "policy": "none" if no_jlfp else "scx_jlfp", "trace": False,
-              "max_shard_size": placement.SHARD_SIZE}, check_shards=not no_jlfp, destination=destination)
-          run["worker_cgroup"] = str(destination)
-        run["cpu_isolation"] = isolation.enter_context(
-            host.isolated_root_tasks(output / "cpu_isolation.json")) if isolate else {"enabled": False}
+        run["cgroup"] = placement.load_relative_config(session, output, cgroup, {
+            "policy": "none" if no_jlfp else "scx_jlfp", "trace": False,
+            "max_shard_size": placement.SHARD_SIZE}, check_shards=not no_jlfp)
+        run["worker_cgroup"] = str(cgroup)
         common.report_progress(f"Running {mode} cyclictest on CPUs {sorted(cpus)} for {duration}s...")
         run["verified_threads"] = run_cyclic(command, output, cpus, duration, threads, mode,
                                              {"ext": 7, "fifo": 1, "other": 0}[policy], timer_slack_ns,
-                                             **({"cgroup": destination} if relative_to is not None else {}))
+                                             cgroup=cgroup)
   finally:
     (output / "run.json").write_text(json.dumps(run, indent=2) + "\n")
     if session is not None:

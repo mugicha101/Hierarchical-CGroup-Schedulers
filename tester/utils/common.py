@@ -13,6 +13,8 @@ import sys
 import time
 import uuid
 
+from . import experiment_config
+
 REPO = Path(__file__).resolve().parents[2]
 CGROUP_ROOT = Path("/sys/fs/cgroup")
 OUTPUT = REPO / "tester/build/experiments"
@@ -20,7 +22,7 @@ DEFAULT_CONFIG = REPO / "tester/experiments/config.json"
 BPF_CLANG = "clang-22"
 CONFIG_KEYS = {"workload_cgroup", "test_cpus", "controller_cpus", "cyclictest_cpu",
                "duration_s", "stress_utilization_percent", "max_attempts",
-               "process_timeout_s", "build_timeout_s"}
+               "process_timeout_s", "build_timeout_s", "warmup_s", "experiments"}
 
 
 def cpu_set(value):
@@ -49,6 +51,8 @@ def load_config(path=DEFAULT_CONFIG):
     value = config[key]
     if type(value) not in (int, float) or not math.isfinite(value) or value <= 0:
       raise ValueError(f"{key} must be finite and positive")
+  experiment_config.number(config, "warmup_s", inclusive=True)
+  experiment_config.validate(config["experiments"])
   value = config["stress_utilization_percent"]
   if type(value) not in (int, float) or not math.isfinite(value) or not 0 <= value <= 100:
     raise ValueError("stress_utilization_percent must be between 0 and 100")
@@ -66,14 +70,15 @@ def load_config(path=DEFAULT_CONFIG):
   return config
 
 
-def workload_cgroup(config):
+def workload_cgroup(config, *, leaf=True):
   if config["workload_cgroup"] is None:
     raise ValueError("set workload_cgroup in config.json to an existing prepared leaf")
   path = Path(config["workload_cgroup"]).resolve(strict=True)
   if path == CGROUP_ROOT or not path.is_relative_to(CGROUP_ROOT):
     raise ValueError("workload cgroup must be below /sys/fs/cgroup")
-  if (path / "cgroup.type").read_text().strip() != "domain" or \
-      (path / "cgroup.subtree_control").read_text().strip():
+  if (path / "cgroup.type").read_text().strip() != "domain":
+    raise ValueError("workloads require an existing process cgroup domain")
+  if leaf and (path / "cgroup.subtree_control").read_text().strip():
     raise ValueError("workloads require an existing process cgroup leaf")
   if cpu_set((path / "cpuset.cpus.effective").read_text().strip()) != cpu_set(config["test_cpus"]):
     raise ValueError("workload cgroup must allow exactly the configured test CPUs")
