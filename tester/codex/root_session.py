@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Temporary local root access for experiment preflight and smoke checks."""
+"""Temporary root access for experiment setup checks and Clang installation."""
 
 import argparse
 import json
@@ -57,6 +57,9 @@ def receive(connection):
 
 def command(request):
   action = request["action"]
+  if action == "install-clang":
+    return ["/usr/bin/apt-get", "-o", "DPkg::Lock::Timeout=60", "install", "--yes",
+            "--no-install-recommends", "--no-remove", "clang-22"]
   traced = request.get("traced", False)
   if type(traced) is not bool:
     raise ValueError("invalid tracing selection")
@@ -65,7 +68,7 @@ def command(request):
   elif action == "smoke" and request.get("scheduler") in ("none", "jlfp", "qmap", "simple"):
     args = ["smoke", request["scheduler"]]
   else:
-    raise ValueError("only status, preflight and setup smoke checks are allowed")
+    raise ValueError("only Clang installation, preflight and setup smoke checks are allowed")
   if traced:
     args.append("--traced")
   if request.get("basic", False):
@@ -111,8 +114,12 @@ def serve():
             else:
               args = command(request)
               print("Running:", " ".join(args), flush=True)
+              environment = os.environ.copy()
+              if request["action"] == "install-clang":
+                environment["DEBIAN_FRONTEND"] = "noninteractive"
               child = subprocess.Popen(args, cwd=REPO, stdout=subprocess.PIPE,
-                                       stderr=subprocess.STDOUT, text=True, start_new_session=True)
+                                       stderr=subprocess.STDOUT, text=True, start_new_session=True,
+                                       env=environment)
               output, _ = child.communicate()
               response = {"return_code": child.returncode, "output": output}
               child = None
@@ -133,6 +140,7 @@ def main():
   commands = parser.add_subparsers(dest="action", required=True)
   commands.add_parser("serve")
   commands.add_parser("status")
+  commands.add_parser("install-clang", help="install clang-22 from configured apt repositories")
   commands.add_parser("preflight").add_argument("--traced", action="store_true")
   smoke = commands.add_parser("smoke")
   smoke.add_argument("scheduler", choices=("none", "jlfp", "qmap", "simple"))

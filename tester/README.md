@@ -42,6 +42,9 @@ untouched. A runner invoked through sudo delegates compilation to the original
 user. JLFP/GEDF builds disable timing statistics and custom trace emissions
 by default; `build jlfp --trace events` or `--trace hotpath` selects a separate
 tracing build. Qmap/simple's operational counters are left alone.
+All BPF scheduler builds use `clang-22`, including preflight's compiler check;
+build manifests retain the compiler path/version. Clang 21.1.8 can omit arena
+pointer casts after combining adjacent stores into a memory intrinsic.
 
 Short lifecycle checks use the existing native worker with an expired schedule,
 so no busy loop or benchmark measurement runs:
@@ -71,9 +74,9 @@ custom scxtp events require a matching module and a tracing-enabled JLFP build.
 On a development host, `smoke ... --basic` relaxes only the housekeeping-slice
 isolation checks. It still requires the prepared CPUs 8-15 workload cgroup, marks
 the output as a setup check, and never produces benchmark results. All final-run
-prerequisites remain mandatory for normal checks. On this development kernel,
-qmap currently fails verification in `qmap_dequeue` (`R7 invalid mem access
-'scalar'`); its build succeeds, and failed runtime attempts retain verifier logs.
+prerequisites remain mandatory for normal checks. Earlier qmap checks built with
+Clang 21 failed in `qmap_dequeue` (`R7 invalid mem access 'scalar'`); compiler
+diagnosis and validation notes are in [qmap_failure.md](codex/qmap_failure.md).
 
 For repeated development checks, the optional
 [`tester/codex/root_session.py`](codex/root_session.py) helper exposes only fixed
@@ -84,6 +87,10 @@ sudo python3 tester/codex/root_session.py serve
 # in another terminal
 python3 tester/codex/root_session.py smoke none --basic
 ```
+
+The helper also accepts `install-clang`, a fixed `apt-get install clang-22` action
+using configured repositories, without recommended packages or package removals.
+Package installation is explicit; experiment runs never install dependencies.
 
 Ctrl-C in the server terminal stops the helper after active-run cleanup. Its
 explicit `cgroup` commands are manual operations for the fixed development leaf

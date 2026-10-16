@@ -3,7 +3,8 @@
 Investigated 2026-10-16. The observed scalar-register rejection is explained by
 Clang 21.1.8's missing BPF address-space handling for memory intrinsics. This
 diagnoses the first load failure; it does not establish that the whole scheduler
-will load after recompilation. No production source or system setting changed.
+will load after recompilation. The investigation initially changed no production
+source or system setting; the subsequent compiler update is recorded below.
 
 ## Evidence
 
@@ -60,13 +61,45 @@ loaded or attached. Diagnostic builds reuse the previous private libbpf/headers.
 
 Prefer a compiler containing the upstream fix (verified in the 22.1.0 source),
 and record/use the selected toolchain consistently across scheduler comparisons.
-Only Clang 21 is installed here. Alternatively, evaluate a documented qmap BPF
+The initial investigation had only Clang 21 installed. Alternatively, evaluate a qmap BPF
 build flag `-fno-builtin-memset`; source barriers are another upstream workaround
 but would edit scheduler source and are unnecessary for this investigation.
 
-The experiment builder currently hardcodes `clang-21`; adopting a new compiler
-requires an explicit build/documentation update. No such change, package install,
-kernel rebuild or scheduler patch has been made. The root helper is stopped, so
-neither candidate has a new live verification/attachment check. Validate a bounded
-partial-switch lifecycle before calling qmap unblocked; further verifier/runtime
-issues, including this PREEMPT_RT kernel's BPF timer support, remain untested.
+The initial builder hardcoded `clang-21`. The private flag-workaround binary has
+not been loaded. Further verifier/runtime issues must be checked before calling
+qmap unblocked; no scheduler or kernel patch is part of the compiler fix.
+
+## Compiler update and next rejection (2026-10-16)
+
+At the user's request, installed Ubuntu Clang 22.1.2 through the restricted root
+helper's fixed `install-clang` action. Apt added clang-22 and six dependencies,
+without upgrades or removals. The experiment builder/preflight and local scheduler
+Makefile now select clang-22; manifests record compiler path/version. The original
+Clang 21 installation remains available, and no global compiler alternatives changed.
+
+The minimal reproducer emits cast-based arena stores with Clang 22 and no extra
+flags. Private qmap/simple and JLFP/GEDF off/hotpath builds pass. JLFP trace-free
+and simple traced live setup checks pass; the simple capture parses with zero
+reported loss. A real partial-switch qmap
+attempt gets past the scalar-store rejection but fails in `qmap_init_cids`:
+
+```text
+R1 arena pointer requires a program with an associated arena
+processed 0 insns
+```
+
+All three attempts fail before attachment and clean up completely. Artifacts:
+`tester/build/experiments/smoke-qmap-20261016T055446.940502Z-79350320/`;
+build: `build-qmap-off-20261016T055431.151175Z-639fa52a/`.
+
+Unlike several other qmap callbacks, `qmap_init_cids` contains no reference to
+the arena map (confirmed by its object relocations). The existing
+`QMAP_TOUCH_ARENA()` helper documents precisely this association requirement.
+Adding an arena reference there is a focused candidate for separate scheduler
+review; it has not been applied or tested. Later failures, including PREEMPT_RT
+BPF timer support, can still be masked by this rejection. Kernel and scheduler
+sources remain unchanged.
+The user requested keeping the development cgroup for subsequent checks. It is
+retained empty at `/sys/fs/cgroup/cgs-experiments-dev`, effective CPUs 8-15,
+memory node 0; root's cpuset controller remains enabled. EXT is disabled and
+`workload_cgroup` is restored to null for final-host configuration.

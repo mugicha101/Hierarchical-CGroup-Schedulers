@@ -5,12 +5,13 @@ import json
 import os
 from pathlib import Path
 import pwd
+import shutil
 import signal
 import subprocess
 import sys
 
 from ..build_jlfp_cyclictest import guard_header
-from .common import (REPO, CleanupError, controller_affinity, cpu_set, new_run,
+from .common import (BPF_CLANG, REPO, CleanupError, controller_affinity, cpu_set, new_run,
                      repository_state, run_attempts, sha256, write_json)
 
 RT_TESTS_URL = "https://git.kernel.org/pub/scm/utils/rt-tests/rt-tests.git"
@@ -123,6 +124,14 @@ def build(config, target, trace="off"):
   def action(directory, processes):
     timeout = config["build_timeout_s"]
     metadata = {"target": target, "trace_profile": trace, "latency_statistics": False}
+    if target in ("jlfp", "qmap", "simple"):
+      compiler = shutil.which(BPF_CLANG)
+      if compiler is None:
+        raise FileNotFoundError(f"{BPF_CLANG} is required for BPF scheduler builds")
+      version = subprocess.run([compiler, "--version"], check=True, capture_output=True,
+                               text=True, timeout=config["process_timeout_s"])
+      metadata["bpf_compiler"] = {"path": str(Path(compiler).resolve()),
+                                  "version": version.stdout.strip()}
 
     def run(command, cwd=REPO):
       write_json(directory / "build.json", metadata)
@@ -141,7 +150,7 @@ def build(config, target, trace="off"):
       watched = list((REPO / "scheds").glob("*.h")) + list((REPO / "scheds").glob("*.c"))
       watched += list((REPO / "scheds/trace").glob("*.h")) + [REPO / "scheds/Makefile"]
       metadata["source_sha256"] = {str(p.relative_to(REPO)): sha256(p) for p in watched}
-      run(["make", "-C", REPO / "scheds", "-j2", f"BUILD={output}", "CLANG=clang-21",
+      run(["make", "-C", REPO / "scheds", "-j2", f"BUILD={output}", f"CLANG={BPF_CLANG}",
            *(f"{key}={value}" for key, value in flags.items()), "all"])
       binary = output / "scx_jlfp"
       metadata["gedf_binary_sha256"] = sha256(output / "scx_gedf")
@@ -152,7 +161,7 @@ def build(config, target, trace="off"):
       output = directory / "upstream"
       output.mkdir()
       run(["make", "-C", REPO.parent, "-j2", f"O={output}",
-           "CLANG=clang-21", "VMLINUX_BTF=/sys/kernel/btf/vmlinux", f"scx_{target}"])
+           f"CLANG={BPF_CLANG}", "VMLINUX_BTF=/sys/kernel/btf/vmlinux", f"scx_{target}"])
       binary = directory / f"upstream/build/bin/scx_{target}"
       metadata.update(partial_switch=True, launch_args=["-p"])
       if target == "simple":

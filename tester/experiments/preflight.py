@@ -6,9 +6,9 @@ from pathlib import Path
 import shutil
 
 if __package__:
-  from .common import CGROUP_ROOT, REPO, cpu_set
+  from .common import BPF_CLANG, CGROUP_ROOT, REPO, cpu_set
 else:
-  from common import CGROUP_ROOT, REPO, cpu_set
+  from common import BPF_CLANG, CGROUP_ROOT, REPO, cpu_set
 
 
 def inspect(config, *, traced=False, basic=False):
@@ -17,7 +17,7 @@ def inspect(config, *, traced=False, basic=False):
   def check(name, ok, detail, *, required=True):
     checks.append({"name": name, "ok": bool(ok), "required": required, "detail": detail})
 
-  for tool in ("cc", "make", "clang-21", "bpftool", "git", "pkg-config", "stress-ng"):
+  for tool in ("cc", "make", BPF_CLANG, "bpftool", "git", "pkg-config", "stress-ng"):
     path = shutil.which(tool)
     check(tool, path is not None, path or "not found in PATH")
   for path in (REPO / "scheds/include/scx/common.bpf.h",

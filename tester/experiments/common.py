@@ -16,6 +16,7 @@ REPO = Path(__file__).resolve().parents[2]
 CGROUP_ROOT = Path("/sys/fs/cgroup")
 OUTPUT = REPO / "tester/build/experiments"
 DEFAULT_CONFIG = Path(__file__).with_name("config.json")
+BPF_CLANG = "clang-22"
 CONFIG_KEYS = {"workload_cgroup", "test_cpus", "controller_cpus", "cyclictest_cpu",
                "duration_s", "stress_utilization_percent", "max_attempts",
                "process_timeout_s", "build_timeout_s"}
