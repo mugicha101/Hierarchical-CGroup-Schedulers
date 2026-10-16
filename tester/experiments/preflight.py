@@ -21,7 +21,7 @@ def inspect(config, *, traced=False, basic=False):
     path = shutil.which(tool)
     check(tool, path is not None, path or "not found in PATH")
   for path in (REPO / "scheds/include/scx/common.bpf.h",
-               REPO.parent / "scx_qmap.bpf.c", REPO.parent / "scx_simple.bpf.c",
+               REPO / "scheds/setup.sh",
                Path("/sys/kernel/btf/vmlinux")):
     check(str(path), path.is_file(), "required source/BTF")
   cpus = cpu_set(config["test_cpus"])

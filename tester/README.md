@@ -45,6 +45,12 @@ tracing build. Qmap/simple's operational counters are left alone.
 All BPF scheduler builds use `clang-22`, including preflight's compiler check;
 build manifests retain the compiler path/version. Clang 21.1.8 can omit arena
 pointer casts after combining adjacent stores into a memory intrinsic.
+Qmap/simple are fetched into private sparse checkouts using `LINUX_REPO` and
+`LINUX_REF` from `scheds/setup.sh`, currently Torvalds' `v7.3-rc7` at
+`24a19b953e2a3d0ea5a8c4951a0ab8f32720c907`. Manifests retain the resolved commit
+and setup-script hash. These builds require network access for fetching; they
+do not use or modify the enclosing kernel checkout. Simple's partial-switch
+loader patch stays in its private build output; qmap source is unmodified.
 
 Short lifecycle checks use the existing native worker with an expired schedule,
 so no busy loop or benchmark measurement runs:
@@ -75,28 +81,10 @@ On a development host, `smoke ... --basic` relaxes only the housekeeping-slice
 isolation checks. It still requires the prepared CPUs 8-15 workload cgroup, marks
 the output as a setup check, and never produces benchmark results. All final-run
 prerequisites remain mandatory for normal checks. Earlier qmap checks built with
-Clang 21 failed in `qmap_dequeue` (`R7 invalid mem access 'scalar'`); compiler
-diagnosis and validation notes are in [qmap_failure.md](codex/qmap_failure.md).
-
-For repeated development checks, the optional
-[`tester/codex/root_session.py`](codex/root_session.py) helper exposes only fixed
-preflight/smoke commands through a socket restricted to the invoking user:
-
-```sh
-sudo python3 tester/codex/root_session.py serve
-# in another terminal
-python3 tester/codex/root_session.py smoke none --basic
-```
-
-The helper also accepts `install-clang`, a fixed `apt-get install clang-22` action
-using configured repositories, without recommended packages or package removals.
-Package installation is explicit; experiment runs never install dependencies.
-
-Ctrl-C in the server terminal stops the helper after active-run cleanup. Its
-explicit `cgroup` commands are manual operations for the fixed development leaf
-`/sys/fs/cgroup/cgs-experiments-dev`; no cgroup is created by starting the helper
-or running a check. Prepare/remove that temporary leaf manually. The final runner
-always uses the externally prepared cgroup from the configuration.
+Clang 21 failed in `qmap_dequeue` (`R7 invalid mem access 'scalar'`); Clang 22 fixes
+the arena-memory-intrinsic cast bug. Qmap also requires working BPF timers on
+PREEMPT_RT; the current development kernel rejects them. Experiment runs never
+install dependencies or prepare cgroups.
 
 The new cyclictest build uses upstream revision
 `62da2befac98f811af8e56f2b7992fb09faa33d6` in a private checkout with only EXT

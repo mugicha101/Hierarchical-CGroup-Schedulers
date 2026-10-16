@@ -5,6 +5,8 @@ import json
 import os
 from pathlib import Path
 import pwd
+import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -16,6 +18,30 @@ from .common import (BPF_CLANG, REPO, CleanupError, controller_affinity, cpu_set
 
 RT_TESTS_URL = "https://git.kernel.org/pub/scm/utils/rt-tests/rt-tests.git"
 RT_TESTS_REVISION = "62da2befac98f811af8e56f2b7992fb09faa33d6"
+
+
+def linux_pin():
+  script = (REPO / "scheds/setup.sh").read_text()
+  values = {}
+  for key in ("REPO", "REF"):
+    match = re.search(rf"^LINUX_{key}=(.+)$", script, re.MULTILINE)
+    words = shlex.split(match[1]) if match else []
+    if len(words) != 1:
+      raise ValueError(f"scheds/setup.sh must define a literal LINUX_{key}")
+    values[key.lower()] = words[0]
+  return values
+
+
+def checkout_linux(path, pin, run):
+  run(["git", "-c", "init.defaultBranch=main", "init", path])
+  run(["git", "remote", "add", "origin", pin["repo"]], cwd=path)
+  run(["git", "sparse-checkout", "init", "--cone"], cwd=path)
+  run(["git", "sparse-checkout", "set", "tools/sched_ext", "tools/build", "tools/scripts",
+       "tools/include", "tools/lib", "tools/bpf/bpftool", "tools/arch", "include", "scripts",
+       "kernel/bpf"], cwd=path)
+  run(["git", "fetch", "--depth=1", "--filter=blob:none", "--no-tags", "origin", pin["ref"]],
+      cwd=path)
+  run(["git", "checkout", "--detach", "FETCH_HEAD"], cwd=path)
 
 
 def patch_once(text, before, after):
@@ -155,17 +181,22 @@ def build(config, target, trace="off"):
       binary = output / "scx_jlfp"
       metadata["gedf_binary_sha256"] = sha256(output / "scx_gedf")
     elif target in ("qmap", "simple"):
-      metadata["kernel_source"] = repository_state(REPO.parent)
-      watched = [REPO.parent / f"scx_{target}{suffix}" for suffix in (".c", ".bpf.c")]
-      metadata["source_sha256"] = {str(p): sha256(p) for p in watched}
+      pin = linux_pin()
+      checkout = directory / "linux"
+      metadata["kernel_source"] = {**pin, "setup_sha256": sha256(REPO / "scheds/setup.sh")}
+      checkout_linux(checkout, pin, run)
+      metadata["kernel_source"].update(repository_state(checkout))
+      upstream = checkout / "tools/sched_ext"
+      watched = [upstream / f"scx_{target}{suffix}" for suffix in (".c", ".bpf.c")]
+      metadata["source_sha256"] = {str(p.relative_to(checkout)): sha256(p) for p in watched}
       output = directory / "upstream"
       output.mkdir()
-      run(["make", "-C", REPO.parent, "-j2", f"O={output}",
+      run(["make", "-C", upstream, "-j2", f"O={output}",
            f"CLANG={BPF_CLANG}", "VMLINUX_BTF=/sys/kernel/btf/vmlinux", f"scx_{target}"])
       binary = directory / f"upstream/build/bin/scx_{target}"
       metadata.update(partial_switch=True, launch_args=["-p"])
       if target == "simple":
-        original = (REPO.parent / "scx_simple.c").read_text()
+        original = (upstream / "scx_simple.c").read_text()
         modified = simple_loader(original)
         source = output / "scx_simple.c"
         source.write_text(modified)
@@ -173,9 +204,9 @@ def build(config, target, trace="off"):
                                     modified.splitlines(keepends=True),
                                     fromfile="a/scx_simple.c", tofile="b/scx_simple.c")
         (directory / "simple-partial.patch").write_text("".join(patch))
-        includes = [output / "build/include", REPO.parent / "../../include/generated",
-                    REPO.parent / "../lib", REPO.parent / "../include",
-                    REPO.parent / "../include/uapi", REPO.parent / "include"]
+        includes = [output / "build/include", checkout / "include/generated",
+                    checkout / "tools/lib", checkout / "tools/include",
+                    checkout / "tools/include/uapi", upstream / "include"]
         run(["cc", "-g", "-O2", "-rdynamic", "-pthread", "-Wall", "-Werror",
              *(f"-I{p}" for p in includes), source, "-o", binary,
              output / "build/obj/libbpf/libbpf.a", "-lelf", "-lz", "-lpthread"])
