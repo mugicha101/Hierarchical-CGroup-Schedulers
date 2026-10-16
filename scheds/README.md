@@ -7,7 +7,7 @@ Implementation of various sched_ext cgroup schedulers for Linux 7.3.
 ### Requirements
 
 - Linux kernel compatible with the `v7.3-rc7` tag used in `scheds/setup.sh`
-- Git, make, GCC, bpftool, and clang-21
+- Git, make, GCC, bpftool, and clang-22
 - Development libs/headers for libbpf, libelf, and zlib
 - Kernel BTF at /sys/kernel/btf/vmlinux
 
@@ -15,7 +15,7 @@ Implementation of various sched_ext cgroup schedulers for Linux 7.3.
 
 clone https://github.com/torvalds/linux.git or git://git.kernel.org/pub/scm/linux/kernel/git/tj/sched_ext.git and select branch with cgroup sub-scheduling (linux 7.1 has cgroup subscheduling v3)
 
-install clang-21
+install clang-22
 make sure pahole is 1.31+ since uses KF_IMPLICIT_ARGS
 install kernel
 
@@ -32,10 +32,12 @@ Fetch the sched_ext headers before the first build:
 Build the schedulers:
 
 ```sh
-make CLANG=clang-21
+make CLANG=clang-22
 ```
 
 This puts the scheduler binaries and the `check_tracing` helper in `./build`.
+Clang 22 includes the BPF arena memory-intrinsic cast fix needed by qmap in the
+enclosing kernel tree; the experiment runner uses clang-22 for all BPF schedulers.
 
 Give the scheduler permission to run (will ask for sudo permission):
 
@@ -214,7 +216,7 @@ The default remains 1. Use a fresh output directory so existing objects cannot
 retain flags from an earlier build:
 
 ```sh
-make CLANG=clang-21 BUILD=build/no-latency-stats SCX_LATENCY_STATS=0
+make CLANG=clang-22 BUILD=build/no-latency-stats SCX_LATENCY_STATS=0
 ```
 
 The experiment builder uses a new directory for every attempt and selects this

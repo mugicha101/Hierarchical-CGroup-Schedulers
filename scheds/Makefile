@@ -13,7 +13,7 @@ TARGETS := scx_jlfp scx_gedf
 BUILD := build
 
 CC := gcc
-CLANG := clang
+CLANG := clang-22
 BPFTOOL := bpftool
 SCXTP_HOTPATH_TRACING ?= 0
 SCXTP_TRACING ?= 1
