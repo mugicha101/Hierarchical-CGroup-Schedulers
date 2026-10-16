@@ -2,6 +2,52 @@
 
 Run all commands below from the repository root (`cgs/`).
 
+## Staged Experiment Setup
+
+The shared setup for the overhead/inversion experiment suite lives in
+`tester/experiments/`. Experiment workloads are still pending later stages;
+these commands only inspect prerequisites or build private artifacts:
+
+```sh
+python3 tester/experiments/run.py plan
+python3 tester/experiments/run.py preflight
+python3 tester/experiments/run.py build worker
+python3 tester/experiments/run.py build jlfp
+python3 tester/experiments/run.py build qmap
+python3 tester/experiments/run.py build simple
+python3 tester/experiments/run.py build cyclictest
+```
+
+Edit `tester/experiments/config.json` to set `workload_cgroup` to an existing
+writable process cgroup below `/sys/fs/cgroup`; it is deliberately unset by
+default. The prepared workload leaf must allow exactly CPUs 8-15 and distribute
+no child controllers. All threads of each workload process share its cgroup.
+Housekeeping processes remain on CPUs 0-7. Setup does not create cgroups,
+configure isolation, load modules, attach schedulers or install packages.
+
+`stress_utilization_percent` targets aggregate busy time only across CPUs 8-15.
+The shared `/proc/stat` reader excludes idle and iowait from busy time and does
+not count guest time twice. It retains raw counters; stress-ng's per-worker load
+option must not be treated as proof that the aggregate target was achieved.
+Final duration defaults to 60 seconds; other durations are marked development.
+DEADLINE cases are explicitly deferred. E2's EXT variants are qmap/JLFP.
+
+Each command's artifacts go to a new `tester/build/experiments/` directory.
+Build attempts retain commands, logs, source/binary hashes and failures, with a
+fixed attempt limit and process-group cleanup. Cleanup failure stops retries.
+Builds run on the controller CPUs, do not require root, and leave existing builds
+untouched. JLFP/GEDF builds disable timing statistics and custom trace emissions
+by default; `build jlfp --trace events` or `--trace hotpath` selects a separate
+tracing build. Qmap/simple's operational counters are left alone.
+
+The new cyclictest build uses upstream revision
+`62da2befac98f811af8e56f2b7992fb09faa33d6` in a private checkout with only EXT
+policy support and the existing inherited-affinity fix applied. Its patch is
+saved with the build. It does not replace `cyclictest/rt-tests` or build/use
+cyclicdeadline. Preflight returns status 2 and preserves a JSON report when
+prerequisites are missing; `preflight --traced` additionally checks trace tools.
+The harnesses described below retain their existing behavior.
+
 Follow the [scheduler build instructions](../scheds/README.md#setup). Inversion tests also require the [tracing module](../scheds/README.md#structured-scheduler-tracepoints). Live captures require sudo for BPF, ftrace, and cgroup setup.
 
 Trace analysis uses Python 3, `bt2`, and the Babeltrace2 ftrace plugin. [setup_bt2_ftrace.sh](setup_bt2_ftrace.sh) builds the plugin; its comments list the required development packages.
@@ -60,7 +106,9 @@ To measure idle-core wakeup migration, run `sudo python3 tester/run_jlfp_wakeup_
 
 ## Cyclictest Comparisons
 
-The builder uses the existing SCHED_EXT-enabled checkout at `cyclictest/rt-tests`.
+The older `build_jlfp_cyclictest.py` builder uses `cyclictest/rt-tests`, cloning a
+pinned checkout when it is absent and applying the repository's modified source
+in a separate build copy. The staged setup above instead patches upstream source.
 
 For cyclictest comparisons, first build a separate copy that preserves unpinned threads' inherited CPU affinity:
 

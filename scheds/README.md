@@ -152,7 +152,7 @@ GEDF is a leaf scheduler and only supports tasks.
 
 - Sub-policy of JLFP.
 - Uses JLFP's per-cid queues and nmig weight boost for migration-disabled and single-CPU pinned tasks.
-- Task GEDF parameters will be stored in `/sys/fs/bpf/scx/task_sporadic_params` and will persist if the task moves to another scheduler instance.
+- Task GEDF parameters are stored in `/sys/fs/bpf/scx/task_rtp_map` and persist if the task moves to another scheduler instance.
 - Deadline-derived priorities will reuse the JLFP `task_weights` map, so task weights should not be set manually.
 - Job completions are marked in the memory-mapped `job_completion_flags` bitmap, with one bit per TID. Atomically OR `1ULL << (tid & 63)` into the `u64` word at `flags[tid >> 6]` before sleeping or yielding. The scheduler advances the deadline and clears the bit on wakeup or yield.
 - Subschedulers use JLFP ordering.
@@ -207,6 +207,19 @@ Schedulers can also output timings for selected scheduling logic using `-s/--sta
 Run the workload, then stop the scheduler with Ctrl-C to write the JSON file. GEDF accepts the same option. The file contains one object per CID, with `n` (sample count), `sum` (total nanoseconds), and `max` (maximum observed nanoseconds) for each measured section. Compute the mean as `sum / n` when `n` is nonzero. To combine CIDs, add their counts and sums and take the largest maximum.
 
 These timings cover sections such as CID selection, task and sub-scheduler dispatch, and pending-order updates. They can overlap, so their sums should not be added together to estimate total scheduler overhead. Measurement is already compiled into the scheduling logic; `-s` controls saving the results and does not require `-t` or the trace module. The maximum is an observed value, not a worst-case bound.
+
+To disable collection itself, build with `SCX_LATENCY_STATS=0`. This removes
+timing-stat timestamps and updates while retaining the shared data layout.
+The default remains 1. Use a fresh output directory so existing objects cannot
+retain flags from an earlier build:
+
+```sh
+make CLANG=clang-21 BUILD=build/no-latency-stats SCX_LATENCY_STATS=0
+```
+
+The experiment builder uses a new directory for every attempt and selects this
+setting automatically. `SCXTP_TRACING=0` separately compiles out custom trace
+emissions; it does not control `bpf_printk()` or generic kernel events.
 
 ### Cyclictest
 
