@@ -1,13 +1,26 @@
 """Read native scheduling events and summarize blocking wakeups."""
 
+from contextlib import closing
+import json
 import math
 
 import bt2
 
 from .parse_events import Event, TASK_REPORT_MAX
-from .trace_helpers import TraceParser
+from .trace_helpers import TraceParser, defer_trace_interrupts
 
 NATIVE_EVENTS = {"sched:sched_switch", "sched:sched_wakeup", "sched:sched_wakeup_new"}
+
+
+def analyse_capture(output, run):
+  with defer_trace_interrupts() as check_interrupt:
+    with closing(trace_events(output / "trace.dat", check_interrupt)) as events:
+      return analyse(events, run["weights"], run["cpus"], run["start_ns"], run["end_ns"])
+
+
+def print_report(result):
+  summary = {key: value for key, value in result.items() if key != "samples"}
+  print(json.dumps(summary, indent=2))
 
 
 def trace_events(path, check_interrupt=None):

@@ -19,9 +19,14 @@ def run(config, scheduler, traced=False, basic=False):
 
   def action(directory, _):
     with Session(config, directory, manifest, events=events) as session:
-      job = session.start_workload([worker["binary"], "--jlfp-worker"], {config["cyclictest_cpu"]},
-                                   policy="other" if manifest is None else "ext",
-                                   priority=0, nice=0, weight=1 if scheduler == "jlfp" else None)
+      job = session.start_workload(
+          [worker["binary"], "--jlfp-worker"],
+          {config["cyclictest_cpu"]},
+          policy="other" if manifest is None else "ext",
+          priority=0,
+          nice=0,
+          weight=1 if scheduler == "jlfp" else None,
+      )
       job.release()
       deadline = time.monotonic() + config["process_timeout_s"]
       while "ready" not in job.log.read_text().splitlines():
@@ -29,12 +34,18 @@ def run(config, scheduler, traced=False, basic=False):
         if job.process.poll() is not None or time.monotonic() >= deadline:
           raise RuntimeError(f"native worker did not become ready; see {job.log}")
         time.sleep(.02)
+
       job.verify("native-worker")
       job.process.stdin.write(f"0 {time.monotonic_ns()} 0 0 0\n".encode())
       job.process.stdin.flush()
       job.wait(config["process_timeout_s"])
     trace = tracing.summarize(directory / "trace.dat", events) if traced else None
-    return {"scheduler": scheduler, "measurement": False, "trace": trace,
-            "worker_schedule": "expired; no busy loop", "basic_setup_check": basic}
+    return {
+        "scheduler": scheduler,
+        "measurement": False,
+        "trace": trace,
+        "worker_schedule": "expired; no busy loop",
+        "basic_setup_check": basic,
+    }
 
   return run_attempts(config, f"smoke-{scheduler}", action)

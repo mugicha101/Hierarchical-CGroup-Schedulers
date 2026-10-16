@@ -2,6 +2,7 @@
 
 import time
 
+from . import common, inversion
 from .parse_events import ExecModel, TASK_REPORT_MAX, TaskStatus
 
 TASK_WEIGHT_MASK = (1 << 63) - 1
@@ -11,6 +12,12 @@ class MC2ExecModel(ExecModel):
   def update_pi(self):
     # analyse compares priorities only on CPUs where the waiting task can run
     self.pi = False
+
+
+def analyse_capture(output, run):
+  common.report_progress("Reading MC² trace and checking affinity-aware inversions...")
+  with inversion.capture_events(output) as events:
+    return analyse(events, run, progress=common.report_analysis_progress)
 
 
 def analyse(events, run, *, progress=None):

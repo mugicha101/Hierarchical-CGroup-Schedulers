@@ -1,11 +1,13 @@
 """Offline JLFP inversion analysis and filtered model event reading."""
 
+from contextlib import closing, contextmanager, redirect_stdout
 import time
 
 import bt2
 
+from . import common
 from .parse_events import ExecModel, TASK_REPORT_MAX, parse_trace
-from .trace_helpers import TraceParser
+from .trace_helpers import TraceParser, defer_trace_interrupts
 
 # placement diagnostics remain in the capture for debugging, but do not change the model
 ANALYSIS_EVENTS = {
@@ -29,6 +31,39 @@ def trace_events(trace, *, check_interrupt=None):
         raise RuntimeError("Capture lost events; inversion results would be incomplete")
       if isinstance(message, bt2._EventMessageConst):
         yield from parse_trace((message,), event_types=ANALYSIS_EVENTS)
+
+
+@contextmanager
+def capture_events(output):
+  # close native trace resources before restoring signal handlers
+  with defer_trace_interrupts() as check_interrupt:
+    with (output / "analysis.log").open("w") as log, redirect_stdout(log):
+      with closing(trace_events(output / "trace.dat", check_interrupt=check_interrupt)) as events:
+        yield events
+
+
+def analyse_capture(output, run):
+  trace_size_mib = (output / "trace.dat").stat().st_size / 2**20
+  common.report_progress(
+      f"Reading finalized trace ({trace_size_mib:.1f} MiB); starting offline analysis...")
+
+  options = {"progress": common.report_analysis_progress}
+  if "scheduler_id" in run:
+    options["scheduler_id"] = run["scheduler_id"]
+    options["scheduler_ids"] = run["scheduler_ids"]
+
+  with capture_events(output) as events:
+    return analyse(events, run["weights"], run["start_ns"], run["end_ns"], **options)
+
+
+def print_report(result, run):
+  total_us = result["inversion_ns"] / 1000
+  longest_us = result["longest_inversion_ns"] / 1000
+  print(f"Time spent inverted: {result['inversion_percent']:.3f}% of measurement time")
+  print(f"Inversions: {result['inversion_intervals']}; total {total_us:.3f} us; "
+        f"longest {longest_us:.3f} us")
+  if run.get("workload", {}).get("kind") == "periodic":
+    print(f"Worker transitions: {result['worker_wakeups']} wakeups; {result['worker_blocks']} blocks")
 
 
 def analyse(events, weights, start, end, *, progress=None, scheduler_id=0, scheduler_ids=None):

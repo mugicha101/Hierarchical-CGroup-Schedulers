@@ -8,6 +8,11 @@ placement, optional isolation and offline analysis to separate utility modules.
 Wakeup analysis and cyclictest setup follow the same layout. Local unit tests and
 development checks remain untracked under `tester/codex/`.
 
+Each runner's `capture_run()` shows its configured workload parameters with named
+arguments. Its `main()` selects a new or saved capture, analyses it, saves results
+and prints a report. Analysis utilities own trace-reader cleanup and log handling;
+the shared CLI wrapper handles termination signals.
+
 ## Staged Experiment Setup
 
 The overhead/inversion experiment driver and its configuration live in

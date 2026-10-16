@@ -6,8 +6,13 @@ import sys
 
 if not __package__:
   sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from tester.experiments.run_jlfp_test import cli
+from tester.experiments import run_jlfp_test
+from tester.utils import common
+
+
+def main():
+  return run_jlfp_test.main(periodic=True)
 
 
 if __name__ == "__main__":
-  raise SystemExit(cli(periodic=True))
+  raise SystemExit(common.run_cli(main))

@@ -85,6 +85,10 @@ def workload_cgroup(config, *, leaf=True):
   return path
 
 
+def read_json(path):
+  return json.loads(Path(path).read_text())
+
+
 def write_json(path, value):
   path = Path(path)
   temporary = path.with_suffix(path.suffix + ".tmp")
@@ -301,3 +305,14 @@ def report_progress(message):
 def report_analysis_progress(percent, events, elapsed):
   report_progress(f"Analysing trace: {percent:.1f}% of measurement interval; "
                   f"{events:,} model events; {elapsed:.1f}s elapsed")
+
+
+def run_cli(main):
+  def interrupt(*_):
+    raise KeyboardInterrupt
+
+  original = signal.signal(signal.SIGTERM, interrupt)
+  try:
+    return main()
+  finally:
+    signal.signal(signal.SIGTERM, original)
