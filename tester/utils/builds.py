@@ -13,7 +13,7 @@ import subprocess
 import sys
 
 from .build_jlfp_cyclictest import guard_header
-from .common import (BPF_CLANG, REPO, CleanupError, controller_affinity, cpu_set, new_run,
+from .common import (BPF_CLANG, REPO, CleanupError, controller_placement, new_run,
                      repository_state, run_attempts, sha256, write_json)
 
 RT_TESTS_URL = "https://git.kernel.org/pub/scm/utils/rt-tests/rt-tests.git"
@@ -226,5 +226,5 @@ def build(config, target, trace="off"):
     write_json(directory / "build.json", metadata)
     return metadata
 
-  with controller_affinity(cpu_set(config["controller_cpus"])):
+  with controller_placement(config):
     return run_attempts(config, f"build-{target}-{trace}", action)

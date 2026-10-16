@@ -20,7 +20,7 @@ CGROUP_ROOT = Path("/sys/fs/cgroup")
 OUTPUT = REPO / "tester/build/experiments"
 DEFAULT_CONFIG = REPO / "tester/experiments/config.json"
 BPF_CLANG = "clang-22"
-CONFIG_KEYS = {"workload_cgroup", "test_cpus", "controller_cpus", "cyclictest_cpu",
+CONFIG_KEYS = {"workload_cgroup", "controller_cgroup", "cyclictest_cpu",
                "duration_s", "stress_utilization_percent", "max_attempts",
                "process_timeout_s", "build_timeout_s", "warmup_s", "experiments"}
 
@@ -42,9 +42,6 @@ def load_config(path=DEFAULT_CONFIG):
   config = json.loads(Path(path).read_text())
   if not isinstance(config, dict) or set(config) != CONFIG_KEYS:
     raise ValueError(f"configuration keys must be {sorted(CONFIG_KEYS)}")
-  if cpu_set(config["test_cpus"]) != set(range(8, 16)) or \
-      cpu_set(config["controller_cpus"]) != set(range(8)):
-    raise ValueError("experiments require test CPUs 8-15 and controller CPUs 0-7")
   if type(config["cyclictest_cpu"]) is not int or config["cyclictest_cpu"] != 9:
     raise ValueError("E1 requires logical CPU 9")
   for key in ("duration_s", "process_timeout_s", "build_timeout_s"):
@@ -58,31 +55,65 @@ def load_config(path=DEFAULT_CONFIG):
     raise ValueError("stress_utilization_percent must be between 0 and 100")
   if type(config["max_attempts"]) is not int or not 1 <= config["max_attempts"] <= 10:
     raise ValueError("max_attempts must be between 1 and 10")
-  value = config["workload_cgroup"]
-  if value is not None:
+  for key in ("workload_cgroup", "controller_cgroup"):
+    value = config[key]
+    if value is None:
+      continue
     if not isinstance(value, str) or not value.strip():
-      raise ValueError("workload_cgroup must be null or a cgroup path")
+      raise ValueError(f"{key} must be null or a cgroup path")
     path = Path(value)
     path = (path if path.is_absolute() else CGROUP_ROOT / path).resolve()
     if path == CGROUP_ROOT or not path.is_relative_to(CGROUP_ROOT):
-      raise ValueError("workload_cgroup must be below /sys/fs/cgroup")
-    config["workload_cgroup"] = str(path)
+      raise ValueError(f"{key} must be below /sys/fs/cgroup")
+    config[key] = str(path)
   return config
 
 
-def workload_cgroup(config, *, leaf=True):
-  if config["workload_cgroup"] is None:
-    raise ValueError("set workload_cgroup in config.json to an existing prepared leaf")
-  path = Path(config["workload_cgroup"]).resolve(strict=True)
+def configured_cgroup(config, key, *, leaf=True):
+  if config[key] is None:
+    raise ValueError(f"set {key} in config.json to an existing prepared cgroup")
+  path = Path(config[key]).resolve(strict=True)
   if path == CGROUP_ROOT or not path.is_relative_to(CGROUP_ROOT):
-    raise ValueError("workload cgroup must be below /sys/fs/cgroup")
+    raise ValueError(f"{key} must be below /sys/fs/cgroup")
+  if not (path / "cgroup.procs").is_file():
+    raise ValueError(f"{key} must be a process cgroup")
   if (path / "cgroup.type").read_text().strip() != "domain":
-    raise ValueError("workloads require an existing process cgroup domain")
+    raise ValueError(f"{key} requires a process cgroup domain")
   if leaf and (path / "cgroup.subtree_control").read_text().strip():
-    raise ValueError("workloads require an existing process cgroup leaf")
-  if cpu_set((path / "cpuset.cpus.effective").read_text().strip()) != cpu_set(config["test_cpus"]):
-    raise ValueError("workload cgroup must allow exactly the configured test CPUs")
+    raise ValueError(f"{key} requires a process cgroup leaf")
+  cgroup_cpus(path)
   return path
+
+
+def workload_cgroup(config, *, leaf=True):
+  return configured_cgroup(config, "workload_cgroup", leaf=leaf)
+
+
+def cgroup_cpus(path):
+  return cpu_set((Path(path) / "cpuset.cpus.effective").read_text().strip())
+
+
+def placement(config, *, hierarchy=False):
+  workload = workload_cgroup(config, leaf=not hierarchy)
+  controller = configured_cgroup(config, "controller_cgroup")
+  if cgroup_cpus(workload) & cgroup_cpus(controller):
+    raise ValueError("workload and controller cgroup cpusets must not overlap")
+  return workload, controller
+
+
+def placement_snapshot(config):
+  result = {}
+  for role in ("workload", "controller"):
+    path = config[f"{role}_cgroup"]
+    entry = {"cgroup": path}
+    try:
+      if path is None:
+        raise ValueError(f"{role}_cgroup is unset")
+      entry["cpus"] = sorted(cgroup_cpus(path))
+    except (OSError, ValueError) as error:
+      entry["error"] = str(error)
+    result[role] = entry
+  return result
 
 
 def read_json(path):
@@ -118,7 +149,7 @@ def new_run(config, name):
   write_json(path / "run.json", {
       "kind": name, "config": config, "kernel": os.uname().release,
       "repository": repository_state(REPO), "measurement": False,
-      "utilization_cpus": sorted(cpu_set(config["test_cpus"])),
+      "placement": placement_snapshot(config),
       "duration_kind": "final" if config["duration_s"] == 60 else "development"})
   return path
 
@@ -285,17 +316,37 @@ def utilization(before, after):
           "before": before, "after": after}
 
 
+def current_cgroup():
+  for line in Path("/proc/self/cgroup").read_text().splitlines():
+    if line.startswith("0::/"):
+      path = (CGROUP_ROOT / line[4:]).resolve(strict=True)
+      if path.is_relative_to(CGROUP_ROOT) and (path / "cgroup.procs").is_file():
+        return path
+  raise ValueError("cannot resolve the controller's current cgroup")
+
+
 @contextmanager
-def controller_affinity(cpus):
-  previous = os.sched_getaffinity(0)
-  allowed = previous & set(cpus)
-  if not allowed:
-    raise ValueError("controller cannot run on housekeeping CPUs")
+def controller_placement(config):
+  target = configured_cgroup(config, "controller_cgroup")
+  previous = current_cgroup()
+  affinity = os.sched_getaffinity(0)
+  changed = target != previous
+  if changed and not os.access(previous / "cgroup.procs", os.W_OK):
+    raise PermissionError(f"cannot restore controller to {previous}")
   try:
-    os.sched_setaffinity(0, allowed)
-    yield
+    if changed:
+      (target / "cgroup.procs").write_text(f"{os.getpid()}\n")
+    # children must inherit the controller cpuset rather than a stale workload mask
+    os.sched_setaffinity(0, cgroup_cpus(target))
+    yield target
   finally:
-    os.sched_setaffinity(0, previous)
+    with cleanup_interrupts():
+      try:
+        if changed:
+          (previous / "cgroup.procs").write_text(f"{os.getpid()}\n")
+        os.sched_setaffinity(0, affinity)
+      except OSError as error:
+        raise CleanupError("could not restore controller cgroup and affinity") from error
 
 
 def report_progress(message):

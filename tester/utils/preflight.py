@@ -5,7 +5,8 @@ import os
 from pathlib import Path
 import shutil
 
-from .common import BPF_CLANG, CGROUP_ROOT, REPO, cpu_set
+from .common import (BPF_CLANG, CGROUP_ROOT, REPO, cgroup_cpus, configured_cgroup,
+                     cpu_set, current_cgroup)
 
 
 def inspect(config, *, traced=False, basic=False):
@@ -21,30 +22,31 @@ def inspect(config, *, traced=False, basic=False):
                REPO / "scheds/setup.sh",
                Path("/sys/kernel/btf/vmlinux")):
     check(str(path), path.is_file(), "required source/BTF")
-  cpus = cpu_set(config["test_cpus"])
+  groups = {}
+  for role in ("workload", "controller"):
+    try:
+      path = configured_cgroup(config, f"{role}_cgroup")
+      groups[role] = cgroup_cpus(path)
+      check(f"{role} cgroup", True, {"path": str(path), "cpus": sorted(groups[role])})
+      check(f"{role} placement permission", os.access(path / "cgroup.procs", os.W_OK),
+            str(path / "cgroup.procs"))
+    except (OSError, ValueError) as error:
+      check(f"{role} cgroup", False, str(error))
+  cpus = groups.get("workload", set())
+  controller_cpus = groups.get("controller", set())
+  check("separate workload/controller cpusets", cpus and controller_cpus and not cpus & controller_cpus,
+        "effective cpusets must be nonempty and disjoint")
+  check("cyclictest CPU in workload cpuset", config["cyclictest_cpu"] in cpus, config["cyclictest_cpu"])
   try:
     online = cpu_set(Path("/sys/devices/system/cpu/online").read_text().strip())
-    check("test CPUs online", cpus <= online, sorted(online))
+    check("cgroup CPUs online", (cpus | controller_cpus) <= online, sorted(online))
   except (OSError, ValueError) as error:
-    check("test CPUs online", False, str(error))
-  check("controller affinity", os.sched_getaffinity(0) & cpu_set(config["controller_cpus"]),
-        sorted(os.sched_getaffinity(0)))
-  cgroup = config["workload_cgroup"]
-  if cgroup is None:
-    check("workload cgroup", False, "set workload_cgroup in config.json to a prepared leaf")
-  else:
-    cgroup = Path(cgroup)
-    try:
-      actual = cpu_set((cgroup / "cpuset.cpus.effective").read_text().strip())
-      check("workload cpuset", actual == cpus, sorted(actual))
-      controllers = (cgroup / "cgroup.subtree_control").read_text().strip()
-      check("workload leaf", not controllers, controllers or "no child controllers")
-      kind = (cgroup / "cgroup.type").read_text().strip()
-      check("process cgroup", kind == "domain", kind)
-      check("workload placement permission", os.access(cgroup / "cgroup.procs", os.W_OK),
-            str(cgroup / "cgroup.procs"))
-    except (OSError, ValueError) as error:
-      check("workload cgroup", False, str(error))
+    check("cgroup CPUs online", False, str(error))
+  try:
+    original = current_cgroup()
+    check("controller restore permission", os.access(original / "cgroup.procs", os.W_OK), str(original))
+  except (OSError, ValueError) as error:
+    check("controller restore permission", False, str(error))
   for name in ("user.slice", "system.slice", "machine.slice"):
     path = CGROUP_ROOT / name
     if not path.exists():
@@ -52,7 +54,7 @@ def inspect(config, *, traced=False, basic=False):
       continue
     try:
       actual = cpu_set((path / "cpuset.cpus.effective").read_text().strip())
-      check(name, actual <= cpu_set(config["controller_cpus"]), sorted(actual), required=not basic)
+      check(name, actual <= controller_cpus, sorted(actual), required=not basic)
     except (OSError, ValueError) as error:
       check(name, False, str(error), required=not basic)
   try:

@@ -84,13 +84,13 @@ def temporary_cpu_dma_latency(latency_us):
     state["released"] = True
 
 
-def cyclic_command(binary, output, cpus, controller_cpus, mode, threads, duration,
+def cyclic_command(binary, output, cpus, main_cpus, mode, threads, duration,
                    interval_us, histogram_us, policy="ext", priority=None, *, spike_us=None):
   priority = (50 if policy == "fifo" else 0) if priority is None else priority
   # cyclictest's priority option resets other policies to FIFO; set the requested policy afterward
   command = [str(binary), f"--priority={priority}", f"--policy={policy}", f"--threads={threads}",
              f"--interval={interval_us}", f"--duration={duration}s", "--mlockall",
-             "--quiet", "--clock=monotonic", "--default-system", f"--mainaffinity={cpu_list(controller_cpus)}",
+             "--quiet", "--clock=monotonic", "--default-system", f"--mainaffinity={cpu_list(main_cpus)}",
              f"--histogram={histogram_us}", f"--histfile={output / 'histogram.txt'}",
              f"--json={output / 'cyclictest.json'}"]
   if mode == "pinned":

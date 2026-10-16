@@ -54,6 +54,7 @@ def output_directory(args, prefix):
   output.mkdir(parents=True, exist_ok=False)
   common.write_json(output / "experiment.json", {
       "config_file": str(args.config_path), "config": args.config, "command": sys.argv,
+      "placement": common.placement_snapshot(args.config),
       "duration_kind": "final" if args.config["duration_s"] == 60 else "development"})
   print(f"Capture and results: {output}", flush=True)
   return output
@@ -63,9 +64,9 @@ def output_directory(args, prefix):
 def capture_context(args, *, hierarchy=False):
   if os.geteuid() != 0:
     raise PermissionError("root is required for the scheduler, trace and cgroup placement")
-  cgroup = common.workload_cgroup(args.config, leaf=not hierarchy)
-  cpus = common.cpu_set(args.config["test_cpus"])
-  with common.controller_affinity(common.cpu_set(args.config["controller_cpus"])):
+  cgroup, _ = common.placement(args.config, hierarchy=hierarchy)
+  cpus = common.cgroup_cpus(cgroup)
+  with common.controller_placement(args.config):
     yield cgroup, cpus
 
 

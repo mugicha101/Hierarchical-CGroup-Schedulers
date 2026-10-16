@@ -1,7 +1,6 @@
 {
   "workload_cgroup": null,
-  "test_cpus": "8-15",
-  "controller_cpus": "0-7",
+  "controller_cgroup": null,
   "cyclictest_cpu": 9,
   "duration_s": 60,
   "warmup_s": 1,

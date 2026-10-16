@@ -7,7 +7,7 @@ import os
 from pathlib import Path
 import sys
 
-from .common import cpu_set, workload_cgroup
+from .common import cgroup_cpus, workload_cgroup
 
 POLICIES = {"other": os.SCHED_OTHER, "fifo": os.SCHED_FIFO, "rr": os.SCHED_RR, "ext": 7}
 
@@ -47,7 +47,7 @@ def main(request, ready_fd, gate_fd):
   settings = json.loads(Path(request).read_text())
   cgroup = workload_cgroup(settings["config"])
   cpus = set(settings["cpus"])
-  if not cpus or not cpus <= cpu_set(settings["config"]["test_cpus"]):
+  if not cpus or not cpus <= cgroup_cpus(cgroup):
     raise ValueError("workload CPUs must be within the test cpuset")
   policy = settings["policy"]
   if policy not in POLICIES:

@@ -138,8 +138,8 @@ def main():
       raise PermissionError("root is required for Wi-Fi driver and bandwidth runtime changes")
     if args.command == "enable":
       config = common.load_config(args.config)
-      common.workload_cgroup(config, leaf=False)
-      enable(common.cpu_set(config["test_cpus"]))
+      cgroup = common.workload_cgroup(config, leaf=False)
+      enable(common.cgroup_cpus(cgroup))
       print(f"Manual noise isolation enabled; restore with {sys.executable} {Path(__file__).resolve()} disable")
     else:
       disable()

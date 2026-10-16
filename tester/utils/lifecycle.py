@@ -122,14 +122,14 @@ class Session:
     self.config = config
     self.directory = Path(directory)
     self.timeout = config["process_timeout_s"]
-    self.cgroup = common.workload_cgroup(config)
+    self.cgroup, _ = common.placement(config)
     self.scheduler = scheduler
     self.root_process = None
     self.attached = None
     self.initial = None
     self.jobs = []
     self.history = []
-    self.affinity = None
+    self.controller = None
     self.closed = False
     for name in ("workloads", "scheduler"):
       (self.directory / name).mkdir()
@@ -153,7 +153,7 @@ class Session:
   def start_workload(self, command, cpus, *, policy, priority, nice, weight=None):
     if policy not in POLICIES:
       raise ValueError(f"unsupported workload policy: {policy}")
-    if not set(cpus) or not set(cpus) <= common.cpu_set(self.config["test_cpus"]):
+    if not set(cpus) or not set(cpus) <= common.cgroup_cpus(self.cgroup):
       raise ValueError("workload CPUs must be within the test cpuset")
     if policy == "ext" and self.scheduler is None:
       raise ValueError("EXT workloads require an attached experiment scheduler")
@@ -171,8 +171,9 @@ class Session:
       self.initial = root_state()
       if self.initial["state"] != "disabled" or self.initial["ops"] is not None:
         raise RuntimeError("a root scheduler is already active; refusing to replace it")
-      self.affinity = common.controller_affinity(common.cpu_set(self.config["controller_cpus"]))
-      self.affinity.__enter__()
+      controller = common.controller_placement(self.config)
+      controller.__enter__()
+      self.controller = controller
       self.recording.start()
       self.note("recorder-ready" if self.recording.events else "tracing-disabled")
       if self.scheduler is not None:
@@ -218,7 +219,7 @@ class Session:
     errors = []
     with common.cleanup_interrupts():
       for cleanup in (self.workloads.close, self._close_jobs, self._detach,
-                      self.recording.close, self._restore_affinity):
+                      self.recording.close, self._restore_controller):
         try:
           cleanup()
         except Exception as error:
@@ -246,10 +247,10 @@ class Session:
         time.sleep(.02)
       raise TimeoutError("owned root scheduler did not detach")
 
-  def _restore_affinity(self):
-    if self.affinity is not None:
-      self.affinity.__exit__(None, None, None)
-      self.affinity = None
+  def _restore_controller(self):
+    if self.controller is not None:
+      self.controller.__exit__(None, None, None)
+      self.controller = None
 
   def __exit__(self, *_):
     self.close()

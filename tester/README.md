@@ -30,16 +30,19 @@ python3 tester/experiments/run.py build simple
 python3 tester/experiments/run.py build cyclictest
 ```
 
-Edit `tester/experiments/config.json` to set `workload_cgroup` to an existing
-writable process cgroup below `/sys/fs/cgroup`; it is deliberately unset by
-default. The prepared workload leaf must allow exactly CPUs 8-15 and distribute
-no child controllers. All threads of each workload process share its cgroup.
-Housekeeping processes remain on CPUs 0-7. Preflight and builds do not attach
-schedulers. The runner does not create cgroups, configure isolation, load modules
-or install packages. Recurring experiment settings belong in this configuration;
+Edit `tester/experiments/config.json` to set `workload_cgroup` and
+`controller_cgroup` to existing process cgroups below `/sys/fs/cgroup`; both are
+deliberately unset by default. Their `cpuset.cpus.effective` files determine CPU
+placement, with nonempty, disjoint sets. Prepare CPUs 8-15 for workloads and 0-7
+for the controller on the final machine. Ordinary runs require leaves with no
+child controllers. All threads of each workload process share its cgroup.
+Preflight and builds do not attach schedulers. The runner never creates either
+configured cgroup, configures isolation, loads modules or installs packages.
+Recurring experiment settings belong in this configuration;
 the switches below select development checks and build profiles.
 
-`stress_utilization_percent` targets aggregate busy time only across CPUs 8-15.
+`stress_utilization_percent` targets aggregate busy time only across the workload
+cgroup's effective CPUs (8-15 on the final machine).
 The shared `/proc/stat` reader excludes idle and iowait from busy time and does
 not count guest time twice. It retains raw counters; stress-ng's per-worker load
 option must not be treated as proof that the aggregate target was achieved.
@@ -49,9 +52,11 @@ DEADLINE cases are explicitly deferred. E2's EXT variants are qmap/JLFP.
 Each command's artifacts go to a new `tester/build/experiments/` directory.
 Build attempts retain commands, logs, source/binary hashes and failures, with a
 fixed attempt limit and process-group cleanup. Cleanup failure stops retries.
-Builds run on the controller CPUs, do not require root, and leave existing builds
-untouched. A runner invoked through sudo delegates compilation to the original
-user. JLFP/GEDF builds disable timing statistics and custom trace emissions
+Builds run in the controller cgroup and leave existing builds untouched. Running
+without root requires permission to enter that cgroup and return to the original
+cgroup, or launching from the controller cgroup itself. A runner invoked through
+sudo delegates compilation to the original user. JLFP/GEDF builds disable timing
+statistics and custom trace emissions
 by default; `build jlfp --trace events` or `--trace hotpath` selects a separate
 tracing build. Qmap/simple's operational counters are left alone.
 All BPF scheduler builds use `clang-22`, including preflight's compiler check;
@@ -80,7 +85,8 @@ through a controller gate. JLFP additionally checks a task-weight map write and
 readback. EXT loaders attach only at root using partial switching; simple's
 private loader receives a saved `-p` patch. Existing schedulers are never replaced.
 Root identity and recorder liveness are checked throughout; teardown stops
-workload groups before the owned loader and recorder, then restores affinity.
+workload groups before the owned loader and recorder, then restores the
+controller's original cgroup and affinity.
 Trace-free checks start neither a recorder nor a scheduler manager.
 
 `--traced` records `sched:sched_process_exit` in a private monotonic-clock
@@ -90,7 +96,7 @@ events fail the attempt. No custom module is needed for these smoke captures;
 custom scxtp events require a matching module and a tracing-enabled JLFP build.
 
 On a development host, `smoke ... --basic` relaxes only the housekeeping-slice
-isolation checks. It still requires the prepared CPUs 8-15 workload cgroup, marks
+isolation checks. It still requires both prepared, disjoint cgroups, marks
 the output as a setup check, and never produces benchmark results. All final-run
 prerequisites remain mandatory for normal checks. Earlier qmap checks built with
 Clang 21 failed in `qmap_dequeue` (`R7 invalid mem access 'scalar'`); Clang 22 fixes
@@ -112,11 +118,16 @@ Trace analysis uses Python 3, `bt2`, and the Babeltrace2 ftrace plugin. [setup_b
 
 ## Configured Experiments
 
-All entry points read `tester/experiments/config.json`. Set `workload_cgroup` to
-an existing prepared cgroup allowing CPUs 8-15. Ordinary JLFP, wakeup and latency
-runs require a process cgroup leaf. MC² uses that configured path as the base of
+All entry points read `tester/experiments/config.json`. Set `workload_cgroup` and
+`controller_cgroup` to existing prepared cgroups with disjoint effective cpusets.
+Ordinary JLFP, wakeup and latency runs require a process cgroup leaf. MC² uses
+the workload path as the base of
 its owned class hierarchy and refuses existing `class_a`, `class_b` or `class_c`
-children. The controller uses CPUs 0-7 and restores its original affinity afterward.
+children. The Python controller, scheduler loaders, recorders and build helpers
+run in the controller cgroup; workload launchers move their processes into the
+workload cgroup. The controller restores its original cgroup and affinity afterward.
+Both configured cgroups and their cpusets are left intact. Per-task affinity
+still selects CPUs within the workload cpuset when an experiment requires pinning.
 The runners never create `other`, migrate unrelated processes or change host
 noise controls. MC²'s per-CPU child cgroups inherit from the configured base and
 restrict the pinned A/B workers to their assigned CPUs.
@@ -134,18 +145,22 @@ Experiment-specific parameters live under `experiments`:
 | `latency` | Pinning mode, policy/priority, thread count, interval, histogram range, timer slack, temporary CPU DMA latency, scheduler attachment and diagnostics. |
 
 `tester/experiments/debug.json` is a complete alternate config with 3-second runs,
-0.2-second native-worker warmup and one attempt. Set its cgroup for the development
-machine too. It is loaded explicitly; there is no implicit merge or auto-detection.
+0.2-second native-worker warmup and one attempt. Set both its cgroups for the
+development machine too. It is loaded explicitly; there is no implicit merge
+or auto-detection.
 
 ```sh
 python3 tester/experiments/run.py --config tester/experiments/debug.json plan
 sudo python3 tester/experiments/run_jlfp_dynamic_test.py --config tester/experiments/debug.json
 ```
 
-Durations, CPU sets, cgroups and workload parameters come from config rather than
+Durations, cgroup paths and workload parameters come from config rather than
 CLI flags. `--output-dir` and `--analyse-only CAPTURE_DIR` remain available; saved
 inversion/wakeup captures can be analysed without root or a live workload cgroup.
-Each new capture saves the resolved config and command in `experiment.json`.
+Each new capture saves the resolved config, effective cpusets and command in
+`experiment.json`. Utilization and worker counts use the workload's effective
+cpuset; there are no separate CPU-mask settings in config. Planning and offline
+analysis do not require either cgroup to be available.
 `--scx-build-path` is an optional debug build override. Latency also retains
 `--cyclictest`, `--mode`, `--policy`, `--no-jlfp`, `--diagnostic-trace` and
 `--spike-us`; absent overrides use the config values.
