@@ -1,10 +1,17 @@
 """Build private artifacts without loading BPF or changing existing builds."""
 
 import difflib
+import json
+import os
+from pathlib import Path
+import pwd
+import signal
+import subprocess
+import sys
 
 from ..build_jlfp_cyclictest import guard_header
-from .common import (REPO, controller_affinity, cpu_set, repository_state,
-                     run_attempts, sha256, write_json)
+from .common import (REPO, CleanupError, controller_affinity, cpu_set, new_run,
+                     repository_state, run_attempts, sha256, write_json)
 
 RT_TESTS_URL = "https://git.kernel.org/pub/scm/utils/rt-tests/rt-tests.git"
 RT_TESTS_REVISION = "62da2befac98f811af8e56f2b7992fb09faa33d6"
@@ -12,7 +19,7 @@ RT_TESTS_REVISION = "62da2befac98f811af8e56f2b7992fb09faa33d6"
 
 def patch_once(text, before, after):
   if text.count(before) != 1:
-    raise ValueError(f"upstream cyclictest patch context changed: {before!r}")
+    raise ValueError(f"upstream patch context changed: {before!r}")
   return text.replace(before, after, 1)
 
 
@@ -40,7 +47,79 @@ def patch_cyclictest(checkout):
   return "".join(patches)
 
 
+def simple_loader(source):
+  text = patch_once(source, 'Usage: %s [-f] [-v]', 'Usage: %s [-f] [-p] [-v]')
+  text = patch_once(text, '"  -v            Print libbpf debug messages\\n"',
+      '"  -p            Switch only tasks using SCHED_EXT\\n"\n'
+      '"  -v            Print libbpf debug messages\\n"')
+  text = patch_once(text, 'getopt(argc, argv, "fvh")', 'getopt(argc, argv, "fpvh")')
+  return patch_once(text, "\t\tcase 'v':\n",
+      "\t\tcase 'p':\n"
+      "\t\t\tskel->struct_ops.simple_ops->flags |= SCX_OPS_SWITCH_PARTIAL;\n"
+      "\t\t\tbreak;\n\t\tcase 'v':\n")
+
+
+def result(root):
+  for path in sorted(root.glob("attempt-*/status.json"), reverse=True):
+    status = json.loads(path.read_text())
+    if status["status"] == "succeeded":
+      return status["result"]
+  raise RuntimeError(f"no successful build in {root}")
+
+
+def user_build(config, target, trace):
+  uid = int(os.environ.get("SUDO_UID", "0"))
+  if uid == 0:
+    raise ValueError("root builds require the original user in SUDO_UID")
+  account = pwd.getpwuid(uid)
+  directory = new_run(config, f"build-dispatch-{target}")
+  settings = directory / "config.json"
+  write_json(settings, config)
+  source = """import signal, sys
+from tester.experiments import builds
+from tester.experiments.common import load_config
+def interrupt(*_):
+  raise KeyboardInterrupt
+signal.signal(signal.SIGTERM, interrupt)
+print('BUILD_RESULT=' + str(builds.build(load_config(sys.argv[1]), sys.argv[2], sys.argv[3])),
+      flush=True)
+"""
+  args = [sys.executable, "-c", source, str(settings), target, trace]
+  write_json(directory / "command.json", {"command": args, "uid": uid, "gid": account.pw_gid})
+  process = subprocess.Popen(args, cwd=REPO, stdout=subprocess.PIPE,
+                             stderr=subprocess.STDOUT, text=True, start_new_session=True,
+                             user=uid, group=account.pw_gid, extra_groups=[])
+  try:
+    output, _ = process.communicate(timeout=config["build_timeout_s"] *
+                                    config["max_attempts"] * 4 + 60)
+  except BaseException:
+    try:
+      os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+      pass
+    try:
+      output, _ = process.communicate(timeout=config["process_timeout_s"] * 4 + 5)
+      (directory / "build.log").write_text(output)
+    except subprocess.TimeoutExpired as error:
+      raise CleanupError("unprivileged builder did not finish cleanup") from error
+    raise
+  (directory / "build.log").write_text(output)
+  if process.returncode:
+    raise RuntimeError(f"unprivileged build failed; see {directory / 'build.log'}")
+  roots = [line.removeprefix("BUILD_RESULT=") for line in output.splitlines()
+           if line.startswith("BUILD_RESULT=")]
+  if len(roots) != 1:
+    raise RuntimeError("unprivileged builder did not return one artifact directory")
+  root = Path(roots[0]).resolve(strict=True)
+  if root.parent != directory.parent:
+    raise RuntimeError("builder returned an unexpected artifact directory")
+  print(output, end="", flush=True)
+  return root
+
+
 def build(config, target, trace="off"):
+  if os.geteuid() == 0:
+    return user_build(config, target, trace)
   def action(directory, processes):
     timeout = config["build_timeout_s"]
     metadata = {"target": target, "trace_profile": trace, "latency_statistics": False}
@@ -54,6 +133,7 @@ def build(config, target, trace="off"):
       metadata["source_sha256"] = {"tester/work.c": sha256(REPO / "tester/work.c")}
       run(["cc", "-O2", "-pthread", "-DSCHED_EXT=7", "tester/work.c", "-lbpf", "-o", binary])
     elif target == "jlfp":
+      metadata.update(partial_switch=True, launch_args=[])
       output = directory / "scheds"
       flags = {"SCXTP_TRACING": int(trace != "off"),
                "SCXTP_HOTPATH_TRACING": int(trace == "hotpath"), "SCX_LATENCY_STATS": 0}
@@ -74,6 +154,23 @@ def build(config, target, trace="off"):
       run(["make", "-C", REPO.parent, "-j2", f"O={output}",
            "CLANG=clang-21", "VMLINUX_BTF=/sys/kernel/btf/vmlinux", f"scx_{target}"])
       binary = directory / f"upstream/build/bin/scx_{target}"
+      metadata.update(partial_switch=True, launch_args=["-p"])
+      if target == "simple":
+        original = (REPO.parent / "scx_simple.c").read_text()
+        modified = simple_loader(original)
+        source = output / "scx_simple.c"
+        source.write_text(modified)
+        patch = difflib.unified_diff(original.splitlines(keepends=True),
+                                    modified.splitlines(keepends=True),
+                                    fromfile="a/scx_simple.c", tofile="b/scx_simple.c")
+        (directory / "simple-partial.patch").write_text("".join(patch))
+        includes = [output / "build/include", REPO.parent / "../../include/generated",
+                    REPO.parent / "../lib", REPO.parent / "../include",
+                    REPO.parent / "../include/uapi", REPO.parent / "include"]
+        run(["cc", "-g", "-O2", "-rdynamic", "-pthread", "-Wall", "-Werror",
+             *(f"-I{p}" for p in includes), source, "-o", binary,
+             output / "build/obj/libbpf/libbpf.a", "-lelf", "-lz", "-lpthread"])
+        metadata["loader_sha256"] = sha256(source)
       # these schedulers have no project latency-statistics instrumentation
       metadata["latency_statistics"] = "not applicable"
     else:

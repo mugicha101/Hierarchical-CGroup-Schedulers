@@ -5,8 +5,8 @@ Run all commands below from the repository root (`cgs/`).
 ## Staged Experiment Setup
 
 The shared setup for the overhead/inversion experiment suite lives in
-`tester/experiments/`. Experiment workloads are still pending later stages;
-these commands only inspect prerequisites or build private artifacts:
+`tester/experiments/`. Benchmark cases are still pending later stages;
+these commands inspect prerequisites or build private artifacts:
 
 ```sh
 python3 tester/experiments/run.py plan
@@ -22,8 +22,10 @@ Edit `tester/experiments/config.json` to set `workload_cgroup` to an existing
 writable process cgroup below `/sys/fs/cgroup`; it is deliberately unset by
 default. The prepared workload leaf must allow exactly CPUs 8-15 and distribute
 no child controllers. All threads of each workload process share its cgroup.
-Housekeeping processes remain on CPUs 0-7. Setup does not create cgroups,
-configure isolation, load modules, attach schedulers or install packages.
+Housekeeping processes remain on CPUs 0-7. Preflight and builds do not attach
+schedulers. The runner does not create cgroups, configure isolation, load modules
+or install packages. Recurring experiment settings belong in this configuration;
+the switches below select development checks and build profiles.
 
 `stress_utilization_percent` targets aggregate busy time only across CPUs 8-15.
 The shared `/proc/stat` reader excludes idle and iowait from busy time and does
@@ -36,9 +38,58 @@ Each command's artifacts go to a new `tester/build/experiments/` directory.
 Build attempts retain commands, logs, source/binary hashes and failures, with a
 fixed attempt limit and process-group cleanup. Cleanup failure stops retries.
 Builds run on the controller CPUs, do not require root, and leave existing builds
-untouched. JLFP/GEDF builds disable timing statistics and custom trace emissions
+untouched. A runner invoked through sudo delegates compilation to the original
+user. JLFP/GEDF builds disable timing statistics and custom trace emissions
 by default; `build jlfp --trace events` or `--trace hotpath` selects a separate
 tracing build. Qmap/simple's operational counters are left alone.
+
+Short lifecycle checks use the existing native worker with an expired schedule,
+so no busy loop or benchmark measurement runs:
+
+```sh
+sudo python3 tester/experiments/run.py smoke none
+sudo python3 tester/experiments/run.py smoke jlfp --traced
+sudo python3 tester/experiments/run.py smoke qmap
+sudo python3 tester/experiments/run.py smoke simple
+```
+
+Each check builds fresh artifacts, places the workload process in the configured
+cgroup, verifies every thread's policy/priority/nice/affinity, and releases it
+through a controller gate. JLFP additionally checks a task-weight map write and
+readback. EXT loaders attach only at root using partial switching; simple's
+private loader receives a saved `-p` patch. Existing schedulers are never replaced.
+Root identity and recorder liveness are checked throughout; teardown stops
+workload groups before the owned loader and recorder, then restores affinity.
+Trace-free checks start neither a recorder nor a scheduler manager.
+
+`--traced` records `sched:sched_process_exit` in a private monotonic-clock
+instance before attachment. Captures retain trace controls, per-CPU loss counters,
+offline event/CPU counts and parsing diagnostics. Missing events/metadata or lost
+events fail the attempt. No custom module is needed for these smoke captures;
+custom scxtp events require a matching module and a tracing-enabled JLFP build.
+
+On a development host, `smoke ... --basic` relaxes only the housekeeping-slice
+isolation checks. It still requires the prepared CPUs 8-15 workload cgroup, marks
+the output as a setup check, and never produces benchmark results. All final-run
+prerequisites remain mandatory for normal checks. On this development kernel,
+qmap currently fails verification in `qmap_dequeue` (`R7 invalid mem access
+'scalar'`); its build succeeds, and failed runtime attempts retain verifier logs.
+
+For repeated development checks, the optional
+[`tester/codex/root_session.py`](codex/root_session.py) helper exposes only fixed
+preflight/smoke commands through a socket restricted to the invoking user:
+
+```sh
+sudo python3 tester/codex/root_session.py serve
+# in another terminal
+python3 tester/codex/root_session.py smoke none --basic
+```
+
+Ctrl-C in the server terminal stops the helper after active-run cleanup. Its
+explicit `cgroup` commands are manual operations for the fixed development leaf
+`/sys/fs/cgroup/cgs-experiments-dev`; no cgroup is created by starting the helper
+or running a check. Prepare/remove that temporary leaf manually. The final runner
+always uses the externally prepared cgroup from the configuration.
 
 The new cyclictest build uses upstream revision
 `62da2befac98f811af8e56f2b7992fb09faa33d6` in a private checkout with only EXT

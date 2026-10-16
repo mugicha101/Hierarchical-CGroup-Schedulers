@@ -11,7 +11,7 @@ else:
   from common import CGROUP_ROOT, REPO, cpu_set
 
 
-def inspect(config, *, traced=False):
+def inspect(config, *, traced=False, basic=False):
   checks = []
 
   def check(name, ok, detail, *, required=True):
@@ -55,9 +55,9 @@ def inspect(config, *, traced=False):
       continue
     try:
       actual = cpu_set((path / "cpuset.cpus.effective").read_text().strip())
-      check(name, actual <= cpu_set(config["controller_cpus"]), sorted(actual))
+      check(name, actual <= cpu_set(config["controller_cpus"]), sorted(actual), required=not basic)
     except (OSError, ValueError) as error:
-      check(name, False, str(error))
+      check(name, False, str(error), required=not basic)
   try:
     state = Path("/sys/kernel/sched_ext/state").read_text().strip()
     check("sched_ext available and detached", state == "disabled", state)
@@ -90,4 +90,5 @@ def inspect(config, *, traced=False):
           "required for custom emissions; class-only captures do not need it",
           required=False)
   return {"ok": all(c["ok"] for c in checks if c["required"]), "checks": checks,
-          "kernel": os.uname().release, "changes_applied": False}
+          "kernel": os.uname().release, "changes_applied": False,
+          "housekeeping_isolation_required": not basic}

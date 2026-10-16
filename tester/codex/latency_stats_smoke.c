@@ -10,7 +10,7 @@ typedef uint64_t u64;
 static unsigned calls;
 static u64 bpf_ktime_get_ns(void) { return ++calls; }
 
-#include "../scheds/diagnostics.h"
+#include "../../scheds/diagnostics.h"
 
 int main(void)
 {

@@ -64,6 +64,20 @@ def load_config(path=DEFAULT_CONFIG):
   return config
 
 
+def workload_cgroup(config):
+  if config["workload_cgroup"] is None:
+    raise ValueError("set workload_cgroup in config.json to an existing prepared leaf")
+  path = Path(config["workload_cgroup"]).resolve(strict=True)
+  if path == CGROUP_ROOT or not path.is_relative_to(CGROUP_ROOT):
+    raise ValueError("workload cgroup must be below /sys/fs/cgroup")
+  if (path / "cgroup.type").read_text().strip() != "domain" or \
+      (path / "cgroup.subtree_control").read_text().strip():
+    raise ValueError("workloads require an existing process cgroup leaf")
+  if cpu_set((path / "cpuset.cpus.effective").read_text().strip()) != cpu_set(config["test_cpus"]):
+    raise ValueError("workload cgroup must allow exactly the configured test CPUs")
+  return path
+
+
 def write_json(path, value):
   path = Path(path)
   temporary = path.with_suffix(path.suffix + ".tmp")
@@ -77,8 +91,10 @@ def sha256(path):
 
 
 def repository_state(path):
+  path = Path(path).resolve()
+  root = next(parent for parent in (path, *path.parents) if (parent / ".git").exists())
   def git(*args):
-    return subprocess.run(["git", "-C", str(path), *args], check=True,
+    return subprocess.run(["git", "-c", f"safe.directory={root}", "-C", str(path), *args], check=True,
                           capture_output=True, text=True, timeout=10).stdout.strip()
   return {"path": str(path), "revision": git("rev-parse", "HEAD"),
           "status": git("status", "--short", "--untracked-files=normal")}
@@ -129,7 +145,7 @@ class Processes:
     self.children = []
     self.commands = []
 
-  def start(self, command, *, cwd=REPO):
+  def start(self, command, *, cwd=REPO, stdin=None, pass_fds=()):
     command = list(map(str, command))
     record = {"command": command, "cwd": str(cwd), "started_ns": time.monotonic_ns()}
     self.commands.append(record)
@@ -137,7 +153,8 @@ class Processes:
     log = self.directory / f"command-{len(self.commands):02d}.log"
     with log.open("xb") as output:
       process = subprocess.Popen(command, cwd=cwd, stdout=output,
-                                 stderr=subprocess.STDOUT, start_new_session=True)
+                                 stderr=subprocess.STDOUT, start_new_session=True,
+                                 stdin=stdin, pass_fds=pass_fds)
     self.children.append((process, record))
     record.update(pid=process.pid, log=log.name)
     write_json(self.directory / "commands.json", self.commands)
@@ -209,11 +226,14 @@ def run_attempts(config, name, action):
         state.update(status="cleanup_failed", cleanup=str(caught))
         write_json(directory / "status.json", state)
         raise CleanupError(f"cleanup failed; no retry; see {directory}") from caught
-      state["status"] = "failed" if error else "succeeded"
+      if isinstance(error, CleanupError):
+        state.update(status="cleanup_failed", cleanup="incomplete")
+      else:
+        state["status"] = "failed" if error else "succeeded"
       write_json(directory / "status.json", state)
     if error is None:
       return root
-    if not isinstance(error, Exception):
+    if not isinstance(error, Exception) or isinstance(error, CleanupError):
       raise error
     if number == config["max_attempts"]:
       raise RuntimeError(f"all attempts failed; see {root}") from error

@@ -79,7 +79,7 @@ def cleanup_trace(trace_path):
 class TraceSession:
   # start scheduler manager
   def __init__(self, *, events=("scxtp:*", "bpf_trace:bpf_trace_printk"),
-               scx_build_path=None, timeout=30, monitor=False):
+               scx_build_path=None, timeout=30, monitor=False, manage_schedulers=True):
     self._manager = None
     self._trace = None
     self._trace_log = None
@@ -89,6 +89,7 @@ class TraceSession:
     self._manager_failed = False
     self._root_loaded = False
     self._closed = False
+    self.cleanup_error = None
     self.manager_output = []
     self.events = (events,) if isinstance(events, str) else tuple(events)
     self.timeout = timeout
@@ -96,6 +97,8 @@ class TraceSession:
     self._owns_trace = False
     if not self.events or timeout <= 0:
       raise ValueError("Events must be nonempty and timeout must be positive")
+    if not manage_schedulers:
+      return
     try:
       if _root_attached():
         raise RuntimeError("A root scheduler is already attached")
@@ -318,10 +321,37 @@ class TraceSession:
           continue
       raise TimeoutError("Forced process shutdown; trace or cgroup cleanup may be incomplete")
 
+  def _save_trace_metadata(self):
+    metadata = {"instance": str(self._instance_path), "requested_events": self.events,
+                "controls": {}, "cpu_stats": {}, "errors": []}
+    # freeze the private buffers before trace-cmd drains and deletes its instance
+    try:
+      (self._instance_path / "tracing_on").write_text("0\n")
+    except OSError as error:
+      metadata["errors"].append(f"stop tracing: {error}")
+    for name in ("tracing_on", "trace_clock", "tracing_cpumask", "current_tracer", "buffer_size_kb",
+                 "set_event"):
+      try:
+        metadata["controls"][name] = (self._instance_path / name).read_text().strip()
+      except OSError as error:
+        metadata["errors"].append(f"{name}: {error}")
+    try:
+      for path in sorted((self._instance_path / "per_cpu").glob("cpu*/stats")):
+        metadata["cpu_stats"][path.parent.name] = path.read_text()
+    except OSError as error:
+      metadata["errors"].append(f"cpu stats: {error}")
+    path = self.trace_path.with_suffix(self.trace_path.suffix + ".metadata.json")
+    path.write_text(json.dumps(metadata, indent=2) + "\n")
+
   # stop trace recording
   def stop_trace(self):
     process, self._trace = self._trace, None
     errors = []
+    if self._instance_path is not None:
+      try:
+        self._save_trace_metadata()
+      except OSError as error:
+        errors.append(error)
     try:
       if process is not None:
         status = self._finish_process(process)
@@ -388,7 +418,8 @@ class TraceSession:
         errors.append(error)
     self._closed = True
     if errors:
-      raise RuntimeError("Session cleanup failed: " + "; ".join(map(str, errors))) from errors[0]
+      self.cleanup_error = RuntimeError("Session cleanup failed: " + "; ".join(map(str, errors)))
+      raise self.cleanup_error from errors[0]
 
   def _close_after_error(self, error):
     try:

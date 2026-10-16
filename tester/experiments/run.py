@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prepare the staged experiment suite; no benchmark cases run yet."""
+"""Prepare experiments and check their lifecycle; no benchmark cases run yet."""
 
 import argparse
 import json
@@ -34,6 +34,11 @@ def main():
   build = commands.add_parser("build", help="build isolated artifacts without attaching schedulers")
   build.add_argument("target", choices=("worker", "jlfp", "qmap", "simple", "cyclictest"))
   build.add_argument("--trace", choices=("off", "events", "hotpath"), default="off")
+  smoke = commands.add_parser("smoke", help="check lifecycle with an expired worker schedule")
+  smoke.add_argument("scheduler", choices=("none", "jlfp", "qmap", "simple"))
+  smoke.add_argument("--traced", action="store_true")
+  smoke.add_argument("--basic", action="store_true",
+                     help="setup check on a development host without housekeeping isolation")
   args = parser.parse_args()
   try:
     config = load_config(args.config)
@@ -48,10 +53,13 @@ def main():
         print(f"{status}: {check['name']}: {check['detail']}")
       print(f"Report: {output / 'preflight.json'}")
       return 0 if report["ok"] else 2
-    else:
+    elif args.command == "build":
       if args.trace != "off" and args.target != "jlfp":
         raise ValueError("custom trace profiles apply only to JLFP")
       builds.build(config, args.target, args.trace)
+    else:
+      from tester.experiments import smoke
+      smoke.run(config, args.scheduler, args.traced, args.basic)
     return 0
   except KeyboardInterrupt:
     print("Interrupted; attempt artifacts retained", file=sys.stderr)
