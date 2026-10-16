@@ -2,9 +2,9 @@
 
 import time
 
-from . import builds, preflight, tracing
-from .common import new_run, run_attempts, write_json
-from .lifecycle import Session
+from tester.utils import builds, preflight, tracing
+from tester.utils.common import new_run, run_attempts, write_json
+from tester.utils.lifecycle import Session
 
 
 def run(config, scheduler, traced=False, basic=False):

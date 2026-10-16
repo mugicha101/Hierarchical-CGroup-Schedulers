@@ -1,15 +1,15 @@
 # checks for priority inversions based on switch + trace events
 
+from pathlib import Path
 from bisect import insort
 import sys
 import traceback
 from collections import namedtuple
 from enum import Enum
 
-if __package__:
-  from .trace_helpers import TraceParser
-else:
-  from trace_helpers import TraceParser
+if not __package__:
+  sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from tester.utils.trace_helpers import TraceParser
 
 # assume migratable tasks; ignore the nmig flag in traced weights
 TASK_WEIGHT_MASK = (1 << 63) - 1
@@ -114,7 +114,7 @@ class ExecModel:
     self.running_weights = [] # (cgroup_weight, task_weight)
     self.pi = False # priority inversion?
     self.use_sched_switch = use_sched_switch
-  
+
   def fetch_cpu(self, cpu_id):
     while len(self.cpus) <= cpu_id:
       self.cpus.append(CPUState(len(self.cpus), self.start_time))
@@ -157,7 +157,7 @@ class ExecModel:
       case TaskStatus.RUNNING:
         insort(self.running_weights, weight)
     self.update_pi()
-  
+
   def dump_pi_info(self):
     print(f"Time {self.curr_time}: PI {'YES' if self.pi else 'NO'}")
     print(f"  Pending weights: {list(self.pending_weights)}")
@@ -275,7 +275,7 @@ class ExecModel:
     elif not self.pi and old_pi:
       print(f"PI END at time {self.curr_time}")
       self.dump_pi_info()
-        
+
   def finish(self):
     for cpu in self.cpus:
       cpu.update_time(self.curr_time)

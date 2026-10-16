@@ -66,7 +66,7 @@ class Workload:
     gate_r, self.gate = os.pipe2(os.O_CLOEXEC)
     try:
       self.process = session.workloads.start(
-          [sys.executable, "-m", "tester.experiments.launch", self.request, ready_w, gate_r],
+          [sys.executable, "-m", "tester.utils.launch", self.request, ready_w, gate_r],
           stdin=subprocess.PIPE, pass_fds=(ready_w, gate_r))
       self.log = session.workloads.directory / session.workloads.commands[-1]["log"]
       os.close(ready_w)

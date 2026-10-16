@@ -12,7 +12,7 @@ import signal
 import subprocess
 import sys
 
-from ..build_jlfp_cyclictest import guard_header
+from .build_jlfp_cyclictest import guard_header
 from .common import (BPF_CLANG, REPO, CleanupError, controller_affinity, cpu_set, new_run,
                      repository_state, run_attempts, sha256, write_json)
 
@@ -103,8 +103,8 @@ def user_build(config, target, trace):
   settings = directory / "config.json"
   write_json(settings, config)
   source = """import signal, sys
-from tester.experiments import builds
-from tester.experiments.common import load_config
+from tester.utils import builds
+from tester.utils.common import load_config
 def interrupt(*_):
   raise KeyboardInterrupt
 signal.signal(signal.SIGTERM, interrupt)

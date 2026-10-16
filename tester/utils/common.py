@@ -9,13 +9,14 @@ import os
 from pathlib import Path
 import signal
 import subprocess
+import sys
 import time
 import uuid
 
 REPO = Path(__file__).resolve().parents[2]
 CGROUP_ROOT = Path("/sys/fs/cgroup")
 OUTPUT = REPO / "tester/build/experiments"
-DEFAULT_CONFIG = Path(__file__).with_name("config.json")
+DEFAULT_CONFIG = REPO / "tester/experiments/config.json"
 BPF_CLANG = "clang-22"
 CONFIG_KEYS = {"workload_cgroup", "test_cpus", "controller_cpus", "cyclictest_cpu",
                "duration_s", "stress_utilization_percent", "max_attempts",
@@ -286,3 +287,12 @@ def controller_affinity(cpus):
     yield
   finally:
     os.sched_setaffinity(0, previous)
+
+
+def report_progress(message):
+  print(message, file=sys.stderr, flush=True)
+
+
+def report_analysis_progress(percent, events, elapsed):
+  report_progress(f"Analysing trace: {percent:.1f}% of measurement interval; "
+                  f"{events:,} model events; {elapsed:.1f}s elapsed")

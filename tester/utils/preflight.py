@@ -5,10 +5,7 @@ import os
 from pathlib import Path
 import shutil
 
-if __package__:
-  from .common import BPF_CLANG, CGROUP_ROOT, REPO, cpu_set
-else:
-  from common import BPF_CLANG, CGROUP_ROOT, REPO, cpu_set
+from .common import BPF_CLANG, CGROUP_ROOT, REPO, cpu_set
 
 
 def inspect(config, *, traced=False, basic=False):

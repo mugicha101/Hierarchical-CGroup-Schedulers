@@ -5,7 +5,7 @@
 # - use a context manager or close() to detach, delete owned cgroups, and finalize
 #   on success or failure. __del__ is a fallback; stop test workloads before cleanup.
 # - config trace flags still control scheduler emissions; no flags are overridden.
-# - TraceParser reads the finalized .dat offline. analysis stays in test scripts.
+# - TraceParser reads the finalized .dat offline for the analysis helpers.
 # - after parsing, cleanup_trace(path) or session.cleanup_trace() deletes capture files.
 
 from pathlib import Path
@@ -27,7 +27,7 @@ import time
 import uuid
 import warnings
 
-REPO_DIR = Path(__file__).resolve().parents[1]
+REPO_DIR = Path(__file__).resolve().parents[2]
 ROOT_OPS = Path("/sys/kernel/sched_ext/root/ops")
 CGROUP_ROOT = Path("/sys/fs/cgroup")
 TRACE_INSTANCES = Path("/sys/kernel/tracing/instances")
@@ -447,7 +447,7 @@ class TraceSession:
 class TraceParser:
   # open a trace file for parsing
   def __init__(self, trace_path, *, lttng=False):
-    plugin_path = Path(__file__).resolve().parent / "build/bt2-ftrace-to-ctf/build/babeltrace-plugin-ftrace.so"
+    plugin_path = REPO_DIR / "tester/build/bt2-ftrace-to-ctf/build/babeltrace-plugin-ftrace.so"
     self._plugin = bt2.find_plugins_in_path(str(plugin_path), fail_on_load_error=True)[0]
     # retain native ftrace names/fields unless LTTng semantics are requested
     source = bt2.ComponentSpec(self._plugin.source_component_classes["tracedat"],

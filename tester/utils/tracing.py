@@ -20,7 +20,7 @@ class Recording:
     if any(event.startswith("scxtp:") for event in self.events) and \
         not Path("/sys/kernel/btf/scxtp").exists():
       raise RuntimeError("load the matching scxtp module externally before custom tracing")
-    from ..trace_helpers import TraceSession
+    from .trace_helpers import TraceSession
     self.session = TraceSession(events=self.events, timeout=self.timeout, manage_schedulers=False)
     self.session.start_trace(self.path)
 
@@ -41,7 +41,7 @@ class Recording:
 
 
 def summarize(path, required_events=()):
-  from ..trace_helpers import TraceParser, defer_trace_interrupts
+  from .trace_helpers import TraceParser, defer_trace_interrupts
   path = Path(path)
   report = {"valid": False, "events": {}, "cpus": {}, "error": None}
   events, cpus = Counter(), Counter()

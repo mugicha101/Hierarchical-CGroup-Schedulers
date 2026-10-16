@@ -9,8 +9,8 @@ import sys
 
 if not __package__:
   sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from tester.experiments import builds, preflight
-from tester.experiments.common import DEFAULT_CONFIG, load_config, new_run, write_json
+from tester.utils import builds, preflight
+from tester.utils.common import DEFAULT_CONFIG, load_config, new_run, write_json
 
 
 def plan(config):

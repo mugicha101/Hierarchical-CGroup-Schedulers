@@ -11,7 +11,7 @@ import subprocess
 import sys
 import tempfile
 
-REPO_DIR = Path(__file__).resolve().parents[1]
+REPO_DIR = Path(__file__).resolve().parents[2]
 RT_TESTS_REPO = "https://git.kernel.org/pub/scm/utils/rt-tests/rt-tests.git"
 RT_TESTS_REVISION = "fd45df830803dd7f26d2ca8bdcf05fd7e0d62ae8"
 MODIFIED_SOURCE = REPO_DIR / "cyclictest/modified_cyclictest.c"
