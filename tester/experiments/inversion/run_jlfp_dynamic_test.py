@@ -5,8 +5,8 @@ from pathlib import Path
 import sys
 
 if not __package__:
-  sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from tester.experiments import run_jlfp_test
+  sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+from tester.experiments.inversion import run_jlfp_test
 from tester.utils import common
 
 

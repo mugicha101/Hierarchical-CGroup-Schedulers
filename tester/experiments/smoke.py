@@ -21,7 +21,7 @@ def run(config, scheduler, traced=False, basic=False):
     with Session(config, directory, manifest, events=events) as session:
       job = session.start_workload(
           [worker["binary"], "--jlfp-worker"],
-          {config["cyclictest_cpu"]},
+          {config["experiments"]["overhead"]["cyclictest_cpu"]},
           policy="other" if manifest is None else "ext",
           priority=0,
           nice=0,

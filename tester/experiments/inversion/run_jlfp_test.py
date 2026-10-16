@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Run weighted, migratable JLFP workers and check an offline ftrace capture."""
+"""Measure static priority inversions among weighted, migratable JLFP workers."""
 
 from pathlib import Path
 import sys
 
 if not __package__:
-  sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+  sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 from tester.utils import arguments, common, inversion, jlfp_capture
 
 
@@ -41,7 +41,7 @@ def main(*, periodic=False):
     name = "jlfp_static"
     prefix = "jlfp-test-"
     description = __doc__
-  args = arguments.parse_experiment(name, description)
+  args = arguments.parse_experiment("inversion", name, description)
   output = None
 
   try:

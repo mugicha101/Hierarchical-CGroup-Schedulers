@@ -11,16 +11,17 @@ import sys
 from . import common, experiment_config
 
 
-def parse_experiment(name, description):
+def parse_experiment(suite, name, description):
+  is_latency = suite == "diagnostics" and name == "latency"
   parser = argparse.ArgumentParser(description=description)
   parser.add_argument("--config", type=Path, default=common.DEFAULT_CONFIG)
   output = parser.add_mutually_exclusive_group()
   output.add_argument("--output-dir", type=Path)
-  if name != "latency":
+  if not is_latency:
     output.add_argument("--analyse-only", type=Path, metavar="CAPTURE_DIR")
   parser.add_argument("--scx-build-path", type=Path, default=common.REPO / "scheds/build",
                       help="debug scheduler build override")
-  if name == "latency":
+  if is_latency:
     parser.add_argument("--cyclictest", type=Path, help="debug binary override")
     parser.add_argument("--mode", choices=("pinned", "migratable"), default=argparse.SUPPRESS)
     parser.add_argument("--policy", choices=("ext", "fifo", "other"), default=argparse.SUPPRESS)
@@ -30,12 +31,12 @@ def parse_experiment(name, description):
   args = parser.parse_args()
   try:
     config = common.load_config(args.config)
-    settings = config["experiments"][name]
+    settings = config["experiments"][suite][name]
     for key in tuple(settings):
       if hasattr(args, key):
         settings[key] = getattr(args, key)
     experiment_config.validate(config["experiments"])
-    if name == "latency" and not float(config["duration_s"]).is_integer():
+    if is_latency and not float(config["duration_s"]).is_integer():
       raise ValueError("cyclictest requires duration_s to be a whole number of seconds")
   except (OSError, ValueError, TypeError, KeyError) as error:
     parser.error(str(error))

@@ -36,7 +36,8 @@ def inspect(config, *, traced=False, basic=False):
   controller_cpus = groups.get("controller", set())
   check("separate workload/controller cpusets", cpus and controller_cpus and not cpus & controller_cpus,
         "effective cpusets must be nonempty and disjoint")
-  check("cyclictest CPU in workload cpuset", config["cyclictest_cpu"] in cpus, config["cyclictest_cpu"])
+  cyclictest_cpu = config["experiments"]["overhead"]["cyclictest_cpu"]
+  check("cyclictest CPU in workload cpuset", cyclictest_cpu in cpus, cyclictest_cpu)
   try:
     online = cpu_set(Path("/sys/devices/system/cpu/online").read_text().strip())
     check("cgroup CPUs online", (cpus | controller_cpus) <= online, sorted(online))

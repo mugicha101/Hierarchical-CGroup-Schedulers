@@ -3,9 +3,28 @@
 Run all commands below from the repository root (`cgs/`).
 
 Experiment entry points live in `tester/experiments/`; shared implementation lives
-in `tester/utils/`. The JLFP and MC² runners delegate worker capture, cgroup
-placement, optional isolation and offline analysis to separate utility modules.
-Wakeup analysis and cyclictest setup follow the same layout. Local unit tests and
+in `tester/utils/`. The directory layout matches the config's experiment groups:
+
+```text
+tester/experiments/
+  config.json                 shared settings and experiment groups
+  debug.json                  complete development configuration
+  run.py                      shared plan/preflight/build/smoke driver
+  smoke.py                    infrastructure checks, no benchmark measurements
+  inversion/
+    run_jlfp_test.py           static JLFP inversions
+    run_jlfp_dynamic_test.py   dynamic JLFP inversions
+    run_mc2_dynamic_test.py    inter/intra-class MC² inversions
+  diagnostics/
+    run_jlfp_wakeup_test.py    wakeup placement and latency
+    run_jlfp_latency_test.py   existing traced cyclictest comparison
+  overhead/
+    plan.py                   upcoming overhead E1–E4; no runnable benchmarks
+```
+
+The JLFP and MC² runners delegate worker capture, cgroup placement and offline
+analysis to separate utility modules. Wakeup analysis and cyclictest setup follow
+the same layout. Local unit tests and
 development checks remain untracked under `tester/codex/`.
 
 Each runner's `capture_run()` shows its configured workload parameters with named
@@ -41,8 +60,8 @@ configured cgroup, configures isolation, loads modules or installs packages.
 Recurring experiment settings belong in this configuration;
 the switches below select development checks and build profiles.
 
-`stress_utilization_percent` targets aggregate busy time only across the workload
-cgroup's effective CPUs (8-15 on the final machine).
+`experiments.overhead.stress_utilization_percent` targets aggregate busy time
+across the workload cgroup's effective CPUs (8-15 on the final machine).
 The shared `/proc/stat` reader excludes idle and iowait from busy time and does
 not count guest time twice. It retains raw counters; stress-ng's per-worker load
 option must not be treated as proof that the aggregate target was achieved.
@@ -121,9 +140,9 @@ Trace analysis uses Python 3, `bt2`, and the Babeltrace2 ftrace plugin. [setup_b
 All entry points read `tester/experiments/config.json`. Set `workload_cgroup` and
 `controller_cgroup` to existing prepared cgroups with disjoint effective cpusets.
 Ordinary JLFP, wakeup and latency runs require a process cgroup leaf. MC² uses
-the workload path as the base of
-its owned class hierarchy and refuses existing `class_a`, `class_b` or `class_c`
-children. The Python controller, scheduler loaders, recorders and build helpers
+the workload path as the base of its owned class hierarchy and refuses existing
+`class_a`, `class_b` or `class_c` children. The Python controller, scheduler
+loaders, recorders and build helpers
 run in the controller cgroup; workload launchers move their processes into the
 workload cgroup. The controller restores its original cgroup and affinity afterward.
 Both configured cgroups and their cpusets are left intact. Per-task affinity
@@ -134,15 +153,16 @@ restrict the pinned A/B workers to their assigned CPUs.
 
 Shared `duration_s` is 60 seconds; `warmup_s` is 1 second for native-worker runs.
 Cyclictest histograms include startup and do not use the native-worker warmup.
-Experiment-specific parameters live under `experiments`:
+Experiment-specific parameters live under three explicit `experiments` groups:
 
 | Section | Settings |
 | --- | --- |
-| `jlfp_static` | Workers per CPU; continuous runnable workers with distinct JLFP weights. |
-| `jlfp_dynamic` | Workers per CPU, period and CPU budget in milliseconds. |
-| `wakeup` | Worker count, period in milliseconds, CPU budget in microseconds. |
-| `mc2.classes` | Each class's utilization percentage, task count per CPU, periods in milliseconds, and release staggering. |
-| `latency` | Pinning mode, policy/priority, thread count, interval, histogram range, timer slack, temporary CPU DMA latency, scheduler attachment and diagnostics. |
+| `inversion.jlfp_static` | Workers per CPU; continuous runnable workers with distinct JLFP weights. |
+| `inversion.jlfp_dynamic` | Workers per CPU, period and CPU budget in milliseconds. |
+| `inversion.mc2.classes` | Each class's utilization percentage, task count per CPU, periods in milliseconds, and release staggering. |
+| `overhead` | Upcoming E1–E4: measurement CPU (`cyclictest_cpu`) and aggregate stress utilization target. Remaining methodology is pending. |
+| `diagnostics.wakeup` | Worker count, period in milliseconds, CPU budget in microseconds. |
+| `diagnostics.latency` | Pinning mode, policy/priority, thread count, interval, histogram range, timer slack, temporary CPU DMA latency, scheduler attachment and diagnostics. |
 
 `tester/experiments/debug.json` is a complete alternate config with 3-second runs,
 0.2-second native-worker warmup and one attempt. Set both its cgroups for the
@@ -151,7 +171,7 @@ or auto-detection.
 
 ```sh
 python3 tester/experiments/run.py --config tester/experiments/debug.json plan
-sudo python3 tester/experiments/run_jlfp_dynamic_test.py --config tester/experiments/debug.json
+sudo python3 tester/experiments/inversion/run_jlfp_dynamic_test.py --config tester/experiments/debug.json
 ```
 
 Durations, cgroup paths and workload parameters come from config rather than
@@ -171,6 +191,18 @@ and SCHED_EXT policy before running. Periodic workers use absolute monotonic
 release times, thread CPU-time budgets and skipped missed releases. Cleanup reaps
 workers before detaching schedulers or finalizing the private trace. Scheduler
 and capture failures retain diagnostic output.
+
+## Upcoming Overhead Experiments
+
+`experiments.overhead` contains the agreed overhead settings. The read-only
+matrix in `tester/experiments/overhead/plan.py` describes E1 (trace-free cyclictest
+latency), E2 (scheduling class operations), E3 (JLFP callback/class operation
+timing), and E4 (operation timing with migratable workers). View it with
+`python3 tester/experiments/run.py plan`.
+
+These benchmarks are not implemented. Remaining methodology and tracing
+prerequisites must be resolved before adding their runners. The existing
+`diagnostics/` scripts retain their current capture behavior and are not E1–E4.
 
 ## Manual Noise Isolation
 
@@ -195,19 +227,15 @@ Repeated `enable` refuses to overwrite an outstanding snapshot. Setup failure ro
 back; incomplete restoration retains the snapshot for another `disable` attempt.
 The utility exits after enabling, so restore explicitly when development tests end.
 
-## JLFP Inversions and Wakeups
+## JLFP Inversions
 
 ```sh
-sudo python3 tester/experiments/run_jlfp_test.py
-sudo python3 tester/experiments/run_jlfp_dynamic_test.py
-sudo python3 tester/experiments/run_jlfp_wakeup_test.py
+sudo python3 tester/experiments/inversion/run_jlfp_test.py
+sudo python3 tester/experiments/inversion/run_jlfp_dynamic_test.py
 ```
 
 Static JLFP defaults to two continuous workers per CPU. Dynamic JLFP defaults to
 two workers per CPU, a 20 ms period and 10 ms CPU budget, with staggered releases.
-Wakeup defaults to one migratable worker, a 1 ms period and 50 us CPU budget.
-Native switch/wakeup events distinguish blocking from preemption. Wakeup analysis
-retains individual samples and reports wake-to-run latency and migration ratios.
 
 Replay a saved capture with the same runner's `--analyse-only CAPTURE_DIR`. Its
 `trace.dat` and `run.json` supply measurement metadata; analysis rewrites the
@@ -217,7 +245,7 @@ supported. JLFP placement diagnostics are excluded from inversion calculations.
 ## MC² Hierarchy and Utilization
 
 ```sh
-sudo python3 tester/experiments/run_mc2_dynamic_test.py
+sudo python3 tester/experiments/inversion/run_mc2_dynamic_test.py
 ```
 
 The fixed hierarchy is root JLFP, pinned JLFP/RM class A (weight 4), pinned GEDF
@@ -258,19 +286,35 @@ time. Missing initialization, applied weights, tracing or premature scheduler
 detach invalidates the capture. Non-root JLFP/GEDF self-weight initialization remains
 an existing scheduler issue that this harness can expose; scheduler logic is unchanged.
 
-## Cyclictest Comparisons
+## Wakeup Diagnostics
+
+```sh
+sudo python3 tester/experiments/diagnostics/run_jlfp_wakeup_test.py
+```
+
+Wakeup defaults to one migratable worker, a 1 ms period and 50 us CPU budget.
+Native switch/wakeup events distinguish blocking from preemption. Wakeup analysis
+retains individual samples and reports wake-to-run latency and migration ratios.
+Use `experiments.diagnostics.wakeup` to configure it and `--analyse-only` to replay
+a saved capture.
+
+## Cyclictest Diagnostics
+
+This existing traced comparison is separate from the upcoming trace-free overhead
+E1 experiment. Its settings live under `experiments.diagnostics.latency`.
 
 The older utility builder uses `cyclictest/rt-tests` and the repository's modified
 source in a private copy. The staged build instead patches pinned upstream source.
 
 ```sh
 python3 tester/utils/build_jlfp_cyclictest.py --output-dir tester/build/cyclictest-affinity
-sudo python3 tester/experiments/run_jlfp_latency_test.py --cyclictest tester/build/cyclictest-affinity/cyclictest
+sudo python3 tester/experiments/diagnostics/run_jlfp_latency_test.py --cyclictest tester/build/cyclictest-affinity/cyclictest
 ```
 
-Set `experiments.latency` in the config for recurring comparisons. Its default is
-one migratable EXT thread, a 1000 us interval, 10000 us histogram range, 1 ns timer
-slack and a temporary 0 us CPU DMA latency request. Set `cpu_dma_latency_us` to -1
+Set `experiments.diagnostics.latency` in the config for recurring comparisons.
+Its default is one migratable EXT thread, a 1000 us interval, 10000 us histogram
+range, 1 ns timer slack and a temporary 0 us CPU DMA latency request. Set
+`cpu_dma_latency_us` to -1
 to omit that request. The request is released after capture. The harness verifies
 actual worker policies, affinities and slack, uses CLOCK_MONOTONIC and saves pooled
 and per-thread histogram summaries. Cyclictest's main thread also stays inside the

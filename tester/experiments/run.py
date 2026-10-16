@@ -8,6 +8,7 @@ import sys
 if not __package__:
   sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from tester.experiments import smoke
+from tester.experiments.overhead.plan import plan as overhead_plan
 from tester.utils import arguments, builds, common, preflight
 
 
@@ -18,13 +19,11 @@ def plan(config):
       "workload_cgroup": config["workload_cgroup"],
       "controller_cgroup": config["controller_cgroup"],
       "utilization_cpus": "workload cgroup effective cpuset",
-      "stress_utilization_percent": config["stress_utilization_percent"],
-      "overhead_e1": ["other", "fifo", "rr", "qmap", "simple", "jlfp"],
-      "overhead_e2": ["other", "fifo", "qmap", "jlfp"],
-      "overhead_e3_e4": ["jlfp"],
-      "deferred_policies": {"deadline": "pending methodology"},
-      "benchmark_implementation": "pending stages 3-6",
-      "legacy_experiments": config["experiments"],
+      "experiments": {
+          "inversion": config["experiments"]["inversion"],
+          "overhead": overhead_plan(config["experiments"]["overhead"]),
+          "diagnostics": config["experiments"]["diagnostics"],
+      },
   }
 
 

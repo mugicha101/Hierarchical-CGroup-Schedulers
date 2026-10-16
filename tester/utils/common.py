@@ -20,8 +20,7 @@ CGROUP_ROOT = Path("/sys/fs/cgroup")
 OUTPUT = REPO / "tester/build/experiments"
 DEFAULT_CONFIG = REPO / "tester/experiments/config.json"
 BPF_CLANG = "clang-22"
-CONFIG_KEYS = {"workload_cgroup", "controller_cgroup", "cyclictest_cpu",
-               "duration_s", "stress_utilization_percent", "max_attempts",
+CONFIG_KEYS = {"workload_cgroup", "controller_cgroup", "duration_s", "max_attempts",
                "process_timeout_s", "build_timeout_s", "warmup_s", "experiments"}
 
 
@@ -42,17 +41,12 @@ def load_config(path=DEFAULT_CONFIG):
   config = json.loads(Path(path).read_text())
   if not isinstance(config, dict) or set(config) != CONFIG_KEYS:
     raise ValueError(f"configuration keys must be {sorted(CONFIG_KEYS)}")
-  if type(config["cyclictest_cpu"]) is not int or config["cyclictest_cpu"] != 9:
-    raise ValueError("E1 requires logical CPU 9")
   for key in ("duration_s", "process_timeout_s", "build_timeout_s"):
     value = config[key]
     if type(value) not in (int, float) or not math.isfinite(value) or value <= 0:
       raise ValueError(f"{key} must be finite and positive")
   experiment_config.number(config, "warmup_s", inclusive=True)
   experiment_config.validate(config["experiments"])
-  value = config["stress_utilization_percent"]
-  if type(value) not in (int, float) or not math.isfinite(value) or not 0 <= value <= 100:
-    raise ValueError("stress_utilization_percent must be between 0 and 100")
   if type(config["max_attempts"]) is not int or not 1 <= config["max_attempts"] <= 10:
     raise ValueError("max_attempts must be between 1 and 10")
   for key in ("workload_cgroup", "controller_cgroup"):

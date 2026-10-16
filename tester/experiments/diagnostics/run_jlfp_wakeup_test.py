@@ -5,7 +5,7 @@ from pathlib import Path
 import sys
 
 if not __package__:
-  sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+  sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 from tester.utils import arguments, common, jlfp_capture, wakeup
 
 
@@ -31,7 +31,7 @@ def capture_run(args, output):
 
 
 def main():
-  args = arguments.parse_experiment("wakeup", __doc__)
+  args = arguments.parse_experiment("diagnostics", "wakeup", __doc__)
   output = None
 
   try:
