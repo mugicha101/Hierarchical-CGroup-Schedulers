@@ -108,10 +108,12 @@ static inline int base_parse_opt(struct base_cli_opts *opts, int opt, const char
 #define base_report_tracing(opts, skel) \
   base_report_tracing_impl((opts), \
     (skel)->rodata->scxtp_lowfreq_compiled, \
-    (skel)->rodata->scxtp_hotpath_compiled)
+    (skel)->rodata->scxtp_hotpath_compiled, \
+    (skel)->rodata->scxtp_op_compiled)
 
 static inline void base_report_tracing_impl(const struct base_cli_opts *opts,
-                                          bool lowfreq_compiled, bool hotpath_compiled) {
+                                          bool lowfreq_compiled, bool hotpath_compiled,
+                                          bool op_compiled) {
   if (!opts->trace) {
     fprintf(stdout, "Tracing Disabled\n");
     return;
@@ -119,14 +121,15 @@ static inline void base_report_tracing_impl(const struct base_cli_opts *opts,
 
   bool module_loaded = access("/sys/module/scxtp", F_OK) == 0;
 
-  if (module_loaded && lowfreq_compiled) {
-    fprintf(stdout, "Tracing Enabled: %s events\n", hotpath_compiled ? "all" : "non-hotpath");
+  if (module_loaded && (lowfreq_compiled || hotpath_compiled || op_compiled)) {
+    fprintf(stdout, "Tracing Enabled: lowfreq=%d hotpath=%d ops=%d\n",
+            lowfreq_compiled, hotpath_compiled, op_compiled);
   } else {
     fprintf(stdout, "Tracing Disabled: -t/--trace specified but scxtp kernel module not loaded or compiled without tracing\n");
   }
 
-  fprintf(stdout, "Tracing Compilation Flags: SCXTP_TRACING=%d, SCXTP_HOTPATH_TRACING=%d\n",
-          lowfreq_compiled, hotpath_compiled);
+  fprintf(stdout, "Tracing Compiled Events: lowfreq=%d hotpath=%d ops=%d\n",
+          lowfreq_compiled, hotpath_compiled, op_compiled);
 
   fprintf(stdout, "Tracing Loadtime Flags: -t/--trace=%d, scxtp kernel module loaded=%d\n",
           opts->trace, module_loaded);

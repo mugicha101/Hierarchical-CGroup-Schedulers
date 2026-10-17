@@ -156,6 +156,22 @@ SCXTP_DEFINE_EVENT(stopping, SCXTP_FIELDS_stopping,
   __entry->runnable
 );
 
+#define SCXTP_FIELDS_op_entry(FIELD, ARRAY, STRING) \
+  FIELD(__u32, op)
+
+SCXTP_DEFINE_EVENT(op_entry, SCXTP_FIELDS_op_entry,
+  "op=%u",
+  __entry->op
+);
+
+#define SCXTP_FIELDS_op_exit(FIELD, ARRAY, STRING) \
+  SCXTP_FIELDS_op_entry(FIELD, ARRAY, STRING)
+
+SCXTP_DEFINE_EVENT(op_exit, SCXTP_FIELDS_op_exit,
+  "op=%u",
+  __entry->op
+);
+
 #endif
 
 // define_trace.h rereads the event definitions outside the include guard
