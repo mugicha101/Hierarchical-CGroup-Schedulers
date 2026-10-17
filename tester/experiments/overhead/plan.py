@@ -7,13 +7,15 @@ def plan(settings):
       "settings": settings,
       "e1": {
           "measurement": "end-to-end cyclictest scheduling latency",
-          "schedulers": ["other", "fifo", "rr", "qmap", "simple", "jlfp"],
+          "schedulers": ["other", "fifo", "rr", "deadline", "qmap", "simple", "jlfp"],
+          "deadline": "cases enabled only when their explicit reservations are configured",
           "status": "implemented; full live matrix validation pending",
           "load_conditions": ["no stress-ng", f"{settings['stress_utilization_percent']}% system utilization"],
       },
       "e2": {
           "measurement": "scheduling class operation latency",
           "schedulers": ["other", "fifo", "qmap", "jlfp"],
+          "status": "deferred: required class-operation tracepoints are not installed",
       },
       "e3": {
           "measurement": "JLFP callback versus class operation latency",
@@ -23,5 +25,5 @@ def plan(settings):
           "measurement": "JLFP operation latency with migratable workers",
           "schedulers": ["jlfp"],
       },
-      "deferred_policies": {"deadline": "pending methodology"},
+      "deadline_placement": "temporary single-CPU partitions below the existing workload cgroup",
   }

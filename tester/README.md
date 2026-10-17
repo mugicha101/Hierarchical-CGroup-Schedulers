@@ -68,7 +68,8 @@ The shared `/proc/stat` reader excludes idle and iowait from busy time and does
 not count guest time twice. It retains raw counters; stress-ng's per-worker load
 option must not be treated as proof that the aggregate target was achieved.
 Final duration defaults to 60 seconds; other durations are marked development.
-DEADLINE cases are explicitly deferred. E2's EXT variants are qmap/JLFP.
+E1 DEADLINE cases require explicit reservations and temporary CPU partitions
+(described below). E2's EXT variants are qmap/JLFP; E2 awaits kernel tracepoints.
 
 Each command's artifacts go to a new `tester/build/experiments/` directory.
 Build attempts retain commands, logs, source/binary hashes and failures, with a
@@ -122,14 +123,14 @@ the output as a setup check, and never produces benchmark results. All final-run
 prerequisites remain mandatory for normal checks. Earlier qmap checks built with
 Clang 21 failed in `qmap_dequeue` (`R7 invalid mem access 'scalar'`); Clang 22 fixes
 the arena-memory-intrinsic cast bug. Qmap also requires working BPF timers on
-PREEMPT_RT; the current development kernel rejects them. Experiment runs never
-install dependencies or prepare cgroups.
+PREEMPT_RT. Treat the separately installed timer patches as an external
+prerequisite. Experiments never install dependencies or create the two configured
+cgroups; E1 DEADLINE temporarily manages child CPU partitions as described below.
 
 The new cyclictest build uses upstream revision
-`62da2befac98f811af8e56f2b7992fb09faa33d6` in a private checkout with only EXT
-policy support, correct EXT worker policy selection, the inherited-affinity fix,
-and an optional E1 worker startup gate. Its patch is
-saved with the build. It does not replace `cyclictest/rt-tests` or build/use
+`62da2befac98f811af8e56f2b7992fb09faa33d6` in a private checkout with EXT and
+explicit-reservation DEADLINE support, the inherited-affinity fix, and an optional
+E1 worker startup gate. Its readable patch and hash are saved with the build. It does not replace `cyclictest/rt-tests` or build/use
 cyclicdeadline. Preflight returns status 2 and preserves a JSON report when
 prerequisites are missing; `preflight --traced` additionally checks trace tools.
 The harnesses below use the same configuration file for placement and timing.
@@ -210,7 +211,53 @@ the workload cgroup's effective CPUs. No additional utilization levels are run.
 The no-stress condition does not assert zero system utilization. Config controls
 the target through `experiments.overhead.stress_utilization_percent`.
 Final cases last 60 seconds; the debug profile uses 3 seconds. `--scheduler` and
-`--stress off|on` select partial reruns. DEADLINE remains deferred.
+`--stress off|on` select partial reruns. DEADLINE adds up to two cases once its
+reservation fields are configured; unset cases are explicitly reported as pending.
+
+The private cyclictest build supports `--policy=deadline` (or `dl`) with three
+required per-worker options: `--dl-runtime=NS`, `--dl-deadline=NS`, and
+`--dl-period=NS`. Values are integer nanoseconds, with
+`1024 <= runtime <= deadline <= period <= INT64_MAX`. Use priority zero;
+priority spreading is rejected. The patch uses current `sched_setattr` and
+`sched_getattr`, rather than the experimental syscall in the
+[original DEADLINE cyclictest PR](https://github.com/jlelli/rt-tests/pull/1).
+It verifies every worker's installed reservation before sampling and retains
+cyclictest's timer/histogram behavior. The reviewable patch is
+`tester/patches/cyclictest.patch`, applied only to fresh pinned private builds;
+it also contains the existing EXT, startup-gate and NUMA affinity changes.
+
+Configure E1 reservations under `experiments.overhead.e1.policies.deadline`:
+`cyclictest` and `stress` each contain `runtime_ns`, `deadline_ns`, and `period_ns`.
+Both triples are deliberately `null` until the experiment parameters are supplied.
+Filling cyclictest's triple enables the unstressed case; filling both enables
+both. `--scheduler deadline --stress off` requests just the unstressed case and
+fails clearly if its reservation is unset. The stress reservation applies to each
+CPU worker. Cyclictest's relative deadline must be shorter than stress-ng's;
+this expresses relative urgency, not a strict fixed-priority guarantee.
+
+For DEADLINE only, E1 creates temporary single-CPU partitions below the configured
+workload cgroup: CPU 9 for an unstressed case, or every workload CPU for a stressed
+case. This is required by
+[DEADLINE's root-domain affinity rule](https://docs.kernel.org/scheduler/sched-deadline.html).
+The existing workload cgroup must be empty and have no children. It must already
+be a valid partition root, or be directly below one; ancestors are not changed.
+When needed, the runner temporarily makes it a partition root and enables its
+cpuset controller. Existing `root`/`isolated` partition behavior is preserved.
+Cyclictest's entire process occupies the CPU-9 child. Each stress-ng process group
+occupies its CPU's child. Stress supervisors remain OTHER so they can fork;
+CPU workers select DEADLINE themselves. The runner verifies actual policy,
+reservation and placement, using libc `sched_getattr` (glibc 2.41 or newer).
+
+All partition validity checks remain active during measurement. Cleanup stops
+owned processes before removing children and restoring parent controls; a populated
+child or restoration failure stops retries and keeps the failure artifacts.
+Utilization still covers the **original** workload CPU set, including CPU 9.
+The kernel's reservation admission limit also applies: all stress-worker
+reservations plus cyclictest's reservation must fit on CPU 9. A 95% offered-load
+target is not a 95% reservation budget. The runner never disables admission
+control or changes system bandwidth settings. Admission failures invalidate the
+attempt. Real DEADLINE admission, achieved load and partition restoration still
+need validation on the prepared target after the reservation values are supplied.
 
 Each invocation builds fresh cyclictest and the selected EXT schedulers, using
 trace profile `off`. EXT attaches at root with partial switching; native cases
@@ -220,7 +267,8 @@ or function tracers; it does not change them. Kernel BPF timer support and host
 preparation remain external prerequisites. E1 never installs kernel patches.
 
 One cyclictest measurement thread is pinned to CPU 9. Its main thread stays
-within the workload cgroup's effective cpuset. A private cyclictest startup gate
+within the workload cgroup's effective cpuset (the CPU-9 partition for DEADLINE).
+A private cyclictest startup gate
 lets the controller verify the measurement TID's policy, priority, nice, affinity
 and timer slack, and set/read back its JLFP task weight before the first sample.
 The gate is inactive for ordinary cyclictest users. It discards no samples.
@@ -234,8 +282,9 @@ from cyclictest gate release through observed process exit, including shutdown.
 Raw counters and monotonic timestamps are saved. Trials outside the configured
 2 percentage point utilization tolerance fail and retain their artifacts for
 bounded retries. The runner does not silently equate `--cpu-load` with achieved
-system utilization. All stress-ng supervisors, workers and threads are checked
-for the requested policy, priority, nice, affinity and cgroup.
+system utilization. Stress-ng supervisors, workers and threads are checked
+for the expected policy, priority, nice, affinity and cgroup; the DEADLINE
+supervisor/worker distinction is described above.
 
 Initial priority settings are explicit in `overhead.e1.policies`: FIFO/RR use
 50 for cyclictest and 10 for stress-ng; OTHER/qmap/simple use nice 0 versus 19;
@@ -401,3 +450,7 @@ runs record native scheduler/timer/IRQ/workqueue events and timestamped spikes i
 `cyclictest.log`; timestamps use CLOCK_MONOTONIC microseconds, while trace events
 use nanoseconds. These legacy latency runs always record an exit event and are
 separate from the pending trace-free E1 implementation.
+
+E2 remains unimplemented until the required scheduling-class operation entry/exit
+tracepoints are added to the kernel. Function-graph tracing is not substituted
+for those tracepoints. E3/E4 are also pending their instrumentation requirements.

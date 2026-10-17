@@ -9,7 +9,7 @@ import sys
 
 from .common import cgroup_cpus, workload_cgroup
 
-POLICIES = {"other": os.SCHED_OTHER, "fifo": os.SCHED_FIFO, "rr": os.SCHED_RR, "ext": 7}
+POLICIES = {"other": os.SCHED_OTHER, "fifo": os.SCHED_FIFO, "rr": os.SCHED_RR, "ext": 7, "deadline": 6}
 
 
 def set_weight(weight, *, tid=None):
@@ -51,6 +51,8 @@ def main(request, ready_fd, gate_fd):
   if not cpus or not cpus <= cgroup_cpus(cgroup):
     raise ValueError("workload CPUs must be within the test cpuset")
   policy = settings["policy"]
+  if policy == "deadline":
+    raise ValueError("DEADLINE workloads must install explicit reservations after exec")
   if policy not in POLICIES:
     raise ValueError(f"unsupported workload policy: {policy}")
   priority, nice, weight = settings["priority"], settings["nice"], settings["weight"]

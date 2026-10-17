@@ -75,7 +75,7 @@ def parse_driver(description):
   parser = argparse.ArgumentParser(description=description)
   parser.add_argument("--config", type=Path, default=common.DEFAULT_CONFIG)
   commands = parser.add_subparsers(dest="command", required=True)
-  commands.add_parser("plan", help="show the non-DEADLINE case matrix without running anything")
+  commands.add_parser("plan", help="show experiment availability without running anything")
   check = commands.add_parser("preflight", help="read and record live-run prerequisites")
   check.add_argument("--traced", action="store_true")
   build = commands.add_parser("build", help="build isolated artifacts without attaching schedulers")
@@ -92,8 +92,8 @@ def parse_driver(description):
 
 
 def add_e1_options(parser):
-  parser.add_argument("--scheduler", choices=("other", "fifo", "rr", "qmap", "simple", "jlfp"),
-                      help="rerun one scheduler; default: all six")
+  parser.add_argument("--scheduler", choices=("other", "fifo", "rr", "deadline", "qmap", "simple", "jlfp"),
+                      help="rerun one scheduler; default: all configured policies")
   parser.add_argument("--stress", choices=("off", "on"), help="rerun one load condition; default: both")
   parser.add_argument("--analyse-only", type=Path, metavar="SUITE_DIR")
 

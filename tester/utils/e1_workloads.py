@@ -1,12 +1,14 @@
 """Prepare and verify E1 cyclictest threads and stress-ng process groups."""
 
+from contextlib import ExitStack
 import errno
 import os
 from pathlib import Path
 import time
 
+from . import deadline as deadline_support
 from . import common, cyclictest, e1_config, lifecycle
-from .launch import POLICIES, set_weight
+from .launch import set_weight
 
 
 def cyclic_command(binary, directory, config, scheduler):
@@ -26,11 +28,13 @@ def cyclic_command(binary, directory, config, scheduler):
       policy=primary["policy"],
       priority=primary["priority"],
   )
+  if scheduler == "deadline":
+    command.extend(deadline_support.options(settings["policies"]["deadline"]["cyclictest"], cyclictest=True))
   return ["/usr/bin/env", f"CGS_E1_READY={directory / 'cyclictest.ready'}",
           f"CGS_E1_GATE={directory / 'cyclictest.gate'}", *command]
 
 
-def wait_cyclic(session, job, directory, cpu, primary, timer_slack_ns):
+def wait_cyclic(session, job, directory, cpu, primary, timer_slack_ns, *, reservation=None):
   deadline = time.monotonic() + session.timeout
   ready = directory / "cyclictest.ready"
   while time.monotonic() < deadline:
@@ -52,9 +56,11 @@ def wait_cyclic(session, job, directory, cpu, primary, timer_slack_ns):
         time.sleep(.01)
         continue
       slack = int((Path("/proc") / str(tid) / "timerslack_ns").read_text())
-      expected = 0 if primary["policy"] in ("fifo", "rr") else timer_slack_ns
+      expected = 0 if primary["policy"] in ("fifo", "rr", "deadline") else timer_slack_ns
       if slack != expected:
         raise RuntimeError(f"cyclictest timer slack differs: expected {expected}, got {slack}")
+      if reservation is not None:
+        common.write_json(directory / "cyclictest-reservation.json", deadline_support.verify_reservation(tid, reservation))
       common.write_json(directory / "cyclictest-threads.json", {**state, "measurement_tid": tid,
                         "timer_slack_ns": slack, "task_weight": primary["weight"]})
       return tid
@@ -91,30 +97,52 @@ def open_gate(session, directory):
 
 
 class Stress:
-  def __init__(self, session, directory, config, scheduler, binary):
+  def __init__(self, session, directory, config, scheduler, binary, *, partitions=None):
     self.session, self.directory = session, directory
     self.settings = config["experiments"]["overhead"]["e1"]["stress"]
     self.target = config["experiments"]["overhead"]["stress_utilization_percent"]
     self.policy = e1_config.policy(config["experiments"]["overhead"]["e1"], scheduler, "stress")
+    self.partitions = partitions
+    self.resources = ExitStack()
+    self.reservation = (config["experiments"]["overhead"]["e1"]["policies"]["deadline"]["stress"]
+                        if scheduler == "deadline" else None)
     self.jobs = []
     self.weighted = set()
     self.members = None
     count = self.settings["workers_per_cpu"]
     load = max(1, round(self.target / count))
     timeout = int(config["duration_s"] + config["warmup_s"] + 4 * session.timeout + 1)
-    for cpu in sorted(common.cgroup_cpus(session.cgroup)):
-      command = [binary, "--cpu", str(count), f"--cpu-load={load}",
-                 f"--cpu-method={self.settings['cpu_method']}",
-                 f"--cpu-load-slice={self.settings['busy_slice_ms']}",
-                 f"--taskset={cpu}", f"--timeout={timeout}s", "--metrics-brief",
-                 f"--sched={self.policy['policy']}"]
-      if self.policy["policy"] in ("fifo", "rr"):
-        command.append(f"--sched-prio={self.policy['priority']}")
-      job = session.start_workload(command, {cpu}, **self.policy)
-      self.jobs.append((job, cpu))
-      job.release()
+    try:
+      cpus = partitions.cpus if partitions is not None else common.cgroup_cpus(session.cgroup)
+      for cpu in sorted(cpus):
+        command = [binary, "--cpu", str(count), f"--cpu-load={load}",
+                   f"--cpu-method={self.settings['cpu_method']}",
+                   f"--cpu-load-slice={self.settings['busy_slice_ms']}",
+                   f"--taskset={cpu}", f"--timeout={timeout}s", "--metrics-brief",
+                   f"--sched={self.policy['policy']}"]
+        if self.policy["policy"] in ("fifo", "rr"):
+          command.append(f"--sched-prio={self.policy['priority']}")
+        owner = session
+        launch_policy = self.policy
+        if self.reservation is not None:
+          command.extend(deadline_support.options(self.reservation, cyclictest=False))
+          child = directory / f"stress-cpu{cpu}"
+          child.mkdir()
+          owner = self.resources.enter_context(lifecycle.Session(partitions.config_for(cpu), child))
+          launch_policy = {"policy": "other", "priority": 0, "nice": 0}
+        job = owner.start_workload(command, {cpu}, **launch_policy)
+        self.jobs.append((job, cpu))
+        job.release()
+    except BaseException:
+      self.close()
+      raise
+
+  def close(self):
+    self.resources.close()
 
   def check(self, *, starting=False):
+    if self.partitions is not None:
+      self.partitions.check()
     groups = group_members({job.process.pid for job, _ in self.jobs})
     snapshots = []
     ready = True
@@ -126,15 +154,27 @@ class Stress:
         try:
           state = lifecycle.process_state(pid)
           name = (Path("/proc") / str(pid) / "comm").read_text().strip()
-          if name.startswith("stress-ng-cpu"):
+          is_worker = name.startswith("stress-ng-cpu")
+          expected = self.policy
+          reservation = None
+          if self.reservation is not None:
+            if is_worker:
+              if starting and any(task["policy"] != 6 for task in state["tasks"].values()):
+                continue
+              reservation = {tid: deadline_support.verify_reservation(tid, self.reservation)
+                             for tid in state["tasks"]}
+            else:
+              expected = {"policy": "other", "priority": 0, "nice": 0}
+          if is_worker:
             workers += 1
           if self.policy["weight"] is not None:
             for tid in state["tasks"]:
               if tid not in self.weighted:
                 set_weight(self.policy["weight"], tid=tid)
                 self.weighted.add(tid)
-          lifecycle.verify_state(state, {**self.policy, "cpus": [cpu]}, self.session.cgroup)
-          snapshots.append({**state, "comm": name, "task_weight": self.policy["weight"]})
+          lifecycle.verify_state(state, {**expected, "cpus": [cpu]}, job.session.cgroup)
+          snapshots.append({**state, "comm": name, "task_weight": self.policy["weight"],
+                            "reservation": reservation})
         except (FileNotFoundError, ProcessLookupError):
           continue
       if workers != self.settings["workers_per_cpu"]:

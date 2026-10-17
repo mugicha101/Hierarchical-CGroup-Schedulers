@@ -61,6 +61,9 @@ def prepare_builds(config, cases, directory):
   for target in targets:
     root = builds.build(config, target, trace="off")
     manifests[target] = builds.result(root)
+  needs_deadline = any(case["scheduler"] == "deadline" for case in cases)
+  if needs_deadline and not manifests["cyclictest"].get("deadline_support"):
+    raise ValueError("DEADLINE requires cyclictest built with explicit reservation support")
   if not manifests["cyclictest"].get("e1_startup_gate"):
     raise ValueError("E1 requires cyclictest built with its worker readiness gate")
   common.write_json(directory / "builds.json", manifests)
@@ -72,6 +75,9 @@ def run(config, *, scheduler=None, stress=None, analyse_only=None):
     rows = analyse(analyse_only)
     print_report(rows)
     return Path(analyse_only)
+  settings = config["experiments"]["overhead"]["e1"]
+  if scheduler == "deadline" and not e1_config.deadline_ready(settings, stressed=stress != "off"):
+    raise ValueError("set the DEADLINE cyclictest and, for stressed cases, stress reservations in config")
   if os.geteuid() != 0:
     raise PermissionError("root is required for E1 policy, scheduler and cgroup placement")
   if not float(config["duration_s"]).is_integer():
@@ -87,7 +93,12 @@ def run(config, *, scheduler=None, stress=None, analyse_only=None):
               (stress is None or case["stress"] == (stress == "on"))]
   if not cases:
     raise ValueError("no E1 cases selected")
-  suite = {"status": "running", "command": sys.argv, "planned_cases": cases, "cases": []}
+  pending = [load for load in ("off", "on")
+             if not e1_config.deadline_ready(settings, stressed=load == "on")]
+  if pending and scheduler is None:
+    print(f"DEADLINE stress {'/'.join(pending)} omitted: reservation fields are unset", flush=True)
+  suite = {"deadline_pending_loads": pending, "status": "running", "command": sys.argv,
+           "planned_cases": cases, "cases": []}
   common.write_json(directory / "suite.json", suite)
   try:
     with common.controller_placement(config):

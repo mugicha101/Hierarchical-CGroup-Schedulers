@@ -12,7 +12,6 @@ import signal
 import subprocess
 import sys
 
-from .build_jlfp_cyclictest import guard_header
 from .common import (BPF_CLANG, REPO, CleanupError, controller_placement, new_run,
                      repository_state, run_attempts, sha256, write_json)
 
@@ -51,63 +50,13 @@ def patch_once(text, before, after):
 
 
 def patch_cyclictest(checkout):
-  patches = []
-  source = checkout / "src/cyclictest/cyclictest.c"
-  original = source.read_text()
-  modified = patch_once(original, "static char *policyname(int policy);",
-      "#ifndef SCHED_EXT\n#define SCHED_EXT 7\n#endif\n\nstatic char *policyname(int policy);")
-  context = '\telse if (strncasecmp(polname, "rr", 2) == 0)\n\t\tpolicy = SCHED_RR;\n'
-  modified = patch_once(modified, context, context +
-      '\telse if (strncasecmp(polname, "ext", 3) == 0)\n\t\tpolicy = SCHED_EXT;\n')
-  modified = patch_once(modified, "\tcase SCHED_BATCH:\n",
-      '\tcase SCHED_EXT:\n\t\tpolicystr = "ext";\n\t\tbreak;\n\tcase SCHED_BATCH:\n')
-  modified = patch_once(modified, "of: other, normal, batch, idle, fifo or rr.",
-                        "of: other, normal, batch, idle, fifo, rr or ext.")
-  modified = patch_once(modified,
-      "\t\tif (priority && (policy == SCHED_FIFO || policy == SCHED_RR))\n"
-      "\t\t\tpar->policy = policy;",
-      "\t\tif ((priority && (policy == SCHED_FIFO || policy == SCHED_RR)) ||\n"
-      "\t\t    policy == SCHED_EXT)\n"
-      "\t\t\tpar->policy = policy;")
-  gate = r'''
-static void e1_wait_for_start(void)
-{
-	const char *ready = getenv("CGS_E1_READY");
-	const char *gate = getenv("CGS_E1_GATE");
-	char buffer[32], go;
-	int fd, length;
-
-	if (!ready && !gate)
-		return;
-	if (!ready || !gate)
-		fatal("incomplete E1 startup gate\n");
-	fd = open(ready, O_WRONLY | O_CREAT | O_EXCL, 0600);
-	if (fd < 0)
-		fatal("cannot publish E1 worker readiness\n");
-	length = snprintf(buffer, sizeof(buffer), "%d\n", gettid());
-	if (write(fd, buffer, length) != length)
-		fatal("cannot write E1 worker readiness\n");
-	close(fd);
-	fd = open(gate, O_RDONLY);
-	if (fd < 0 || read(fd, &go, 1) != 1 || go != 'g')
-		fatal("E1 controller closed the startup gate\n");
-	close(fd);
-}
-
-'''
-  modified = patch_once(modified, "static void *timerthread(void *param)\n", gate +
-                        "static void *timerthread(void *param)\n")
-  modified = patch_once(modified, "\t/* Get current time */\n",
-                        "\te1_wait_for_start();\n\n\t/* Get current time */\n")
-  header = checkout / "src/cyclictest/rt_numa.h"
-  for path, before, after in ((source, original, modified),
-                              (header, header.read_text(), guard_header(header.read_text()))):
-    name = str(path.relative_to(checkout))
-    patches.extend(difflib.unified_diff(before.splitlines(keepends=True),
-                                       after.splitlines(keepends=True),
-                                       fromfile="a/" + name, tofile="b/" + name))
-    path.write_text(after)
-  return "".join(patches)
+  patch = REPO / "tester/patches/cyclictest.patch"
+  for options in (("--check",), ()):
+    result = subprocess.run(["git", "apply", *options, str(patch)], cwd=checkout,
+                            capture_output=True, text=True, timeout=10)
+    if result.returncode:
+      raise ValueError(f"cyclictest patch failed: {result.stderr.strip()}")
+  return patch.read_text()
 
 
 def simple_loader(source):
@@ -260,6 +209,9 @@ def build(config, target, trace="off"):
       binary = checkout / "cyclictest"
       metadata["patched_source_sha256"] = sha256(checkout / "src/cyclictest/cyclictest.c")
       metadata["e1_startup_gate"] = True
+      metadata["deadline_support"] = {"parameters": "explicit nanoseconds per worker",
+                                      "reservation_readback": True}
+      metadata["patch_sha256"] = sha256(REPO / "tester/patches/cyclictest.patch")
     metadata.update(binary=str(binary), binary_sha256=sha256(binary))
     write_json(directory / "build.json", metadata)
     return metadata

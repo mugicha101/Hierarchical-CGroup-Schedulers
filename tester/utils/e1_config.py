@@ -2,7 +2,9 @@
 
 import ctypes
 
-SCHEDULERS = ("other", "fifo", "rr", "qmap", "simple", "jlfp")
+from . import deadline
+
+SCHEDULERS = ("other", "fifo", "rr", "deadline", "qmap", "simple", "jlfp")
 
 
 def validate(settings):
@@ -38,6 +40,14 @@ def validate(settings):
       background = number(group, "stress_priority", integer=True)
       if not background < primary <= 99:
         raise ValueError(f"E1 {scheduler} requires 1 <= stress priority < cyclictest priority <= 99")
+    elif scheduler == "deadline":
+      require_keys(group, {"cyclictest", "stress"}, "E1 DEADLINE")
+      for reservation in group.values():
+        deadline.validate_reservation(reservation, allow_unset=True)
+      primary, background = group["cyclictest"], group["stress"]
+      if primary["deadline_ns"] is not None and background["deadline_ns"] is not None and \
+          primary["deadline_ns"] >= background["deadline_ns"]:
+        raise ValueError("DEADLINE cyclictest relative deadline must be shorter than stress-ng's")
     elif scheduler == "jlfp":
       require_keys(group, {"cyclictest_weight", "stress_weight", "slice_ns", "max_shard_size"}, "E1 JLFP")
       primary = number(group, "cyclictest_weight", integer=True)
@@ -60,7 +70,7 @@ def validate(settings):
 
 def policy(settings, scheduler, role):
   group = settings["policies"][scheduler]
-  return {"policy": scheduler if scheduler in ("other", "fifo", "rr") else "ext",
+  return {"policy": scheduler if scheduler in ("other", "fifo", "rr", "deadline") else "ext",
           "priority": group.get(f"{role}_priority", 0),
           "nice": group.get(f"{role}_nice", 0), "weight": group.get(f"{role}_weight")}
 
@@ -75,6 +85,13 @@ def cases(config):
   for repetition in range(1, settings["e1"]["repetitions"] + 1):
     for scheduler in SCHEDULERS:
       for stressed in (False, True):
+        if scheduler == "deadline" and not deadline_ready(settings["e1"], stressed=stressed):
+          continue
         yield {"scheduler": scheduler, "stress": stressed,
                "target_utilization_percent": target if stressed else None,
                "repetition": repetition}
+
+
+def deadline_ready(settings, *, stressed):
+  roles = ("cyclictest", "stress") if stressed else ("cyclictest",)
+  return all(settings["policies"]["deadline"][role]["runtime_ns"] is not None for role in roles)

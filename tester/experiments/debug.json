@@ -83,6 +83,18 @@
             "stress_weight": 1,
             "slice_ns": 1000000,
             "max_shard_size": 4
+          },
+          "deadline": {
+            "cyclictest": {
+              "runtime_ns": null,
+              "deadline_ns": null,
+              "period_ns": null
+            },
+            "stress": {
+              "runtime_ns": null,
+              "deadline_ns": null,
+              "period_ns": null
+            }
           }
         }
       }
