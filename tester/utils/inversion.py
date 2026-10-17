@@ -27,8 +27,8 @@ def trace_events(trace, *, check_interrupt=None):
     for message in parser.messages:
       if check_interrupt is not None:
         check_interrupt()
-      if isinstance(message, bt2._DiscardedEventsMessageConst):
-        raise RuntimeError("Capture lost events; inversion results would be incomplete")
+      if isinstance(message, (bt2._DiscardedEventsMessageConst, bt2._DiscardedPacketsMessageConst)):
+        raise RuntimeError("Capture lost events or packets; inversion results would be incomplete")
       if isinstance(message, bt2._EventMessageConst):
         yield from parse_trace((message,), event_types=ANALYSIS_EVENTS)
 

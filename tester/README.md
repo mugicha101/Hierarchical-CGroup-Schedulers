@@ -130,9 +130,14 @@ cgroups; E1 DEADLINE temporarily manages child CPU partitions as described below
 The new cyclictest build uses upstream revision
 `62da2befac98f811af8e56f2b7992fb09faa33d6` in a private checkout with EXT and
 explicit-reservation DEADLINE support, the inherited-affinity fix, and an optional
-E1 worker startup gate. Its readable patch and hash are saved with the build. It does not replace `cyclictest/rt-tests` or build/use
-cyclicdeadline. Preflight returns status 2 and preserves a JSON report when
-prerequisites are missing; `preflight --traced` additionally checks trace tools.
+E1 worker startup gate. Its readable patch and hash are saved with the build.
+It does not replace `cyclictest/rt-tests` or build/use cyclicdeadline.
+Both cyclictest builders pass `DEBUG=` explicitly to select
+upstream's release build (`-O2 -g`), even when the environment exports a nonempty
+`DEBUG` value. Build metadata records this choice; rebuild older development
+binaries before making comparisons. Preflight returns status 2 and preserves a
+JSON report when prerequisites are missing; `preflight --traced` additionally
+checks trace tools.
 The harnesses below use the same configuration file for placement and timing.
 
 Follow the [scheduler build instructions](../scheds/README.md#setup). Inversion tests also require the [tracing module](../scheds/README.md#structured-scheduler-tracepoints). Live captures require sudo for BPF, ftrace, and cgroup setup.
@@ -293,6 +298,9 @@ four-CPU shards. Simple retains its existing weighted-vtime mode and built-in
 `SCX_SLICE_DFL` slice; it has no runtime slice option. Qmap/simple weight service
 is approximate and does not become strict fixed-priority scheduling. Scheduler
 algorithms are unchanged. Qmap's normal timers remain part of its execution.
+Single-CPU affinity selects JLFP's non-migratable task path for both cyclictest
+and these stress workers. This workload does not measure its migratable-task
+selection path; the later E4 workload must address that separately.
 
 Measurement defaults are a 1 ms interval, integer microsecond histogram samples
 with a 10 ms histogram range, 1 ns timer slack, and a temporary 0 us CPU DMA
@@ -311,6 +319,10 @@ use interpolation at `(n-1)*p`; `sample` standard deviation uses `n-1`.
 Overflowed or inconsistent histograms, short runs, incorrect placement/policy,
 unexpected process exits or incomplete cleanup invalidate the attempt. Offline
 suite replay requires successful capture/cleanup records and unchanged raw hashes.
+Completed cases must match the planned matrix in order and identity, with distinct
+case directories. Failed attempts remain available even when a retry succeeds.
+Review those attempts before comparing latency tails: retrying after histogram
+overflow or a utilization miss can favour the trials that pass those checks.
 
 For histogram-only inspection:
 

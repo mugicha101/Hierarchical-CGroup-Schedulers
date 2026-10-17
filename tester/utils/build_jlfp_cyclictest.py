@@ -63,7 +63,8 @@ def prepare_copy(source, output):
               "cyclictest_source": str(MODIFIED_SOURCE),
               "cyclictest_source_sha256": sha256(MODIFIED_SOURCE),
               "change": "apply repository SCHED_EXT cyclictest; skip NUMA CPU rebinding when cpu == -1",
-              "command": ["make", "-j2", "cyclictest"],
+              "command": ["make", "-j2", "DEBUG=", "cyclictest"],
+              "build_mode": "upstream release (DEBUG=, -O2 -g)",
               "output_binary": str(output / "cyclictest")}
   def ignore(directory, names):
     return set(names) & {".git", "bld", "cyclictest"} if Path(directory) == source else set()

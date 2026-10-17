@@ -24,33 +24,39 @@ def save_results(directory, rows):
 def analyse(directory):
   directory = Path(directory).resolve(strict=True)
   suite = common.read_json(directory / "suite.json")
-  rows = []
-  for item in suite["cases"]:
-    root = directory / item["directory"]
-    if not root.resolve(strict=True).is_relative_to(directory):
-      raise ValueError("E1 case directory escapes the suite")
-    attempts = sorted(root.glob("attempt-*/status.json"))
-    successful = [path for path in attempts if common.read_json(path)["status"] == "succeeded"]
-    if len(successful) != 1:
-      raise ValueError(f"expected exactly one successful E1 attempt: {root}")
-    attempt = successful[0].parent
-    status = common.read_json(successful[0])
-    capture = common.read_json(attempt / "capture.json")
-    if not status["measurement"] or not capture["measurement"] or status["cleanup"] != "complete":
-      raise ValueError(f"E1 attempt is not a validated measurement: {attempt}")
-    raw_path = attempt / "cyclictest.json"
-    if capture["case"] != item["case"] or common.sha256(raw_path) != capture["cyclictest_sha256"]:
-      raise ValueError(f"E1 case metadata or raw histogram changed: {attempt}")
-    statistics = e1_results.summarize(common.read_json(raw_path),
-                                    **e1_config.statistics(capture["settings"]))
-    rows.append({**capture["case"], **statistics,
-                 "achieved_utilization_percent": capture["utilization"]["busy_percent"],
-                 "raw_sha256": common.sha256(raw_path),
-                 "directory": str(attempt.relative_to(directory))})
-  if suite["status"] != "succeeded" or len(rows) != len(suite["planned_cases"]):
-    raise ValueError("E1 suite is incomplete; failed attempts and successful partial cases are retained")
+  completed = [item["case"] for item in suite["cases"]]
+  if suite["status"] != "succeeded" or not completed or completed != suite["planned_cases"]:
+    raise ValueError("E1 completed cases differ from the planned matrix or the suite is incomplete")
+  roots = [(directory / item["directory"]).resolve(strict=True) for item in suite["cases"]]
+  if len(roots) != len(set(roots)):
+    raise ValueError("E1 suite references the same case directory more than once")
+  rows = [analyse_case(directory, item) for item in suite["cases"]]
   save_results(directory, rows)
   return rows
+
+
+def analyse_case(directory, item):
+  root = directory / item["directory"]
+  if not root.resolve(strict=True).is_relative_to(directory):
+    raise ValueError("E1 case directory escapes the suite")
+  attempts = sorted(root.glob("attempt-*/status.json"))
+  successful = [path for path in attempts if common.read_json(path)["status"] == "succeeded"]
+  if len(successful) != 1:
+    raise ValueError(f"expected exactly one successful E1 attempt: {root}")
+  attempt = successful[0].parent
+  status = common.read_json(successful[0])
+  capture = common.read_json(attempt / "capture.json")
+  if not status["measurement"] or not capture["measurement"] or status["cleanup"] != "complete":
+    raise ValueError(f"E1 attempt is not a validated measurement: {attempt}")
+  raw_path = attempt / "cyclictest.json"
+  if capture["case"] != item["case"] or common.sha256(raw_path) != capture["cyclictest_sha256"]:
+    raise ValueError(f"E1 case metadata or raw histogram changed: {attempt}")
+  statistics = e1_results.summarize(common.read_json(raw_path),
+                                  **e1_config.statistics(capture["settings"]))
+  return {**capture["case"], **statistics,
+          "achieved_utilization_percent": capture["utilization"]["busy_percent"],
+          "raw_sha256": common.sha256(raw_path),
+          "directory": str(attempt.relative_to(directory))}
 
 
 def prepare_builds(config, cases, directory):

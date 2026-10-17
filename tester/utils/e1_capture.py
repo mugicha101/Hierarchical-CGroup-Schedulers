@@ -4,10 +4,9 @@ from contextlib import ExitStack
 from copy import deepcopy
 import os
 from pathlib import Path
-import time
 
 from . import deadline as deadline_support
-from . import common, cyclictest, e1_config, e1_results, e1_workloads, lifecycle
+from . import common, cyclictest, e1_config, e1_measurement, e1_results, e1_workloads, lifecycle
 
 
 def scheduler_manifest(manifest, settings, scheduler):
@@ -83,41 +82,9 @@ def capture(config, directory, case, cyclic_binary, manifest, stress_binary):
                                      partitions=partitions)
         resources.callback(stress.close)
         stress.wait_ready()
-        deadline = time.monotonic() + config["warmup_s"]
-        while time.monotonic() < deadline:
-          session.check()
-          stress.check()
-          time.sleep(min(.05, max(0, deadline - time.monotonic())))
-      gate = e1_workloads.open_gate(session, directory)
-      try:
-        before = common.cpu_times(cpus)
-        run["start_ns"] = time.monotonic_ns()
-        os.write(gate, b"g")
-      finally:
-        os.close(gate)
-      deadline = time.monotonic() + config["duration_s"] + config["process_timeout_s"]
-      next_check = time.monotonic()
-      while job.process.poll() is None:
-        session.check()
-        if partitions:
-          partitions.check()
-        if time.monotonic() >= deadline:
-          raise TimeoutError("cyclictest exceeded its configured duration and shutdown timeout")
-        if stress and time.monotonic() >= next_check:
-          stress.check()
-          next_check = time.monotonic() + 1
-        time.sleep(.02)
-      run["end_ns"] = time.monotonic_ns()
-      after = common.cpu_times(cpus)
-      if job.process.returncode:
-        raise RuntimeError(f"cyclictest exited with {job.process.returncode}; see {job.log}")
-      if run["end_ns"] - run["start_ns"] < round(config["duration_s"] * 1e9):
-        raise ValueError("cyclictest exited before the full measurement duration")
-      session.check()
-      if stress:
-        stress.check()
-      run["utilization"] = common.utilization(before, after)
-      run["counter_window"] = "cyclictest gate release through observed process exit; includes shutdown"
+        e1_measurement.warmup(session, stress, config["warmup_s"])
+      e1_measurement.record_interval(config, session, job, directory, cpus, run,
+                                     stress=stress, partitions=partitions)
       raw = common.read_json(directory / "cyclictest.json")
       run["cyclictest_sha256"] = common.sha256(directory / "cyclictest.json")
       if any(thread["cpu"] != cpu for thread in raw["thread"].values()):
