@@ -77,6 +77,12 @@ do { \
 #define SCXTP_EMIT_OP(NAME, SCHED_CGRP_ID, ...) do {} while (0)
 #endif
 
+#define SCXTP_EMIT_OP_ENTRY(OP, SCHED_CGRP_ID) \
+  SCXTP_EMIT_OP(op_entry, SCHED_CGRP_ID, e->op = (OP);)
+
+#define SCXTP_EMIT_OP_EXIT(OP, SCHED_CGRP_ID) \
+  SCXTP_EMIT_OP(op_exit, SCHED_CGRP_ID, e->op = (OP);)
+
 #else
 
 #define SCXTP_FIELD(TYPE, NAME) __field(TYPE, NAME)

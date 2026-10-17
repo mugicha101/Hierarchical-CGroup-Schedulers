@@ -29,37 +29,56 @@ struct {
 
 s32 BPF_STRUCT_OPS_SLEEPABLE(jlfp_init)
 {
+  SCXTP_EMIT_OP_ENTRY(SCXTP_OP_INIT, aa.base.cgroup_id);
+
   s32 err = jlfp_init_core(&aa);
   if (!err) {
     smp_wmb();
     WRITE_ONCE(jlfp_sched_switch_ready, true);
   }
+  SCXTP_EMIT_OP_EXIT(SCXTP_OP_INIT, aa.base.cgroup_id);
   return err;
 }
 
 void BPF_STRUCT_OPS(jlfp_exit, struct scx_exit_info *ei)
 {
+  SCXTP_EMIT_OP_ENTRY(SCXTP_OP_EXIT, aa.base.cgroup_id);
+
   WRITE_ONCE(jlfp_sched_switch_ready, false);
   SCXTP_EMIT(exit, aa.base.cgroup_id,
     e->cgrp_id = aa.base.cgroup_id;
   );
   bpf_printk("[INFO] [JLFP] [EXIT] cgroup=%llu\n", aa.base.cgroup_id);
   UEI_RECORD(uei, ei);
+
+  SCXTP_EMIT_OP_EXIT(SCXTP_OP_EXIT, aa.base.cgroup_id);
 }
 
 s32 BPF_STRUCT_OPS(jlfp_sub_attach, struct scx_sub_attach_args *args)
 {
-  return jlfp_sub_attach_core(&aa, args);
+  SCXTP_EMIT_OP_ENTRY(SCXTP_OP_SUB_ATTACH, aa.base.cgroup_id);
+
+  s32 err = jlfp_sub_attach_core(&aa, args);
+  SCXTP_EMIT_OP_EXIT(SCXTP_OP_SUB_ATTACH, aa.base.cgroup_id);
+  return err;
 }
 
 void BPF_STRUCT_OPS(jlfp_sub_detach, struct scx_sub_detach_args *args)
 {
+  SCXTP_EMIT_OP_ENTRY(SCXTP_OP_SUB_DETACH, aa.base.cgroup_id);
+
   jlfp_sub_detach_core(&aa, args);
+
+  SCXTP_EMIT_OP_EXIT(SCXTP_OP_SUB_DETACH, aa.base.cgroup_id);
 }
 
 void BPF_STRUCT_OPS(jlfp_cpuctl_set_weight, struct cgroup *cgrp, u32 weight)
 {
+  SCXTP_EMIT_OP_ENTRY(SCXTP_OP_CPUCTL_SET_WEIGHT, aa.base.cgroup_id);
+
   jlfp_cpuctl_set_weight_core(&aa, cgrp, weight);
+
+  SCXTP_EMIT_OP_EXIT(SCXTP_OP_CPUCTL_SET_WEIGHT, aa.base.cgroup_id);
 }
 
 // configured weight for selection, enqueue, and reconsidering runnable prev
@@ -78,12 +97,17 @@ u64 __always_inline get_task_weight(struct task_struct *p) {
 
 void BPF_STRUCT_OPS(jlfp_dispatch, s32 cid, struct task_struct *prev)
 {
+  SCXTP_EMIT_OP_ENTRY(SCXTP_OP_DISPATCH, aa.base.cgroup_id);
+
   struct jlfp_arena __arena *a = &aa;
   u64 prev_weight = 0;
   if (prev && (BPF_CORE_READ(prev, scx.flags) & SCX_TASK_QUEUED))
     prev_weight = get_task_weight(prev);
 
-  if (unlikely(cid >= NR_CPUS)) return; // for testing limited CPUs
+  if (unlikely(cid >= NR_CPUS)) {
+    SCXTP_EMIT_OP_EXIT(SCXTP_OP_DISPATCH, aa.base.cgroup_id);
+    return; // for testing limited CPUs
+  }
 
   // bpf_printk("[INFO] [JLFP] [DISPATCH] dispatching on cpu %u", cpu);
 
@@ -96,20 +120,26 @@ void BPF_STRUCT_OPS(jlfp_dispatch, s32 cid, struct task_struct *prev)
   u64 tid = jlfp_try_task_dispatch(a, cid, prev, a->slice, prev_weight);
   if (tid) {
     lstat_record(&lctx, &a->stats[cid].dispatch);
+    SCXTP_EMIT_OP_EXIT(SCXTP_OP_DISPATCH, aa.base.cgroup_id);
     return;
   }
 
   // dispatch cgroups if no tasks
   if (jlfp_try_sub_dispatch(a, cid)) {
     lstat_record(&lctx, &a->stats[cid].dispatch);
+    SCXTP_EMIT_OP_EXIT(SCXTP_OP_DISPATCH, aa.base.cgroup_id);
     return;
   }
 
   lstat_record(&lctx, &a->stats[cid].dispatch);
+
+  SCXTP_EMIT_OP_EXIT(SCXTP_OP_DISPATCH, aa.base.cgroup_id);
 }
 
 s32 BPF_STRUCT_OPS(jlfp_select_cid, struct task_struct *p, s32 prev_cid, u64 wake_flags)
 {
+  SCXTP_EMIT_OP_ENTRY(SCXTP_OP_SELECT_CID, aa.base.cgroup_id);
+
   // bpf_printk("[INFO] [JLFP] [SELECT_CID] cgroup=%d pid=%d comm=%s prev_cid=%d wake_flags=%llu", cgroup_id, p->pid, p->comm, prev_cid, wake_flags);
 
   struct latency_ctx lctx;
@@ -118,11 +148,14 @@ s32 BPF_STRUCT_OPS(jlfp_select_cid, struct task_struct *p, s32 prev_cid, u64 wak
   u32 cid = scx_bpf_this_cid();
   lstat_record(&lctx, &aa.stats[cid].select_cid);
 
+  SCXTP_EMIT_OP_EXIT(SCXTP_OP_SELECT_CID, aa.base.cgroup_id);
   return prev_cid; // should be ignored since enqueue shouldn't run
 }
 
 void BPF_STRUCT_OPS(jlfp_enqueue, struct task_struct *p, u64 enq_flags)
 {
+  SCXTP_EMIT_OP_ENTRY(SCXTP_OP_ENQUEUE, aa.base.cgroup_id);
+
   // bpf_printk("[INFO] [JLFP] [ENQUEUE] cgroup=%d pid=%d comm=%s enq_flags=%llu", cgroup_id, p->pid, p->comm, enq_flags);
 
   SCXTP_EMIT_HOTPATH(enqueue_args, aa.base.cgroup_id,
@@ -138,10 +171,14 @@ void BPF_STRUCT_OPS(jlfp_enqueue, struct task_struct *p, u64 enq_flags)
   
   u32 cid = scx_bpf_this_cid();
   lstat_record(&lctx, &aa.stats[cid].enqueue);
+
+  SCXTP_EMIT_OP_EXIT(SCXTP_OP_ENQUEUE, aa.base.cgroup_id);
 }
 
 void BPF_STRUCT_OPS(jlfp_running, struct task_struct *p)
 {
+  SCXTP_EMIT_OP_ENTRY(SCXTP_OP_RUNNING, aa.base.cgroup_id);
+
   struct latency_ctx lctx;
   lstat_start(&lctx);
   
@@ -164,11 +201,17 @@ void BPF_STRUCT_OPS(jlfp_running, struct task_struct *p)
   }
 
   jlfp_running_core(&aa, p, tctx, wt, &lctx);
+
+  SCXTP_EMIT_OP_EXIT(SCXTP_OP_RUNNING, aa.base.cgroup_id);
 }
 
 void BPF_STRUCT_OPS(jlfp_stopping, struct task_struct *p, bool runnable)
 {
+  SCXTP_EMIT_OP_ENTRY(SCXTP_OP_STOPPING, aa.base.cgroup_id);
+
   jlfp_stopping_core(&aa, p, runnable);
+
+  SCXTP_EMIT_OP_EXIT(SCXTP_OP_STOPPING, aa.base.cgroup_id);
 }
 
 // update weight of current running task
@@ -205,7 +248,11 @@ void BPF_STRUCT_OPS(jlfp_stopping, struct task_struct *p, bool runnable)
 
 void BPF_STRUCT_OPS(jlfp_update_idle, s32 cid, bool idle)
 {
+  SCXTP_EMIT_OP_ENTRY(SCXTP_OP_UPDATE_IDLE, aa.base.cgroup_id);
+
   base_update_idle(&aa.base, cid, idle);
+
+  SCXTP_EMIT_OP_EXIT(SCXTP_OP_UPDATE_IDLE, aa.base.cgroup_id);
 }
 
 // from qmap
@@ -213,6 +260,8 @@ void BPF_STRUCT_OPS(jlfp_update_idle, s32 cid, bool idle)
 // because cid-form removes enable/disable can only be done in enqueue
 s32 BPF_STRUCT_OPS_SLEEPABLE(jlfp_init_task, struct task_struct *p, struct scx_init_task_args *args)
 {
+  SCXTP_EMIT_OP_ENTRY(SCXTP_OP_INIT_TASK, aa.base.cgroup_id);
+
   SCXTP_EMIT(init_task_args, aa.base.cgroup_id,
     e->tid = p->pid;
     e->fork = args->fork;
@@ -223,15 +272,19 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(jlfp_init_task, struct task_struct *p, struct scx_i
   // bpf_printk("[INFO] [JLFP] [INIT_TASK] cgroup=%d pid=%d comm=%s", cgroup_id, p->pid, p->comm);
 
   if (unlikely(!init_jlfp_task_ctx(&aa.base, p, args))) {
+    SCXTP_EMIT_OP_EXIT(SCXTP_OP_INIT_TASK, aa.base.cgroup_id);
     return -ENOMEM;
   }
 
+  SCXTP_EMIT_OP_EXIT(SCXTP_OP_INIT_TASK, aa.base.cgroup_id);
   return 0;
 }
 
 // from qmap
 void BPF_STRUCT_OPS(jlfp_exit_task, struct task_struct *p)
 {
+  SCXTP_EMIT_OP_ENTRY(SCXTP_OP_EXIT_TASK, aa.base.cgroup_id);
+
   SCXTP_EMIT(exit_task_args, aa.base.cgroup_id,
     e->tid = p->pid;
   );
@@ -240,20 +293,30 @@ void BPF_STRUCT_OPS(jlfp_exit_task, struct task_struct *p)
   struct latency_ctx lctx;
   lstat_start(&lctx);
 
-  if (!base_exit_task(&aa.base, p)) return;
+  if (!base_exit_task(&aa.base, p)) {
+    SCXTP_EMIT_OP_EXIT(SCXTP_OP_EXIT_TASK, aa.base.cgroup_id);
+    return;
+  }
 
   u32 cid = scx_bpf_this_cid();
   lstat_record(&lctx, &aa.stats[cid].exit_task);
+
+  SCXTP_EMIT_OP_EXIT(SCXTP_OP_EXIT_TASK, aa.base.cgroup_id);
 }
 
 // from qmap
 void BPF_STRUCT_OPS(jlfp_set_cmask, struct task_struct *p, const struct scx_cmask *cmask_in)
 {
+  SCXTP_EMIT_OP_ENTRY(SCXTP_OP_SET_CMASK, aa.base.cgroup_id);
+
   struct latency_ctx lctx;
   lstat_start(&lctx);
 
   task_ctx_t *tctx = base_set_cmask(p, cmask_in);
-  if (unlikely(!tctx)) return;
+  if (unlikely(!tctx)) {
+    SCXTP_EMIT_OP_EXIT(SCXTP_OP_SET_CMASK, aa.base.cgroup_id);
+    return;
+  }
 
   u32 cid = scx_bpf_this_cid();
   lstat_record(&lctx, &aa.stats[cid].set_cmask);
@@ -262,14 +325,20 @@ void BPF_STRUCT_OPS(jlfp_set_cmask, struct task_struct *p, const struct scx_cmas
     e->tid = p->pid;
     e->cmask = cmask_to_u64(&tctx->cpus_allowed);
   );
+
+  SCXTP_EMIT_OP_EXIT(SCXTP_OP_SET_CMASK, aa.base.cgroup_id);
 }
 
 void BPF_STRUCT_OPS(jlfp_tick, struct task_struct *p) {
+  SCXTP_EMIT_OP_ENTRY(SCXTP_OP_TICK, aa.base.cgroup_id);
+
   // measure overhead of latency tracking
   struct latency_ctx lctx;
   u32 cid = scx_bpf_this_cid();
   lstat_start(&lctx);
   lstat_record(&lctx, &aa.stats[cid].no_op);
+
+  SCXTP_EMIT_OP_EXIT(SCXTP_OP_TICK, aa.base.cgroup_id);
 }
 
 // based on scx_pair
