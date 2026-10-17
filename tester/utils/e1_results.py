@@ -1,10 +1,9 @@
 """Validate one cyclictest histogram and compute E1 latency statistics offline."""
 
-from fractions import Fraction
-import math
 from pathlib import Path
 
-from . import common
+from . import common, latency_stats
+from .latency_stats import order_statistic, quantile
 
 
 def integer(value, name, *, minimum=0):
@@ -41,55 +40,15 @@ def read_histogram(raw):
   return dict(sorted(histogram.items()))
 
 
-def order_statistic(histogram, rank):
-  cumulative = 0
-  for bucket, count in histogram.items():
-    cumulative += count
-    if cumulative >= rank:
-      return bucket
-  raise ValueError("quantile rank exceeds the histogram sample count")
-
-
-def quantile(histogram, fraction, method):
-  samples = sum(histogram.values())
-  if method == "nearest_rank":
-    return order_statistic(histogram, math.ceil(samples * fraction))
-  position = (samples - 1) * fraction
-  lower = math.floor(position)
-  first = order_statistic(histogram, lower + 1)
-  if position == lower:
-    return first
-  second = order_statistic(histogram, lower + 2)
-  return float(first + (second - first) * (position - lower))
-
-
 def summarize(raw, *, quantile_method, stddev):
-  if quantile_method not in ("nearest_rank", "linear"):
-    raise ValueError("set E1 quantile_method to nearest_rank or linear")
-  if stddev not in ("population", "sample"):
-    raise ValueError("set E1 stddev to population or sample")
   histogram = read_histogram(raw)
-  samples = sum(histogram.values())
-  if stddev == "sample" and samples < 2:
+  statistics = latency_stats.summarize(histogram, quantile_method=quantile_method, stddev=stddev)
+  if stddev == "sample" and statistics["samples"] < 2:
     raise ValueError("sample standard deviation requires at least two samples")
-  total = sum(bucket * count for bucket, count in histogram.items())
-  squares = sum(bucket * bucket * count for bucket, count in histogram.items())
-  denominator = samples * (samples if stddev == "population" else samples - 1)
-  result = {
-      "samples": samples,
-      "histogram_samples": samples,
-      "overflow_samples": 0,
-      "histogram_bucket_us": 1,
-      "quantile_method": quantile_method,
-      "stddev_kind": stddev,
-      "min_us": min(histogram),
-      "max_us": max(histogram),
-      "mean_us": total / samples,
-      "stddev_us": math.sqrt(Fraction(samples * squares - total * total, denominator)),
-  }
-  for name, fraction in (("median_us", Fraction(1, 2)), ("p99_us", Fraction(99, 100)),
-                          ("p999_us", Fraction(999, 1000))):
-    result[name] = quantile(histogram, fraction, quantile_method)
+  result = {key: statistics[key] for key in ("samples", "quantile_method", "stddev_kind")}
+  result.update(histogram_samples=statistics["samples"], overflow_samples=0, histogram_bucket_us=1)
+  result.update({name + "_us": statistics[name] for name in
+                 ("min", "max", "mean", "median", "p99", "p999", "stddev")})
   return result
 
 

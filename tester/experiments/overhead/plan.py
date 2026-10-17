@@ -15,11 +15,12 @@ def plan(settings):
       "e2": {
           "measurement": "scheduling class operation latency",
           "schedulers": ["other", "fifo", "qmap", "jlfp"],
-          "status": "deferred: required class-operation tracepoints are not installed",
+          "status": "capture deferred; offline operation analysis utilities implemented",
       },
       "e3": {
           "measurement": "JLFP callback versus class operation latency",
           "schedulers": ["jlfp"],
+          "status": "capture pending; offline nested callback analysis utilities implemented",
       },
       "e4": {
           "measurement": "JLFP operation latency with migratable workers",

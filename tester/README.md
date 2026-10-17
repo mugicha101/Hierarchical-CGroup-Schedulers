@@ -449,8 +449,26 @@ and `spike_us` in debug config, or use the corresponding CLI overrides. Diagnost
 runs record native scheduler/timer/IRQ/workqueue events and timestamped spikes in
 `cyclictest.log`; timestamps use CLOCK_MONOTONIC microseconds, while trace events
 use nanoseconds. These legacy latency runs always record an exit event and are
-separate from the pending trace-free E1 implementation.
+separate from overhead E1.
 
-E2 remains unimplemented until the required scheduling-class operation entry/exit
-tracepoints are added to the kernel. Function-graph tracing is not substituted
-for those tracepoints. E3/E4 are also pending their instrumentation requirements.
+E2/E3 capture runners remain pending validated operation entry/exit instrumentation.
+E4 also awaits its additional instrumentation requirements.
+
+## Operation trace utilities for E2/E3
+
+```sh
+python3 tester/utils/inspect_trace.py TRACE.dat --output NEW_INVENTORY.json
+python3 tester/utils/analyse_operations.py CAPTURE_DIR
+```
+
+The first command inventories an existing capture with the shared Babeltrace
+reader and loss checks. The second pairs normalized operation entry/exit records,
+retains exact per-call durations, reports per-CPU/pooled latency statistics and
+attributes recorded nested SCX callbacks to class calls. Both are offline tools;
+the operation analyser uses only the standard library. Existing outputs are
+refused, and incomplete input produces retained diagnostics with an invalid result.
+
+See [the input format and output definitions](experiments/overhead/TRACE_FORMAT.md)
+for call IDs, interrupt-context handling, loss counters and callback percentages.
+A live entry/exit producer or tracepoint adapter still needs implementing; these
+utilities do not start E2/E3 or establish scientific validity.

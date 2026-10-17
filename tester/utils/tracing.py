@@ -40,28 +40,35 @@ class Recording:
         raise CleanupError("private recorder cleanup failed") from error
 
 
+def capture_metadata(path):
+  """Require frozen monotonic capture controls and complete, zero-loss CPU counters."""
+  path = Path(path)
+  metadata = json.loads(path.with_suffix(path.suffix + ".metadata.json").read_text())
+  if metadata["errors"] or not metadata["cpu_stats"]:
+    raise ValueError("missing trace controls or per-CPU loss statistics")
+  if metadata["controls"].get("tracing_on") != "0" or \
+      "[mono]" not in metadata["controls"].get("trace_clock", ""):
+    raise ValueError("trace metadata requires frozen buffers and the monotonic clock")
+  for text in metadata["cpu_stats"].values():
+    counters = {}
+    for line in text.splitlines():
+      key, separator, value = line.partition(":")
+      if separator and key.strip() in ("overrun", "commit overrun", "dropped events"):
+        counters[key.strip()] = int(value.strip())
+    if len(counters) != 3:
+      raise ValueError("trace loss counters are incomplete")
+    if any(counters.values()):
+      raise ValueError(f"trace buffer lost events: {counters}")
+  return metadata
+
+
 def summarize(path, required_events=()):
   from .trace_helpers import TraceParser, defer_trace_interrupts
   path = Path(path)
   report = {"valid": False, "events": {}, "cpus": {}, "error": None}
   events, cpus = Counter(), Counter()
   try:
-    metadata = json.loads(path.with_suffix(path.suffix + ".metadata.json").read_text())
-    if metadata["errors"] or not metadata["cpu_stats"]:
-      raise ValueError("missing trace controls or per-CPU loss statistics")
-    if metadata["controls"].get("tracing_on") != "0" or \
-        "[mono]" not in metadata["controls"].get("trace_clock", ""):
-      raise ValueError("trace metadata requires frozen buffers and the monotonic clock")
-    for text in metadata["cpu_stats"].values():
-      counters = {}
-      for line in text.splitlines():
-        key, separator, value = line.partition(":")
-        if separator and key.strip() in ("overrun", "commit overrun", "dropped events"):
-          counters[key.strip()] = int(value.strip())
-      if len(counters) != 3:
-        raise ValueError("trace loss counters are incomplete")
-      if any(counters.values()):
-        raise ValueError(f"trace buffer lost events: {counters}")
+    capture_metadata(path)
     with defer_trace_interrupts() as check_interrupt, TraceParser(path) as parser:
       for message in parser:
         events[message.event.name] += 1

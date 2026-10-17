@@ -118,3 +118,17 @@ def parse_isolation(description):
   parser.add_argument("--config", type=Path, default=common.DEFAULT_CONFIG)
   parser.add_argument("command", choices=("enable", "disable", "status"))
   return parser.parse_args()
+
+
+def parse_operation_analysis(description):
+  parser = argparse.ArgumentParser(description=description)
+  parser.add_argument("capture_dir", type=Path, help="directory containing operations.jsonl and operations.metadata.json")
+  parser.add_argument("--output-dir", type=Path, help="new directory; default: CAPTURE_DIR/operation-analysis")
+  return parser.parse_args()
+
+
+def parse_trace_inventory(description):
+  parser = argparse.ArgumentParser(description=description)
+  parser.add_argument("trace", type=Path)
+  parser.add_argument("--output", type=Path, help="new JSON file; default: TRACE.inventory.json")
+  return parser.parse_args()
