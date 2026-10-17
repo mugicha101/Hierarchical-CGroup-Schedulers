@@ -132,10 +132,13 @@ The new cyclictest build uses upstream revision
 explicit-reservation DEADLINE support, the inherited-affinity fix, and an optional
 E1 worker startup gate. Its readable patch and hash are saved with the build.
 It does not replace `cyclictest/rt-tests` or build/use cyclicdeadline.
-Both cyclictest builders pass `DEBUG=` explicitly to select
-upstream's release build (`-O2 -g`), even when the environment exports a nonempty
-`DEBUG` value. Build metadata records this choice; rebuild older development
-binaries before making comparisons. Preflight returns status 2 and preserves a
+Both cyclictest builders use upstream's Makefile without overriding optimization
+or repairing unrelated upstream bugs. Build metadata records inherited build
+variables, and build logs retain compiler commands. In this pinned upstream
+version, a nonempty `DEBUG` value selects `-O0 -g`; otherwise it selects `-O2 -g`.
+Check these recorded settings when comparing runs or papers. The EXT/DEADLINE,
+startup-gate and affinity changes required by the tests remain explicit in the
+saved patches. Preflight returns status 2 and preserves a
 JSON report when prerequisites are missing; `preflight --traced` additionally
 checks trace tools.
 The harnesses below use the same configuration file for placement and timing.

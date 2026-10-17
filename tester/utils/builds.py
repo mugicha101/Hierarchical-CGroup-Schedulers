@@ -205,9 +205,11 @@ def build(config, target, trace="off"):
       run(["git", "clone", "--no-checkout", RT_TESTS_URL, checkout])
       run(["git", "checkout", "--detach", RT_TESTS_REVISION], cwd=checkout)
       (directory / "cyclictest.patch").write_text(patch_cyclictest(checkout))
-      # upstream treats any nonempty DEBUG value, including "release", as -O0
-      run(["make", "-j2", "DEBUG=", "cyclictest"], cwd=checkout)
-      metadata["build_mode"] = "upstream release (DEBUG=, -O2 -g)"
+      metadata["build_mode"] = "upstream Makefile with inherited environment"
+      metadata["build_environment"] = {key: os.environ.get(key) for key in
+                                       ("DEBUG", "CC", "CFLAGS", "CPPFLAGS", "LDFLAGS",
+                                        "MAKEFLAGS", "CROSS_COMPILE")}
+      run(["make", "-j2", "cyclictest"], cwd=checkout)
       binary = checkout / "cyclictest"
       metadata["patched_source_sha256"] = sha256(checkout / "src/cyclictest/cyclictest.c")
       metadata["e1_startup_gate"] = True
