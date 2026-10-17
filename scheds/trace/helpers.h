@@ -10,16 +10,26 @@
 
 #include <bpf/bpf_helpers.h>
 
-#ifndef SCXTP_TRACING
-#define SCXTP_TRACING 1
+#ifndef SCXTP_LOWFREQ_TRACING
+#define SCXTP_LOWFREQ_TRACING 0
 #endif
+
 #ifndef SCXTP_HOTPATH_TRACING
 #define SCXTP_HOTPATH_TRACING 0
 #endif
 
+#ifndef SCXTP_OP_TRACING
+#define SCXTP_OP_TRACING 0
+#endif
+
+#ifndef SCXTP_TRACING
+#define SCXTP_TRACING (SCXTP_LOWFREQ_TRACING || SCXTP_HOTPATH_TRACING || SCXTP_OP_TRACING)
+#endif
+
 // expose the BPF build settings to the userspace loader
-const bool scxtp_lowfreq_compiled = SCXTP_TRACING;
-const bool scxtp_hotpath_compiled = SCXTP_HOTPATH_TRACING;
+const bool scxtp_lowfreq_compiled = SCXTP_TRACING && SCXTP_LOWFREQ_TRACING;
+const bool scxtp_hotpath_compiled = SCXTP_TRACING && SCXTP_HOTPATH_TRACING;
+const bool scxtp_op_compiled = SCXTP_TRACING && SCXTP_OP_TRACING;
 
 // set per scheduler before BPF load (disabled by default)
 const volatile bool scxtp_enabled = false;
@@ -32,7 +42,7 @@ const volatile bool scxtp_enabled = false;
 
 // skip payload preparation when disabled or the optional module was absent at load time
 // initialize the full payload, including padding, before calling the kfunc
-#define SCXTP_EMIT(NAME, SCHED_CGRP_ID, ...) \
+#define SCXTP_EMIT_EVENT(NAME, SCHED_CGRP_ID, ...) \
 do { \
   if (scxtp_enabled && bpf_ksym_exists(scxtp_emit_##NAME)) { \
     struct scxtp_event_##NAME scxtp_event = {}; \
@@ -43,14 +53,28 @@ do { \
 } while (0)
 
 #else
+#define SCXTP_EMIT_EVENT(NAME, SCHED_CGRP_ID, ...) do {} while (0)
+#endif
+
+#if SCXTP_LOWFREQ_TRACING
+#define SCXTP_EMIT(NAME, SCHED_CGRP_ID, ...) \
+  SCXTP_EMIT_EVENT(NAME, SCHED_CGRP_ID, __VA_ARGS__)
+#else
 #define SCXTP_EMIT(NAME, SCHED_CGRP_ID, ...) do {} while (0)
 #endif
 
 #if SCXTP_HOTPATH_TRACING
 #define SCXTP_EMIT_HOTPATH(NAME, SCHED_CGRP_ID, ...) \
-  SCXTP_EMIT(NAME, SCHED_CGRP_ID, __VA_ARGS__)
+  SCXTP_EMIT_EVENT(NAME, SCHED_CGRP_ID, __VA_ARGS__)
 #else
 #define SCXTP_EMIT_HOTPATH(NAME, SCHED_CGRP_ID, ...) do {} while (0)
+#endif
+
+#if SCXTP_OP_TRACING
+#define SCXTP_EMIT_OP(NAME, SCHED_CGRP_ID, ...) \
+  SCXTP_EMIT_EVENT(NAME, SCHED_CGRP_ID, __VA_ARGS__)
+#else
+#define SCXTP_EMIT_OP(NAME, SCHED_CGRP_ID, ...) do {} while (0)
 #endif
 
 #else

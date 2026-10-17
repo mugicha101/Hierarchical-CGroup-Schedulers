@@ -35,10 +35,6 @@ Build the schedulers:
 make CLANG=clang-22
 ```
 
-This puts the scheduler binaries and the `check_tracing` helper in `./build`.
-Clang 22 includes the BPF arena memory-intrinsic cast fix needed by qmap in the
-enclosing kernel tree; the experiment runner uses clang-22 for all BPF schedulers.
-
 Give the scheduler permission to run (will ask for sudo permission):
 
 ```sh
@@ -56,57 +52,6 @@ Note: Rerun `setcaps.sh` after each rebuild of the scheduler binaries.
 ### Run
 
 To see how to attach a specific scheduler with a userspace program, run `./build/scx_<policy> -h`.
-
-### Tracing
-
-#### General Debugging
-
-For general scheduler debugging without needing a kernel module, use the native `bpf_printk()` macro. Its output is emitted through ftrace as `bpf_trace:bpf_trace_printk` and can be read from `/sys/kernel/tracing/trace_pipe`. This output is independent of the per-scheduler `--trace` flag.
-
-#### Structured Scheduler Tracepoints
-
-To trace BPF schedulers with low overhead, we use custom ftrace kernel tracepoints defined in `trace/`, which requires a kernel module to work. Without the kernel module loaded, trace emissions will become no-ops at scheduler load-time. This kernel module is used to add custom kernel tracepoints, since forwarding tracepoints to userspace would add overhead and complexity. Events are fixed size and written to per-CPU buffers.
-
-Build and load the kernel module before starting a scheduler as follows:
-
-```sh
-make trace-module KDIR=/path/to/kernel/build
-sudo insmod trace/scxtp.ko
-```
-
-Schedulers still work without the module. If the module is loaded later, restart the scheduler to enable tracing.
-
-When running without sudo, run `./setcaps.sh` after building the scheduler. Libbpf needs cap_sys_admin to discover the module's emission kfuncs through BTF. Without it, the optional kfuncs can remain unresolved and custom events will be skipped even with the module loaded and `-t` passed.
-
-At the top of `trace/helpers.h`, various compilation flags are set. These enable specific tracing behavior if set to 1 (disabled if 0). They can also be defined before including `trace/events.bpf.h`. In addition to these flags, `scxtp_enabled` must be set to true when loading the scheduler, which is done via the userspace CLI programs by passing the `-t/--trace` flag (ex: `./build/scx_jlfp -t`). Emissions are disabled by default for each scheduler. GEDF accepts the same flag.
-
-`SCXTP_TRACING`: This flag enables the custom scheduler tracepoints (default: 1). Low-frequency events record cgroup property changes, sub-scheduler attachment and detachment, task creation and exit, task weights, affinity, and topology. Combine these with generic scheduling events such as `sched_switch`, `sched_wakeup`, and `sched_wakeup_new` to check scheduler policy behavior.
-
-`SCXTP_HOTPATH_TRACING`: When combined with `SCXTP_TRACING`, hotpath events are emitted. These record task enqueue and execution transitions. These are intended to replace generic scheduling events so that the captured trace is smaller, with the tradeoff of not capturing external scheduling events. Set `SCXTP_HOTPATH_TRACING` to 1 to enable them (default: 0).
-
-Build schedulers with existing hotpath events enabled using `make -W scx_jlfp.bpf.h SCXTP_HOTPATH_TRACING=1` from `scheds/`. Use the same command with `SCXTP_HOTPATH_TRACING=0` to disable them. After changing event definitions, rebuild and reload the trace module with schedulers and recorders stopped before starting a capture.
-
-JLFP/GEDF treat timer-occupied CPUs as unavailable through the switch observer. A same-core wakeup can bypass normal placement once when a per-CPU FIFO/RR kthread entered from idle, the local/global/per-CID queues are empty, and no preemption reservation exists. The observer preserves this idle origin only across qualifying kthread switches; the handoff consumes it and reserves the CPU before insertion. Other wakeups use normal priority selection. Queue counts are snapshots, so the shortcut retains the existing dispatch-race tradeoff. Running-weight metadata uses the reserved misc bits without changing the pinned map layout; rebuild JLFP and GEDF together before attaching a hierarchy.
-
-Workers preempted with slice remaining retain their cached CPU weight until the next execution state replaces it; exhausted running workers return to their priority DSQ instead of selecting another local placement. On starting migratable work, a nonempty global queue's head is checked for a higher eligible task and triggers preemption when needed. These checks reduce long dynamic inversions while retaining finite slices and the existing shard-lock model.
-
-Rebuild schedulers after changing these flags. In `sched_manager`, use `attach scx_jlfp <cgroup_path> --trace` or set `"trace": true` for individual schedulers in a configuration file. This setting defaults to false and is not inherited by sub-schedulers. The emission flag does not control generic kernel events or `bpf_printk()` output.
-
-#### Capturing Ftrace Events
-
-Schedulers do not create trace files or configure recording. In another terminal, start an external recorder before attaching the schedulers:
-
-```sh
-sudo trace-cmd record -e 'scxtp:*' -e 'bpf_trace:bpf_trace_printk' -o scheduler.dat
-```
-
-Stop recording with Ctrl-C after the schedulers exit, then read the file with `trace-cmd report -i scheduler.dat`. Add generic kernel events such as `sched:sched_switch`, `sched:sched_wakeup`, and `sched:sched_wakeup_new` with additional `-e` options when needed.
-
-For integration with Babeltrace2, use an ftrace to CTF converter such as [bt2-ftrace-to-ctf](https://github.com/siemens/bt2-ftrace-to-ctf).
-
-## Testing
-
-See the [tester README](../tester/README.md) for JLFP and MC² inversion tests, CPU isolation, wakeup analysis, and cyclictest comparisons.
 
 ## Scheduling Policies
 
@@ -150,12 +95,10 @@ sched_yield();
 
 ### GEDF: Global Earliest Deadline First
 
-GEDF is a leaf scheduler and only supports tasks.
-
 - Sub-policy of JLFP.
 - Uses JLFP's per-cid queues and nmig weight boost for migration-disabled and single-CPU pinned tasks.
 - Task GEDF parameters are stored in `/sys/fs/bpf/scx/task_rtp_map` and persist if the task moves to another scheduler instance.
-- Deadline-derived priorities will reuse the JLFP `task_weights` map, so task weights should not be set manually.
+- Deadline-derived priorities reuse the JLFP `task_weights` map, so task weights should not be set manually.
 - Job completions are marked in the memory-mapped `job_completion_flags` bitmap, with one bit per TID. Atomically OR `1ULL << (tid & 63)` into the `u64` word at `flags[tid >> 6]` before sleeping or yielding. The scheduler advances the deadline and clears the bit on wakeup or yield.
 - Subschedulers use JLFP ordering.
 
@@ -172,6 +115,64 @@ As of the release of Linux 7.3, `struct bpf_timer` cannot be used with PREEMPT_R
 As of the release of 7.3, `sched_class_ext` tasks have lower priority than `sched_class_fair`. This means SCHED_EXT cannot preempt tasks scheduled under the default CFS/EEVDF scheduler, which means running a realtime workload with SCHED_EXT requires careful management of all tasks in the system (either by scheduling them all with SCHED_EXT by omitting the `SCX_OPS_SWITCH_PARTIAL` flag or by using systemd slices / an equivalent CPU partitioning system). The fix to this is to patch the kernel to add a config flag to swap the order of SCX and FAIR: (TODO: add patch that fixes this)
 
 ## Measuring Overhead
+
+### Tracing
+
+#### General Debugging
+
+For general scheduler debugging without needing a kernel module, use the native `bpf_printk()` macro. Its output is emitted through ftrace as `bpf_trace:bpf_trace_printk` and can be read from `/sys/kernel/tracing/trace_pipe`. This output is independent of the per-scheduler `--trace` flag.
+
+#### Structured Scheduler Tracepoints
+
+To trace BPF schedulers with low overhead, we use custom ftrace kernel tracepoints defined in `trace/`, which requires a kernel module to work. Without the kernel module loaded, trace emissions will become no-ops at scheduler load-time. This kernel module is used to add custom kernel tracepoints, since forwarding tracepoints to userspace would add overhead and complexity. Events are fixed size and written to per-CPU buffers.
+
+Build and load the kernel module before starting a scheduler as follows:
+
+```sh
+make trace-module KDIR=/path/to/kernel/build
+sudo insmod trace/scxtp.ko
+```
+
+Schedulers still work without the module. If the module is loaded later, restart the scheduler to enable tracing.
+
+When running without sudo, run `./setcaps.sh` after building the scheduler. Libbpf needs cap_sys_admin to discover the module's emission kfuncs through BTF. Without it, the optional kfuncs can remain unresolved and custom events will be skipped even with the module loaded and `-t` passed. If tracing is disabled, `./setcaps.sh` will exclude cap_sys_admin.
+
+At the top of `trace/helpers.h`, various compilation flags are set. These enable specific tracing behavior if set to 1 (disabled if 0 which is the default). If defined before including `trace/events.bpf.h` (i.e. by Makefile), the values in `trace/helpers.h` are ignored.
+
+In addition to these flags, `scxtp_enabled` must be set to true when loading the scheduler, which is done via the userspace CLI programs by passing the `-t/--trace` flag (ex: `./build/scx_jlfp -t`). Emissions are disabled by default for each scheduler.
+
+`SCXTP_TRACING`: By default, 1 iff any of the following macros are 1. An explicit `SCXTP_TRACING=0` compiles out all emissions.
+
+`SCXTP_LOWFREQ_TRACING`: Enables low-frequency events through `SCXTP_EMIT`. These record cgroup property changes, sub-scheduler attachment and detachment, task creation and exit, task weights, affinity, and topology. Combine these with generic scheduling events such as `sched_switch`, `sched_wakeup`, and `sched_wakeup_new` to check scheduler policy behavior.
+
+`SCXTP_HOTPATH_TRACING`: Enabled hotpath events through `SCXTP_EMIT_HOTPATH`. These record task enqueue and execution transitions. These are intended to replace generic scheduling events so that the captured trace is smaller, with the tradeoff of not capturing external scheduling events.
+
+`SCXTP_OP_TRACING`: Enables sched_ext ops entry/exit events through `SCXTP_EMIT_OP` for ops defined by the BPF scheduler.
+
+From `scheds/`, select event families through Make variables:
+
+```sh
+make clean
+make SCXTP_LOWFREQ_TRACING=1 SCXTP_HOTPATH_TRACING=1 SCXTP_OP_TRACING=1 SCX_LATENCY_STATS=0
+```
+
+`SCXTP_TRACING` is derived automatically. Run `make clean` before rebuilding with different tracing flags, since make doesn't track macro changes.
+
+After adding or changing event definitions in `trace/`, also rebuild the module with `make trace-module KDIR=/path/to/kernel/build`. Stop schedulers and recorders before replacing the loaded module, then restart with `-t/--trace` to enable emissions.
+
+In `sched_manager`, use `attach scx_jlfp <cgroup_path> --trace` or set `"trace": true` for individual schedulers in a configuration file. This setting defaults to false and is not inherited by sub-schedulers. The emission flag does not control generic kernel events or `bpf_printk()` output.
+
+#### Capturing Ftrace Events
+
+Schedulers do not create trace files or configure recording. In another terminal, start an external recorder before attaching the schedulers:
+
+```sh
+sudo trace-cmd record -e 'scxtp:*' -e 'bpf_trace:bpf_trace_printk' -o scheduler.dat
+```
+
+Stop recording with Ctrl-C after the schedulers exit, then read the file with `trace-cmd report -i scheduler.dat`. Add generic kernel events such as `sched:sched_switch`, `sched:sched_wakeup`, and `sched:sched_wakeup_new` with additional `-e` options when needed.
+
+For integration with Babeltrace2, use an ftrace to CTF converter such as [bt2-ftrace-to-ctf](https://github.com/siemens/bt2-ftrace-to-ctf).
 
 ### Average BPF Struct Ops Latency
 
@@ -210,17 +211,15 @@ Run the workload, then stop the scheduler with Ctrl-C to write the JSON file. GE
 
 These timings cover sections such as CID selection, task and sub-scheduler dispatch, and pending-order updates. They can overlap, so their sums should not be added together to estimate total scheduler overhead. Measurement is already compiled into the scheduling logic; `-s` controls saving the results and does not require `-t` or the trace module. The maximum is an observed value, not a worst-case bound.
 
-To disable collection itself, build with `SCX_LATENCY_STATS=0`. This removes
-timing-stat timestamps and updates while retaining the shared data layout.
-The default remains 1. Use a fresh output directory so existing objects cannot
-retain flags from an earlier build:
+On systems using non-TSC clocksource, these stats might have significant overhead. To disable collection itself, clean and rebuild with `SCX_LATENCY_STATS=0`:
 
 ```sh
-make CLANG=clang-22 BUILD=build/no-latency-stats SCX_LATENCY_STATS=0
+make clean
+make SCX_LATENCY_STATS=0
 ```
 
-The experiment builder uses a new directory for every attempt and selects this
-setting automatically. `SCXTP_TRACING=0` separately compiles out custom trace
+The experiment builder selects this setting automatically.
+`SCXTP_TRACING=0` separately compiles out custom trace
 emissions; it does not control `bpf_printk()` or generic kernel events.
 
 ### Cyclictest
@@ -229,7 +228,7 @@ Cyclictest measures the delay between a timer's expected wakeup and the test thr
 
 To test JLFP/GEDF, run the measurement threads with `SCHED_EXT` inside the managed cgroup. These schedulers use `SCX_OPS_SWITCH_PARTIAL`, so threads using `SCHED_OTHER` or `SCHED_FIFO` do not exercise their scheduling policy. The [modified cyclictest](../cyclictest/modified_cyclictest.c) supports `--policy=ext`; the existing scripts in `cyclictest/` use it. Cyclictest reports microseconds by default, or nanoseconds with `-N`.
 
-Keep the workload, CPU affinity, and tracing settings consistent when comparing runs. See [cyclictest comparisons](../tester/README.md#cyclictest-comparisons) for the test harness commands.
+Keep the workload, CPU affinity, and tracing settings consistent when comparing runs. See [cyclictest diagnostics](../tester/README.md#cyclictest-diagnostics) for the test harness commands.
 
 ## File structure
 
