@@ -147,7 +147,7 @@ In addition to these flags, `scxtp_enabled` must be set to true when loading the
 
 `SCXTP_HOTPATH_TRACING`: Enabled hotpath events through `SCXTP_EMIT_HOTPATH`. These record task enqueue and execution transitions. These are intended to replace generic scheduling events so that the captured trace is smaller, with the tradeoff of not capturing external scheduling events.
 
-`SCXTP_OP_TRACING`: Enables sched_ext ops entry/exit events through `SCXTP_EMIT_OP` for ops defined by the BPF scheduler.
+`SCXTP_OP_TRACING`: Enables sched_ext ops entry/exit events through `SCXTP_EMIT_OP` for ops defined by the BPF scheduler. IDs align with SCX_OP_IDX.
 
 From `scheds/`, select event families through Make variables:
 

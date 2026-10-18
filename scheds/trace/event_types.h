@@ -81,26 +81,7 @@ struct scxtp_event_stopping {
   __u8 runnable;
 };
 
-// append new ids to preserve existing trace meanings
-enum scxtp_op {
-  SCXTP_OP_INIT = 1,
-  SCXTP_OP_EXIT,
-  SCXTP_OP_SELECT_CID,
-  SCXTP_OP_ENQUEUE,
-  SCXTP_OP_DISPATCH,
-  SCXTP_OP_RUNNING,
-  SCXTP_OP_STOPPING,
-  SCXTP_OP_UPDATE_IDLE,
-  SCXTP_OP_INIT_TASK,
-  SCXTP_OP_EXIT_TASK,
-  SCXTP_OP_SET_CMASK,
-  SCXTP_OP_CPUCTL_SET_WEIGHT,
-  SCXTP_OP_SUB_ATTACH,
-  SCXTP_OP_SUB_DETACH,
-  SCXTP_OP_TICK,
-  SCXTP_OP_YIELD,
-};
-
+// op uses the target kernel's SCX_OP_IDX numbering
 struct scxtp_event_op_entry {
   __u32 op;
 };
