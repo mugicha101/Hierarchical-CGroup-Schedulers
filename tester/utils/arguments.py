@@ -80,7 +80,7 @@ def parse_driver(description):
   check.add_argument("--traced", action="store_true")
   build = commands.add_parser("build", help="build isolated artifacts without attaching schedulers")
   build.add_argument("target", choices=("worker", "jlfp", "qmap", "simple", "cyclictest"))
-  build.add_argument("--trace", choices=("off", "events", "hotpath"), default="off")
+  build.add_argument("--trace", choices=("off", "events", "hotpath", "ops"), default="off")
   smoke = commands.add_parser("smoke", help="check lifecycle with an expired worker schedule")
   smoke.add_argument("scheduler", choices=("none", "jlfp", "qmap", "simple"))
   smoke.add_argument("--traced", action="store_true")
@@ -88,6 +88,9 @@ def parse_driver(description):
                      help="development check without housekeeping-slice validation")
   e1 = commands.add_parser("e1", help="run trace-free cyclictest E1 cases")
   add_e1_options(e1)
+  for experiment in ("e2", "e3", "e4"):
+    command = commands.add_parser(experiment, help=f"run traced overhead {experiment.upper()} cases")
+    add_operation_options(command, experiment)
   return parser.parse_args()
 
 
@@ -102,6 +105,20 @@ def parse_e1(description):
   parser = argparse.ArgumentParser(description=description)
   parser.add_argument("--config", type=Path, default=common.DEFAULT_CONFIG)
   add_e1_options(parser)
+  return parser.parse_args()
+
+
+def add_operation_options(parser, experiment):
+  from .overhead_config import SCHEDULERS
+  parser.add_argument("--scheduler", choices=SCHEDULERS[experiment], help="rerun one scheduler")
+  parser.add_argument("--stress", choices=("off", "on"), help="rerun one load condition; default: both")
+  parser.add_argument("--analyse-only", type=Path, metavar="SUITE_DIR")
+
+
+def parse_operation_experiment(experiment, description):
+  parser = argparse.ArgumentParser(description=description)
+  parser.add_argument("--config", type=Path, default=common.DEFAULT_CONFIG)
+  add_operation_options(parser, experiment)
   return parser.parse_args()
 
 

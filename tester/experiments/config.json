@@ -97,6 +97,29 @@
             }
           }
         }
+      },
+      "e2": {
+        "repetitions": 1
+      },
+      "e3": {
+        "repetitions": 1
+      },
+      "e4": {
+        "repetitions": 1
+      },
+      "operation_tracing": {
+        "class_events": {
+          "other": null,
+          "fifo": null,
+          "ext": null
+        },
+        "scx_kernel_events": {
+          "enter_event": "sched_ext:sched_ext_op_enter",
+          "exit_event": "sched_ext:sched_ext_op_exit",
+          "operations": {},
+          "scope": null,
+          "duration_field": "delta_ns"
+        }
       }
     },
     "diagnostics": {

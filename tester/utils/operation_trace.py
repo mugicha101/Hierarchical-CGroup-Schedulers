@@ -2,7 +2,7 @@
 
 import json
 
-LAYERS = ("class", "scx")
+LAYERS = ("class", "kernel", "scx")
 COMMON_FIELDS = {"phase", "timestamp_ns", "cpu", "context", "call_id"}
 ENTRY_FIELDS = {"layer", "operation", "parent_id", "rq_cpu"}
 
@@ -21,7 +21,7 @@ def text(value, name):
 
 def operation(value):
   if not isinstance(value, dict) or set(value) != {"layer", "operation"} or value["layer"] not in LAYERS:
-    raise ValueError("expected operation must contain layer (class/scx) and operation")
+    raise ValueError("expected operation must contain layer (class/kernel/scx) and operation")
   return value["layer"], text(value["operation"], "operation")
 
 
@@ -44,8 +44,8 @@ def validate_metadata(metadata):
   if not isinstance(operations, list):
     raise ValueError("expected_operations must be a list")
   expected = [operation(value) for value in operations]
-  if not any(layer == "class" for layer, _ in expected) or len(expected) != len(set(expected)):
-    raise ValueError("declare distinct expected operations, including at least one class operation")
+  if not any(layer in ("class", "kernel") for layer, _ in expected) or len(expected) != len(set(expected)):
+    raise ValueError("declare distinct expected operations, including at least one outer operation")
   loss = metadata["loss"]
   if not isinstance(loss, dict) or set(loss) != {"lost_records", "missed_probes"}:
     raise ValueError("loss must declare lost_records and missed_probes")
@@ -59,6 +59,9 @@ def validate_record(record, cpus, expected):
   if not isinstance(record, dict) or record.get("phase") not in ("enter", "exit"):
     raise ValueError("operation record phase must be enter or exit")
   keys = COMMON_FIELDS | ENTRY_FIELDS if record["phase"] == "enter" else COMMON_FIELDS
+  if record["phase"] == "exit" and "reported_duration_ns" in record:
+    keys = keys | {"reported_duration_ns"}
+    integer(record["reported_duration_ns"], "reported_duration_ns")
   if set(record) != keys:
     raise ValueError(f"{record['phase']} record must contain {sorted(keys)}")
   integer(record["timestamp_ns"], "timestamp_ns")

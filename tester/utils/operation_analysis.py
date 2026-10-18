@@ -32,7 +32,7 @@ class Statistics:
                **{name + "_ns": stats[name] for name in
                   ("min", "max", "mean", "median", "p99", "p999", "stddev")}}
         total = sum(value * count for value, count in histogram.items())
-        measured = self.has_callbacks and item["layer"] == "class"
+        measured = self.has_callbacks and item["layer"] in ("class", "kernel")
         row["observed_scx_union_ns"] = self.callback_time[key] if measured else None
         row["duration_weighted_scx_percent"] = 100 * self.callback_time[key] / total if measured and total else None
         yield row
@@ -63,6 +63,7 @@ def analyse(capture, output):
     statistics = Statistics(metadata)
     latency_stats.summarize({}, **metadata["statistics"])
     report["metadata"] = metadata
+    report["timing"] = metadata.get("timing", report["timing"])
     report["scx_instrumented"] = statistics.has_callbacks
     with partial.open("x") as calls:
       for record in operation_trace.read_records(source, metadata, expected):

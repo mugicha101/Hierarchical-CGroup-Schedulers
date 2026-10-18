@@ -9,10 +9,10 @@ from . import deadline as deadline_support
 from . import common, cyclictest, e1_config, e1_measurement, e1_results, e1_workloads, lifecycle
 
 
-def scheduler_manifest(manifest, settings, scheduler):
+def scheduler_manifest(manifest, settings, scheduler, *, trace="off"):
   manifest = deepcopy(manifest)
-  if manifest["trace_profile"] != "off":
-    raise ValueError("E1 requires a trace-free scheduler build")
+  if manifest["trace_profile"] != trace:
+    raise ValueError(f"scheduler requires the {trace} trace profile")
   group = settings["policies"][scheduler]
   if scheduler == "jlfp":
     manifest["launch_args"] += ["--slice-length", str(group["slice_ns"]),

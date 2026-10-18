@@ -1,5 +1,11 @@
 # Scheduler Tests
 
+## AI Disclosure
+
+OpenAI Codex Sol 6.1 was used to implement experiment scripts with human supervision.
+
+## Overview
+
 Run all commands below from the repository root (`cgs/`).
 
 Experiment entry points live in `tester/experiments/`; shared implementation lives
@@ -21,7 +27,10 @@ tester/experiments/
   overhead/
     run_e1.py                 trace-free cyclictest E1 matrix
     analyse_e1.py             standalone raw-histogram statistics
-    plan.py                   implemented E1 and upcoming E2–E4
+    run_e2.py                 class-operation trace matrix
+    run_e3.py                 JLFP callback attribution, pinned workers
+    run_e4.py                 JLFP callback attribution, migratable workers
+    plan.py                   measurement definitions and pending prerequisites
 ```
 
 The JLFP and MC² runners delegate worker capture, cgroup placement and offline
@@ -38,7 +47,9 @@ the shared CLI wrapper handles termination signals.
 
 The overhead/inversion experiment driver and its configuration live in
 `tester/experiments/`, with build, preflight, lifecycle and tracing helpers in
-`tester/utils/`. Overhead E1 is implemented; E2–E4 remain pending.
+`tester/utils/`. E1 is implemented and E2–E4 runners are drafts; live target
+validation remains pending. E2–E4 also require confirmed target-kernel tracepoint
+bindings below.
 These commands inspect prerequisites or build private artifacts:
 
 ```sh
@@ -69,7 +80,7 @@ not count guest time twice. It retains raw counters; stress-ng's per-worker load
 option must not be treated as proof that the aggregate target was achieved.
 Final duration defaults to 60 seconds; other durations are marked development.
 E1 DEADLINE cases require explicit reservations and temporary CPU partitions
-(described below). E2's EXT variants are qmap/JLFP; E2 awaits kernel tracepoints.
+(described below). E2's EXT variants are qmap/JLFP; DEADLINE remains outside E2–E4.
 
 Each command's artifacts go to a new `tester/build/experiments/` directory.
 Build attempts retain commands, logs, source/binary hashes and failures, with a
@@ -80,7 +91,10 @@ cgroup, or launching from the controller cgroup itself. A runner invoked through
 sudo delegates compilation to the original user. JLFP/GEDF builds disable timing
 statistics and custom trace emissions
 by default; `build jlfp --trace events` or `--trace hotpath` selects a separate
-tracing build. Qmap/simple's operational counters are left alone.
+tracing build. `build jlfp --trace ops` enables only the custom operation-event
+family, with low-frequency/hotpath events and latency statistics compiled out.
+JLFP/GEDF callbacks emit operation entry/exit events when tracing is enabled.
+Qmap/simple's operational counters are left alone.
 All BPF scheduler builds use `clang-22`, including preflight's compiler check;
 build manifests retain the compiler path/version. Clang 21.1.8 can omit arena
 pointer casts after combining adjacent stores into a memory intrinsic.
@@ -337,9 +351,8 @@ This writes `e1-results.json` beside the raw JSON and labels the report analysis
 only: a valid histogram does not by itself validate an experimental trial.
 Live FIFO/RR/EXT E1 validation is still pending on the prepared target machine.
 
-The read-only `overhead/plan.py` also describes upcoming E2–E4. Their remaining
-methodology and tracing prerequisites must be resolved before implementation.
-The existing `diagnostics/` scripts remain separate from these experiments.
+The read-only `overhead/plan.py` describes each experiment and pending target
+prerequisites. The `diagnostics/` scripts remain separate from these experiments.
 
 ## Manual Noise Isolation
 
@@ -466,8 +479,90 @@ runs record native scheduler/timer/IRQ/workqueue events and timestamped spikes i
 use nanoseconds. These legacy latency runs always record an exit event and are
 separate from overhead E1.
 
-E2/E3 capture runners remain pending validated operation entry/exit instrumentation.
-E4 also awaits its additional instrumentation requirements.
+## Overhead E2–E4
+
+```sh
+sudo python3 tester/experiments/overhead/run_e2.py --config tester/experiments/debug.json
+sudo python3 tester/experiments/overhead/run_e3.py --config tester/experiments/debug.json
+sudo python3 tester/experiments/overhead/run_e4.py --config tester/experiments/debug.json
+python3 tester/experiments/overhead/run_e3.py --analyse-only SUITE_DIR
+```
+
+The shared driver also accepts `e2`, `e3` and `e4`. Use `--scheduler` or
+`--stress off|on` for a partial rerun. Configuration controls duration, repetition,
+workload and tracing; no extra recurring command-line parameters are needed.
+These draft runners have local fixture validation only. E2–E4 are incomplete:
+kernel bindings, live target validation and tick emission-cost calibration remain
+pending. Function-probe capture is not implemented.
+
+E2 runs OTHER/FIFO/qmap/JLFP, each without stress-ng and with the configured 95%
+aggregate workload-CPU utilization target. EXT scheduler builds have all custom
+tracing and latency statistics disabled. Native cases require EXT detached.
+E3 runs JLFP with only `SCXTP_OP_TRACING=1`; E4 uses that same build and workload
+with migratable workers. Both record kernel operation events and JLFP entry/exit
+events. The matching scxtp module must already be installed and loaded externally.
+No runner patches the kernel or loads a module.
+
+All three reuse the cyclictest timing, histogram, QoS, stress-ng and policy
+settings under `overhead.e1`, keeping their workload comparable to E1. Their
+`e2`/`e3`/`e4` config sections control repetitions. E2/E3 pin cyclictest to CPU 9
+and create one stress-ng group per workload CPU. E4 keeps one cyclictest thread
+and the same total stress worker count, with every worker allowed throughout the
+existing workload cgroup's effective CPUs 8–15. Permitting migration does not
+force the scheduler to migrate tasks. The existing controller cgroup supplies
+housekeeping placement. No cpuset/isolation setup is performed.
+
+Before running, fill `overhead.operation_tracing`. `class_events` has separate
+OTHER/FIFO/EXT bindings; qmap and JLFP share the EXT class binding.
+`scx_kernel_events` contains the supplied
+`sched_ext:sched_ext_op_enter` / `sched_ext:sched_ext_op_exit` names and
+`duration_field: "delta_ns"`. Its numeric ID mapping and scope intentionally
+remain unset until the target patch is confirmed. Both the kernel and custom
+SCX callback events now use `SCX_OP_IDX` values. Decode them using the target's
+exact `struct sched_ext_ops` layout and canonical member names, not the old
+custom enum. Retain that mapping or BTF with each capture.
+A complete binding has this shape (the IDs below are placeholders):
+
+```json
+{
+  "enter_event": "sched_ext:sched_ext_op_enter",
+  "exit_event": "sched_ext:sched_ext_op_exit",
+  "operations": {"123": "confirmed_operation_name"},
+  "scope": "scx_dispatch",
+  "duration_field": "delta_ns"
+}
+```
+
+Use `scope: "sched_class"` only for events placed around actual sched_class
+methods; E2 requires that scope. `scx_dispatch` represents the kernel's callback
+invocation wrapper and is reported as layer `kernel`, not as a class method.
+These two event names/payloads alone do not establish native class coverage.
+Set `duration_field` to null only when the verified events provide boundary
+measurements without an explicit duration. Unknown IDs, missing bindings or event
+fields fail instead of being guessed. Event format text, kernel version, commands,
+build flags, source/binary hashes, placement, policies and achieved utilization
+are retained alongside each suite.
+
+Recording starts before scheduler/workload startup and ends after their cleanup.
+Conversion selects root calls entered between cyclictest gate release and observed
+process exit, keeping all recorded descendants and their complete exits even
+when they finish after that interval. It reports leading/trailing unselected
+boundary records. A selected incomplete call, CPU migration during a call,
+unknown context encoding, NMI operation, lost event or bad nesting invalidates the
+attempt. Offline analysis filters to execution CPUs 8–15; the raw trace retains
+all recorded CPUs. Interrupt handler events and ftrace interrupt-context flags
+separate interrupted contexts. Durations remain inclusive of interrupt and
+preemption time. Elapsed boundary durations are preserved alongside the kernel's
+`delta_ns`, which supplies outer-operation latency when present. No tracing-cost
+subtraction or percentage clamping is performed.
+
+Each accepted attempt retains `trace.dat`, frozen loss metadata, cyclictest output,
+`operations.jsonl`, conversion diagnostics and exact paired-call samples.
+`results.csv`/`results.json` contain pooled/per-CPU operation statistics and E3/E4
+callback duration fractions, accepted attempt number and failure count. Replay
+checks input hashes and recomputes normalized statistics without requiring root
+or live cgroups. Failed attempts remain available; cleanup failure stops retries.
+Reports explicitly retain `experiment_validated: false` pending target review.
 
 ## Operation trace utilities for E2/E3
 
@@ -485,5 +580,6 @@ refused, and incomplete input produces retained diagnostics with an invalid resu
 
 See [the input format and output definitions](experiments/overhead/TRACE_FORMAT.md)
 for call IDs, interrupt-context handling, loss counters and callback percentages.
-A live entry/exit producer or tracepoint adapter still needs implementing; these
-utilities do not start E2/E3 or establish scientific validity.
+The E2–E4 runners use `utils/operation_convert.py` to produce this format from
+verified tracepoint bindings. Standalone analysis does not start experiments or
+establish scientific validity.

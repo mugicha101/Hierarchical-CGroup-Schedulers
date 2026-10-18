@@ -156,8 +156,9 @@ def build(config, target, trace="off"):
     elif target == "jlfp":
       metadata.update(partial_switch=True, launch_args=[])
       output = directory / "scheds"
-      flags = {"SCXTP_TRACING": int(trace != "off"),
-               "SCXTP_HOTPATH_TRACING": int(trace == "hotpath"), "SCX_LATENCY_STATS": 0}
+      flags = {"SCXTP_LOWFREQ_TRACING": int(trace in ("events", "hotpath")),
+               "SCXTP_HOTPATH_TRACING": int(trace == "hotpath"),
+               "SCXTP_OP_TRACING": int(trace == "ops"), "SCX_LATENCY_STATS": 0}
       metadata["flags"] = flags
       watched = list((REPO / "scheds").glob("*.h")) + list((REPO / "scheds").glob("*.c"))
       watched += list((REPO / "scheds/trace").glob("*.h")) + [REPO / "scheds/Makefile"]

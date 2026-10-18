@@ -3,7 +3,7 @@
 import ctypes
 import math
 
-from . import e1_config, mc2_workload
+from . import e1_config, mc2_workload, overhead_config
 
 
 def number(settings, key, *, minimum=0, inclusive=False, integer=False):
@@ -46,13 +46,15 @@ def validate_inversion(settings):
 
 
 def validate_overhead(settings):
-  require_keys(settings, {"cyclictest_cpu", "stress_utilization_percent", "e1"}, "experiments.overhead")
+  require_keys(settings, {"cyclictest_cpu", "stress_utilization_percent", "e1", "e2", "e3", "e4",
+                          "operation_tracing"}, "experiments.overhead")
   if type(settings["cyclictest_cpu"]) is not int or settings["cyclictest_cpu"] != 9:
     raise ValueError("overhead E1 requires logical CPU 9")
   value = number(settings, "stress_utilization_percent", inclusive=True)
   if value > 100:
     raise ValueError("overhead.stress_utilization_percent must be between 0 and 100")
   e1_config.validate(settings["e1"])
+  overhead_config.validate(settings)
 
 
 def validate_diagnostics(settings):

@@ -1,10 +1,10 @@
 # Operation trace analysis utilities
 
-These utilities prepare the offline analysis needed by E2/E3. They do not run
-experiments, attach probes, configure tracing or patch the kernel. A live
-fentry/fexit collector or kernel-tracepoint adapter still needs implementing and
-validation. Existing `sched_switch`/wakeup events cannot be converted into
-operation durations.
+These utilities provide the offline analysis used by E2–E4. The standalone
+commands do not run experiments or change tracing. The experiment runners use
+`tester/utils/operation_convert.py` to adapt verified target-kernel tracepoint
+bindings. Target validation remains pending. Existing `sched_switch`/wakeup
+events cannot be converted into operation durations.
 
 ```sh
 python3 tester/utils/inspect_trace.py TRACE.dat --output NEW_INVENTORY.json
@@ -71,9 +71,14 @@ The producer must meet these conditions:
 - Records arrive in timestamp order **within each CPU**, with correct entry/exit
   order for ties. Global ordering between CPUs is unnecessary. Calls spanning
   CPUs are unsupported and fail pairing; do not silently move their records.
-- Both boundaries must be retained. Calls cut by capture start/stop are errors;
-  a future collector needs a consistent gating/draining strategy. The analyser
-  does not discard boundary calls, repair nesting, reorder records or clip times.
+- Both boundaries of every selected call must be retained. Calls cut by capture
+  start/stop are errors. The analyser does not repair nesting, reorder records or
+  clip times. The tracepoint adapter records before/after the workload interval,
+  selects root calls whose entry falls within it, and retains complete descendants
+  and exits after the interval. Leading exits before the interval and unselected
+  calls outside it are counted in conversion diagnostics. This selection is
+  explicit; unmatched exits at/after the interval start and selected missing exits
+  fail conversion.
 - `complete`, `record_count` and loss counters must come from the finalized
   producer. `lost_records` covers transport/output loss; `missed_probes` covers
   missed instrumentation, including recursion skips. Unknown counters must not
@@ -82,18 +87,43 @@ The producer must meet these conditions:
   operations produce zero-sample rows. Omit SCX entries for an E2-only capture;
   uninstrumented callbacks are not reported as costing zero time.
 
-The future adapter must derive these fields from its actual instrumentation.
-This document does not prescribe kernel tracepoint names or claim existing
-tracepoint/fentry records already contain call IDs or parent IDs.
+The adapter derives call IDs and parent IDs from each execution CPU/context's
+observed tracepoint stack. Context includes current PID, hard/soft IRQ flags and
+recorded IRQ-handler nesting. The existing ftrace plugin exposes libtraceevent's
+`latency` field instead of raw `common_flags`; its IRQ column is decoded using the
+[kernel's documented format](https://www.kernel.org/doc/html/latest/trace/ftrace.html).
+Unknown encodings and NMI operations fail. Handler markers do not expose every
+possible nested interrupt boundary outside handlers; target validation must check
+that the instrumented operations have sufficient context coverage. Calls that
+migrate between CPUs are unsupported. `rq_cpu` remains null with the supplied
+payloads; execution CPU is never substituted for an unknown runqueue CPU.
+
+`class` denotes actual sched_class methods. A separate `kernel` outer layer
+represents verified kernel sched_ext callback wrappers. Both can contain `scx`
+intervals, but a wrapper is never silently reported as a class-method measurement.
+The kernel binding must declare its scope and numeric operation mapping. Kernel
+callback and custom SCX events use the same target-specific `SCX_OP_IDX` IDs and
+canonical `struct sched_ext_ops` member names. Historical custom events from
+before this change used a separate enum and require their original mapping.
+E2 requires class scope.
+
+Exit records may additionally contain `reported_duration_ns`, copied from the
+configured kernel exit field (normally `delta_ns`). When present, this supplies
+`duration_ns` in paired samples and latency statistics. The timestamp difference
+is retained separately as `boundary_duration_ns`. Both values remain available;
+no equality or clock-placement assumption is made about them. Custom SCX calls
+continue to use their timestamp boundaries.
 
 ## Outputs and definitions
 
-`paired-calls.jsonl` retains each completed class/SCX call, both timestamps,
+`paired-calls.jsonl` retains each completed class/kernel/SCX call, both timestamps,
 context, parent, CPUs and exact integer duration. Class calls additionally record
 the count, duration sum and duration union of **recorded descendant SCX calls in
 the same execution context**, when SCX instrumentation is declared. Nested SCX
 calls overlap: their sum can exceed their union. The per-call percentage uses
-`100 * union / class_duration`; a zero class duration gives `null`.
+`100 * union / outer_duration`; a zero duration gives `null`. When kernel-reported
+and boundary durations differ, the fraction uses the reported outer duration;
+values above 100% are retained for inspection, never clamped or corrected.
 
 Interrupted contexts have separate stacks. Their independent callback records
 are not assigned to an interrupted task's class call merely because times overlap.
@@ -122,7 +152,7 @@ cost is subtracted. Tracing-cost calibration, exclusive execution time and
 scientific interpretation remain separate work.
 
 Invalid metadata, loss, count mismatches, malformed records, backwards CPU times,
-bad nesting, missing boundaries or zero complete class calls fail analysis with a
+bad nesting, missing boundaries or zero complete outer calls fail analysis with a
 nonzero exit status. Raw inputs are untouched. Diagnostics and any
 `paired-calls.partial.jsonl` are retained; failed analyses have `valid: false`.
 Input hashes are recorded and checked again after processing. A successful report

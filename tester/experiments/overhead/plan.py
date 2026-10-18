@@ -1,9 +1,9 @@
-"""Describe overhead experiments and distinguish analysis from pending captures."""
+"""Describe overhead measurements and the target validation still required."""
 
 
 def plan(settings):
   return {
-      "status": "E1 implemented; E2-E4 pending methodology and tracing prerequisites",
+      "status": "E1 implemented; E2-E4 draft runners; target validation pending",
       "settings": settings,
       "e1": {
           "measurement": "end-to-end cyclictest scheduling latency",
@@ -15,16 +15,22 @@ def plan(settings):
       "e2": {
           "measurement": "scheduling class operation latency",
           "schedulers": ["other", "fifo", "qmap", "jlfp"],
-          "status": "capture deferred; offline operation analysis utilities implemented",
+          "placement": "cyclictest on CPU 9; stress-ng pinned per workload CPU",
+          "status": "draft; confirmed class tracepoint bindings and target validation pending",
       },
       "e3": {
-          "measurement": "JLFP callback versus class operation latency",
+          "measurement": "JLFP callback versus enclosing kernel operation latency",
           "schedulers": ["jlfp"],
-          "status": "capture pending; offline nested callback analysis utilities implemented",
+          "placement": "same pinned workload as E2",
+          "status": "draft; kernel op IDs/scope and target validation pending",
+          "tick_emission_calibration": "pending by request; no cost subtraction",
       },
       "e4": {
           "measurement": "JLFP operation latency with migratable workers",
           "schedulers": ["jlfp"],
+          "placement": "cyclictest and stress-ng may migrate throughout workload cpuset",
+          "status": "draft; kernel op IDs/scope and target validation pending",
+          "tick_emission_calibration": "pending by request; no cost subtraction",
       },
-      "deadline_placement": "temporary single-CPU partitions below the existing workload cgroup",
+      "deadline_placement": "E1 only; temporary single-CPU partitions below the existing workload cgroup",
   }

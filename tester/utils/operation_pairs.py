@@ -45,30 +45,37 @@ class Pairing:
     if not stack or stack[-1].entry["call_id"] != record["call_id"]:
       raise ValueError(f"unmatched or out-of-order exit on CPU {cpu}, context {context}, call {record['call_id']}")
     call = stack.pop()
-    duration = timestamp - call.entry["timestamp_ns"]
+    boundary_duration = timestamp - call.entry["timestamp_ns"]
+    duration = record.get("reported_duration_ns", boundary_duration)
     result = {**call.entry, "end_ns": timestamp, "duration_ns": duration}
+    if "reported_duration_ns" in record:
+      result.update(boundary_duration_ns=boundary_duration, reported_duration_ns=duration)
     result.pop("phase")
     if call.entry["layer"] == "scx":
-      parents = [frame for frame in stack if frame.entry["layer"] == "class"]
+      parents = [frame for frame in stack if frame.entry["layer"] in ("class", "kernel")]
       for parent in parents:
         parent.callbacks.append((call.entry["timestamp_ns"], timestamp))
-      result["class_call_id"] = parents[-1].entry["call_id"] if parents else None
+      result["class_call_id"] = (parents[-1].entry["call_id"]
+                                 if parents and parents[-1].entry["layer"] == "class" else None)
+      result["kernel_call_id"] = (parents[-1].entry["call_id"]
+                                  if parents and parents[-1].entry["layer"] == "kernel" else None)
+      result["outer_layer"] = parents[-1].entry["layer"] if parents else None
       self.counts["scx_without_class"] += not parents
     else:
       union = union_duration(call.callbacks)
       result.update(observed_scx_calls=len(call.callbacks),
                     observed_scx_sum_ns=sum(end - start for start, end in call.callbacks),
                     observed_scx_union_ns=union, observed_scx_percent=100 * union / duration if duration else None)
-      self.counts["class_calls"] += 1
-      self.counts["class_without_observed_scx"] += not call.callbacks
+      self.counts[call.entry["layer"] + "_calls"] += 1
+      self.counts[call.entry["layer"] + "_without_observed_scx"] += not call.callbacks
     self.counts["paired_calls"] += 1
     return result
 
   def finish(self):
     if self.open_calls():
       raise ValueError("capture ended with unmatched operation entries")
-    if not self.counts["class_calls"]:
-      raise ValueError("no complete scheduling-class operation calls were captured")
+    if not self.counts["class_calls"] + self.counts["kernel_calls"]:
+      raise ValueError("no complete outer operation calls were captured")
 
   def open_calls(self):
     return [frame.entry for stack in self.stacks.values() for frame in stack]

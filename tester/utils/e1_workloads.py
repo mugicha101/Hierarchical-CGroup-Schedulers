@@ -11,7 +11,7 @@ from . import common, cyclictest, e1_config, lifecycle
 from .launch import set_weight
 
 
-def cyclic_command(binary, directory, config, scheduler):
+def cyclic_command(binary, directory, config, scheduler, *, migratable=False):
   overhead = config["experiments"]["overhead"]
   settings = overhead["e1"]
   primary = e1_config.policy(settings, scheduler, "cyclictest")
@@ -20,7 +20,7 @@ def cyclic_command(binary, directory, config, scheduler):
       output=directory,
       cpus={overhead["cyclictest_cpu"]},
       main_cpus=common.cgroup_cpus(common.workload_cgroup(config)),
-      mode="pinned",
+      mode="migratable" if migratable else "pinned",
       threads=1,
       duration=int(config["duration_s"]),
       interval_us=settings["interval_us"],
@@ -34,7 +34,8 @@ def cyclic_command(binary, directory, config, scheduler):
           f"CGS_E1_GATE={directory / 'cyclictest.gate'}", *command]
 
 
-def wait_cyclic(session, job, directory, cpu, primary, timer_slack_ns, *, reservation=None):
+def wait_cyclic(session, job, directory, cpu, primary, timer_slack_ns, *, reservation=None,
+                migratable=False):
   deadline = time.monotonic() + session.timeout
   ready = directory / "cyclictest.ready"
   while time.monotonic() < deadline:
@@ -48,7 +49,8 @@ def wait_cyclic(session, job, directory, cpu, primary, timer_slack_ns, *, reserv
         raise RuntimeError("cyclictest must have one main thread and one measurement thread")
       if primary["weight"] is not None:
         set_weight(primary["weight"], tid=tid)
-      settings = {**primary, "cpus": [cpu]}
+      cpus = common.cgroup_cpus(session.cgroup) if migratable else {cpu}
+      settings = {**primary, "cpus": sorted(cpus)}
       lifecycle.verify_state({**state, "tasks": {tid: state["tasks"][tid]}}, settings, session.cgroup)
       main = state["tasks"][job.process.pid]
       if main != {"policy": os.SCHED_OTHER, "priority": 0, "nice": primary["nice"],
@@ -97,12 +99,14 @@ def open_gate(session, directory):
 
 
 class Stress:
-  def __init__(self, session, directory, config, scheduler, binary, *, partitions=None):
+  def __init__(self, session, directory, config, scheduler, binary, *, partitions=None,
+               migratable=False):
     self.session, self.directory = session, directory
     self.settings = config["experiments"]["overhead"]["e1"]["stress"]
     self.target = config["experiments"]["overhead"]["stress_utilization_percent"]
     self.policy = e1_config.policy(config["experiments"]["overhead"]["e1"], scheduler, "stress")
     self.partitions = partitions
+    self.migratable = migratable
     self.resources = ExitStack()
     self.reservation = (config["experiments"]["overhead"]["e1"]["policies"]["deadline"]["stress"]
                         if scheduler == "deadline" else None)
@@ -114,24 +118,27 @@ class Stress:
     timeout = int(config["duration_s"] + config["warmup_s"] + 4 * session.timeout + 1)
     try:
       cpus = partitions.cpus if partitions is not None else common.cgroup_cpus(session.cgroup)
-      for cpu in sorted(cpus):
-        command = [binary, "--cpu", str(count), f"--cpu-load={load}",
+      placements = [set(cpus)] if migratable else [{cpu} for cpu in sorted(cpus)]
+      for placement in placements:
+        workers = count * len(placement)
+        command = [binary, "--cpu", str(workers), f"--cpu-load={load}",
                    f"--cpu-method={self.settings['cpu_method']}",
                    f"--cpu-load-slice={self.settings['busy_slice_ms']}",
-                   f"--taskset={cpu}", f"--timeout={timeout}s", "--metrics-brief",
+                   f"--taskset={cyclictest.cpu_list(placement)}", f"--timeout={timeout}s", "--metrics-brief",
                    f"--sched={self.policy['policy']}"]
         if self.policy["policy"] in ("fifo", "rr"):
           command.append(f"--sched-prio={self.policy['priority']}")
         owner = session
         launch_policy = self.policy
         if self.reservation is not None:
+          cpu, = placement
           command.extend(deadline_support.options(self.reservation, cyclictest=False))
           child = directory / f"stress-cpu{cpu}"
           child.mkdir()
           owner = self.resources.enter_context(lifecycle.Session(partitions.config_for(cpu), child))
           launch_policy = {"policy": "other", "priority": 0, "nice": 0}
-        job = owner.start_workload(command, {cpu}, **launch_policy)
-        self.jobs.append((job, cpu))
+        job = owner.start_workload(command, placement, **launch_policy)
+        self.jobs.append((job, placement))
         job.release()
     except BaseException:
       self.close()
@@ -146,7 +153,7 @@ class Stress:
     groups = group_members({job.process.pid for job, _ in self.jobs})
     snapshots = []
     ready = True
-    for job, cpu in self.jobs:
+    for job, cpus in self.jobs:
       if job.process.poll() is not None:
         raise RuntimeError(f"stress-ng exited before cyclictest completed; see {job.log}")
       workers = 0
@@ -172,12 +179,12 @@ class Stress:
               if tid not in self.weighted:
                 set_weight(self.policy["weight"], tid=tid)
                 self.weighted.add(tid)
-          lifecycle.verify_state(state, {**expected, "cpus": [cpu]}, job.session.cgroup)
+          lifecycle.verify_state(state, {**expected, "cpus": sorted(cpus)}, job.session.cgroup)
           snapshots.append({**state, "comm": name, "task_weight": self.policy["weight"],
                             "reservation": reservation})
         except (FileNotFoundError, ProcessLookupError):
           continue
-      if workers != self.settings["workers_per_cpu"]:
+      if workers != self.settings["workers_per_cpu"] * len(cpus):
         ready = False
     if not ready and not starting:
       raise RuntimeError("stress-ng worker count changed during measurement")

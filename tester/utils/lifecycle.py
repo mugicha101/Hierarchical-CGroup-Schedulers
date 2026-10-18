@@ -186,7 +186,10 @@ class Session:
         args = [manifest["binary"], *manifest["launch_args"]]
         custom = any(e.startswith("scxtp:") for e in self.recording.events)
         if custom:
-          if target != "jlfp" or not manifest.get("flags", {}).get("SCXTP_TRACING"):
+          flags = manifest.get("flags", {})
+          compiled = flags.get("SCXTP_TRACING", any(flags.get(name) for name in
+                               ("SCXTP_LOWFREQ_TRACING", "SCXTP_HOTPATH_TRACING", "SCXTP_OP_TRACING")))
+          if target != "jlfp" or not compiled:
             raise ValueError("custom emissions require a tracing-enabled JLFP build")
           args.append("--trace")
         self.root_process = self.schedulers.start(args)

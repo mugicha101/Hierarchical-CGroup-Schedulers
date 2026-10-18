@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prepare experiments, check their lifecycle, or run overhead E1."""
+"""Prepare experiments, check their lifecycle, or run overhead E1-E4."""
 
 import json
 from pathlib import Path
@@ -9,7 +9,7 @@ if not __package__:
   sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from tester.experiments import smoke
 from tester.experiments.overhead.plan import plan as overhead_plan
-from tester.utils import arguments, builds, common, e1, preflight
+from tester.utils import arguments, builds, common, e1, overhead, preflight
 
 
 def plan(config):
@@ -58,6 +58,9 @@ def main():
       builds.build(config, target=args.target, trace=args.trace)
     elif args.command == "e1":
       e1.run(config, scheduler=args.scheduler, stress=args.stress, analyse_only=args.analyse_only)
+    elif args.command in ("e2", "e3", "e4"):
+      overhead.run(config, args.command, scheduler=args.scheduler, stress=args.stress,
+                   analyse_only=args.analyse_only)
     else:
       smoke.run(config, scheduler=args.scheduler, traced=args.traced, basic=args.basic)
     return 0
