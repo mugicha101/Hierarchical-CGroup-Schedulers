@@ -9,6 +9,7 @@
 #ifdef __BPF__
 
 #include <bpf/bpf_helpers.h>
+#include <bpf/bpf_core_read.h>
 
 #ifndef SCXTP_LOWFREQ_TRACING
 #define SCXTP_LOWFREQ_TRACING 0
@@ -77,11 +78,15 @@ do { \
 #define SCXTP_EMIT_OP(NAME, SCHED_CGRP_ID, ...) do {} while (0)
 #endif
 
+// match the target kernel's SCX_OP_IDX after CO-RE relocation
+#define SCXTP_OP_IDX(OP) \
+  (bpf_core_field_offset(struct sched_ext_ops, OP) / sizeof(void (*)(void)))
+
 #define SCXTP_EMIT_OP_ENTRY(OP, SCHED_CGRP_ID) \
-  SCXTP_EMIT_OP(op_entry, SCHED_CGRP_ID, e->op = (OP);)
+  SCXTP_EMIT_OP(op_entry, SCHED_CGRP_ID, e->op = SCXTP_OP_IDX(OP);)
 
 #define SCXTP_EMIT_OP_EXIT(OP, SCHED_CGRP_ID) \
-  SCXTP_EMIT_OP(op_exit, SCHED_CGRP_ID, e->op = (OP);)
+  SCXTP_EMIT_OP(op_exit, SCHED_CGRP_ID, e->op = SCXTP_OP_IDX(OP);)
 
 #else
 
