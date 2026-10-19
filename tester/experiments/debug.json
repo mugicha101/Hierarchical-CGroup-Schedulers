@@ -219,6 +219,49 @@
         }
       }
     },
+    "containers": {
+      "e5": {
+        "repetitions": 1,
+        "shards": 2,
+        "connections_per_shard": 8,
+        "queue_capacity": 512,
+        "records": 10000,
+        "payload_bytes": 256,
+        "response_bytes": 1024,
+        "request_timeout_s": 2,
+        "images": {
+          "nginx": "nginx@sha256:a8b39bd9cf0f83869a2162827a0caf6137ddf759d50a171451b335cecc87d236",
+          "redis": "redis@sha256:3811787313eba226a2ef38658c6ccb91cd5e110edc89c37767de373120a0e5a0",
+          "postgres": "postgres@sha256:77f585114c32fbca283dc835b0596f4e52b51b4c6662d7810b2f4084f60a1873",
+          "mongo": "mongo@sha256:4a4ab5d4834207389e0d7270fac988e21ffedccecba77991a552f755df229907"
+        },
+        "memory_mb": {
+          "nginx": 128,
+          "redis": 256,
+          "postgres": 512,
+          "mongo": 768
+        },
+        "profiles": {
+          "redis": {
+            "nginx_rps": 5176,
+            "database_rps": 3435
+          },
+          "postgres": {
+            "nginx_rps": 8000,
+            "database_rps": 4146
+          },
+          "mongo": {
+            "nginx_rps": 5535,
+            "database_rps": 1936
+          }
+        },
+        "screening": {
+          "minimum_completion_percent": 99.5,
+          "max_combined_cpu_percent": 80,
+          "max_cpu_busy_percent": 95
+        }
+      }
+    },
     "diagnostics": {
       "wakeup": {
         "workers": 1,

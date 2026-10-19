@@ -91,6 +91,8 @@ def parse_driver(description):
   for experiment in ("e2", "e3", "e4"):
     command = commands.add_parser(experiment, help=f"run traced overhead {experiment.upper()} cases")
     add_operation_options(command, experiment)
+  command = commands.add_parser("e5", help="run the native container capacity baseline")
+  add_e5_options(command)
   return parser.parse_args()
 
 
@@ -105,6 +107,18 @@ def parse_e1(description):
   parser = argparse.ArgumentParser(description=description)
   parser.add_argument("--config", type=Path, default=common.DEFAULT_CONFIG)
   add_e1_options(parser)
+  return parser.parse_args()
+
+
+def add_e5_options(parser):
+  parser.add_argument("--database", choices=("redis", "postgres", "mongo"), help="rerun one container pair")
+  parser.add_argument("--analyse-only", type=Path, metavar="SUITE_DIR")
+
+
+def parse_e5(description):
+  parser = argparse.ArgumentParser(description=description)
+  parser.add_argument("--config", type=Path, default=common.DEFAULT_CONFIG)
+  add_e5_options(parser)
   return parser.parse_args()
 
 

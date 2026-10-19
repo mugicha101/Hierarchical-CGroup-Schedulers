@@ -583,3 +583,12 @@ The E2–E4 runners use `utils/bpftrace_convert.py` to produce this format from
 individual function/callback boundaries. The older `operation_convert.py` adapter
 remains available for historical tracepoint captures. Standalone analysis does not
 start experiments or establish scientific validity.
+
+## Container E5 capacity baseline
+
+`experiments/containers/run_e5.py` and the shared driver's `e5` command run the
+native one-CPU Nginx/database capacity checks. Configuration is under
+`experiments.containers.e5`, with the shared duration and existing workload/
+controller cgroups. E5's RM/FIFO/JLFP policy hierarchy and overhead attribution
+remain pending. See [setup, execution and replay](experiments/containers/README.md)
+and [the original sizing results](experiments/containers/WORKLOAD_SIZING.md).

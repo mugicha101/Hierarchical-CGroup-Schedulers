@@ -1,0 +1,4 @@
+aiohttp==3.14.5
+psycopg[binary]==3.3.6
+pymongo==4.19.0
+redis==8.1.0

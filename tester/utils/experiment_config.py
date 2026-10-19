@@ -3,7 +3,7 @@
 import ctypes
 import math
 
-from . import e1_config, mc2_workload, overhead_config
+from . import e1_config, e5_config, mc2_workload, overhead_config
 
 
 def number(settings, key, *, minimum=0, inclusive=False, integer=False):
@@ -20,10 +20,16 @@ def require_keys(settings, keys, name):
 
 
 def validate(settings):
-  require_keys(settings, {"inversion", "overhead", "diagnostics"}, "experiments")
+  keys = {"inversion", "overhead", "diagnostics"}
+  if isinstance(settings, dict) and "containers" in settings:
+    keys.add("containers")
+  require_keys(settings, keys, "experiments")
   validate_inversion(settings["inversion"])
   validate_overhead(settings["overhead"])
   validate_diagnostics(settings["diagnostics"])
+  if "containers" in settings:
+    require_keys(settings["containers"], {"e5"}, "experiments.containers")
+    e5_config.validate(settings["containers"]["e5"])
 
 
 def validate_inversion(settings):
