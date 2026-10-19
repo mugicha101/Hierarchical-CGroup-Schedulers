@@ -12,11 +12,12 @@ import signal
 import subprocess
 import sys
 
+from . import build_jlfp_cyclictest as cyclictest_builder
 from .common import (BPF_CLANG, REPO, CleanupError, controller_placement, new_run,
                      repository_state, run_attempts, sha256, write_json)
 
-RT_TESTS_URL = "https://git.kernel.org/pub/scm/utils/rt-tests/rt-tests.git"
-RT_TESTS_REVISION = "62da2befac98f811af8e56f2b7992fb09faa33d6"
+RT_TESTS_URL = cyclictest_builder.RT_TESTS_REPO
+RT_TESTS_REVISION = cyclictest_builder.RT_TESTS_REVISION
 
 
 def linux_pin():
@@ -47,16 +48,6 @@ def patch_once(text, before, after):
   if text.count(before) != 1:
     raise ValueError(f"upstream patch context changed: {before!r}")
   return text.replace(before, after, 1)
-
-
-def patch_cyclictest(checkout):
-  patch = REPO / "tester/patches/cyclictest.patch"
-  for options in (("--check",), ()):
-    result = subprocess.run(["git", "apply", *options, str(patch)], cwd=checkout,
-                            capture_output=True, text=True, timeout=10)
-    if result.returncode:
-      raise ValueError(f"cyclictest patch failed: {result.stderr.strip()}")
-  return patch.read_text()
 
 
 def simple_loader(source):
@@ -205,7 +196,9 @@ def build(config, target, trace="off"):
       metadata.update(upstream=RT_TESTS_URL, revision=RT_TESTS_REVISION)
       run(["git", "clone", "--no-checkout", RT_TESTS_URL, checkout])
       run(["git", "checkout", "--detach", RT_TESTS_REVISION], cwd=checkout)
-      (directory / "cyclictest.patch").write_text(patch_cyclictest(checkout))
+      (directory / "cyclictest.patch").write_text(cyclictest_builder.install_source(checkout))
+      metadata["cyclictest_source"] = str(cyclictest_builder.MODIFIED_SOURCE)
+      metadata["cyclictest_source_sha256"] = sha256(cyclictest_builder.MODIFIED_SOURCE)
       metadata["build_mode"] = "upstream Makefile with inherited environment"
       metadata["build_environment"] = {key: os.environ.get(key) for key in
                                        ("DEBUG", "CC", "CFLAGS", "CPPFLAGS", "LDFLAGS",
@@ -216,7 +209,7 @@ def build(config, target, trace="off"):
       metadata["e1_startup_gate"] = True
       metadata["deadline_support"] = {"parameters": "explicit nanoseconds per worker",
                                       "reservation_readback": True}
-      metadata["patch_sha256"] = sha256(REPO / "tester/patches/cyclictest.patch")
+      metadata["patch_sha256"] = sha256(directory / "cyclictest.patch")
     metadata.update(binary=str(binary), binary_sha256=sha256(binary))
     write_json(directory / "build.json", metadata)
     return metadata

@@ -15,6 +15,7 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <stdarg.h>
+#include <stdbool.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <getopt.h>
@@ -36,6 +37,7 @@
 #include "rt_numa.h"
 
 #include "rt-utils.h"
+#include "rt-sched.h"
 #include "rt-numa.h"
 #include "rt-error.h"
 #include "histogram.h"
@@ -50,10 +52,6 @@
 #endif
 #ifndef SCHED_NORMAL
 #define SCHED_NORMAL SCHED_OTHER
-#endif
-
-#ifndef SCHED_EXT
-#define SCHED_EXT 7
 #endif
 
 #ifndef CLOCK_AUX
@@ -121,6 +119,10 @@ extern int clock_nanosleep(clockid_t __clock_id, int __flags,
 #define MSR_SMI_COUNT		0x00000034
 #define MSR_SMI_COUNT_MASK	0xFFFFFFFF
 
+#ifndef SCHED_EXT
+#define SCHED_EXT 7
+#endif
+
 static char *policyname(int policy);
 
 /* Struct to transfer parameters to the thread */
@@ -161,7 +163,7 @@ struct thread_stat {
 	unsigned long smi_count;
 };
 
-static pthread_mutex_t trigger_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t trigger_lock;
 
 static int trigger = 0;	/* Record spikes > trigger, 0 means don't record */
 static int trigger_list_size = 1024;	/* Number of list nodes */
@@ -193,6 +195,7 @@ static int lockall = 0;
 static int histogram = 0;
 static int histofall = 0;
 static int duration = 0;
+static uint64_t dl_runtime, dl_deadline, dl_period;
 static int use_nsecs = 0;
 static int refresh_on_max;
 static int force_sched_other;
@@ -212,9 +215,9 @@ static int smi = 0;
 #endif
 
 static pthread_cond_t refresh_on_max_cond = PTHREAD_COND_INITIALIZER;
-static pthread_mutex_t refresh_on_max_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t refresh_on_max_lock;
 
-static pthread_mutex_t break_thread_id_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t break_thread_id_lock;
 static pid_t break_thread_id = 0;
 static uint64_t break_thread_value = 0;
 
@@ -631,6 +634,65 @@ static int has_smi_counter(void)
 }
 #endif
 
+static uint64_t deadline_value(const char *value)
+{
+	char *end;
+	unsigned long long result;
+
+	errno = 0;
+	result = strtoull(value, &end, 10);
+	if (!*value || *value < '0' || *value > '9' || *end || errno ||
+	    result < 1024 || result > INT64_MAX)
+		fatal("DEADLINE values must be integer nanoseconds in [1024, INT64_MAX]\n");
+	return result;
+}
+
+static void set_deadline(void)
+{
+	struct sched_attr attr = {
+		.size = sizeof(attr),
+		.sched_policy = SCHED_DEADLINE,
+		.sched_runtime = dl_runtime,
+		.sched_deadline = dl_deadline,
+		.sched_period = dl_period,
+	};
+	struct sched_attr actual = { .size = sizeof(actual) };
+
+	if (sched_setattr(0, &attr, 0))
+		fatal("sched_setattr(DEADLINE): %s; check reservation admission and root-domain affinity\n",
+		      strerror(errno));
+	if (sched_getattr(0, &actual, sizeof(actual), 0))
+		fatal("sched_getattr(DEADLINE): %s\n", strerror(errno));
+	if (actual.sched_policy != SCHED_DEADLINE || actual.sched_priority ||
+	    actual.sched_runtime != dl_runtime || actual.sched_deadline != dl_deadline ||
+	    actual.sched_period != dl_period)
+		fatal("DEADLINE reservation readback differs from the request\n");
+}
+
+static void e1_wait_for_start(void)
+{
+	const char *ready = getenv("CGS_E1_READY");
+	const char *gate = getenv("CGS_E1_GATE");
+	char buffer[32], go;
+	int fd, length;
+
+	if (!ready && !gate)
+		return;
+	if (!ready || !gate)
+		fatal("incomplete E1 startup gate\n");
+	fd = open(ready, O_WRONLY | O_CREAT | O_EXCL, 0600);
+	if (fd < 0)
+		fatal("cannot publish E1 worker readiness\n");
+	length = snprintf(buffer, sizeof(buffer), "%d\n", gettid());
+	if (write(fd, buffer, length) != length)
+		fatal("cannot write E1 worker readiness\n");
+	close(fd);
+	fd = open(gate, O_RDONLY);
+	if (fd < 0 || read(fd, &go, 1) != 1 || go != 'g')
+		fatal("E1 controller closed the startup gate\n");
+	close(fd);
+}
+
 /*
  * timer thread
  *
@@ -654,22 +716,26 @@ static void *timerthread(void *param)
 	struct itimerval itimer;
 	struct itimerspec tspec;
 	struct thread_stat *stat = par->stats;
+	bool need_refresh_max = false;
 	int stopped = 0;
 	cpu_set_t mask;
 	pthread_t thread;
 	unsigned long smi_now, smi_old = 0;
 
-	/* if we're running in numa mode, set our memory node */
-	if (par->node != -1)
+	/* keep the inherited cpu mask for unpinned measurement threads */
+	if (par->node != -1 && par->cpu != -1)
 		rt_numa_set_numa_run_on_node(par->node, par->cpu);
 
 	if (par->cpu != -1) {
 		CPU_ZERO(&mask);
 		CPU_SET(par->cpu, &mask);
 		thread = pthread_self();
-		if (pthread_setaffinity_np(thread, sizeof(mask), &mask) != 0)
-			warn("Could not set CPU affinity to CPU #%d\n",
-			     par->cpu);
+		int err = pthread_setaffinity_np(thread, sizeof(mask), &mask);
+		if (err) {
+			if (par->policy == SCHED_DEADLINE)
+				fatal("DEADLINE CPU affinity: %s\n", strerror(err));
+			warn("Could not set CPU affinity to CPU #%d\n", par->cpu);
+		}
 	}
 
 	interval.tv_sec = par->interval / USEC_PER_SEC;
@@ -691,11 +757,15 @@ static void *timerthread(void *param)
 		tspec.it_interval = interval;
 	}
 
-	memset(&schedp, 0, sizeof(schedp));
-	schedp.sched_priority = par->prio;
-	if (setscheduler(0, par->policy, &schedp))
-		fatal("timerthread%d: failed to set priority to %d\n",
-		      par->cpu, par->prio);
+	if (par->policy == SCHED_DEADLINE) {
+		set_deadline();
+	} else {
+		memset(&schedp, 0, sizeof(schedp));
+		schedp.sched_priority = par->prio;
+		if (setscheduler(0, par->policy, &schedp))
+			fatal("timerthread%d: failed to set priority to %d\n",
+			      par->cpu, par->prio);
+	}
 
 	if (smi) {
 		par->msr_fd = open_msr_file(par->cpu);
@@ -707,6 +777,8 @@ static void *timerthread(void *param)
 			fatal("Could not read SMI counter, errno: %d\n",
 				par->cpu, errno);
 	}
+
+	e1_wait_for_start();
 
 	/* Get current time */
 	if (aligned || secaligned) {
@@ -850,7 +922,14 @@ static void *timerthread(void *param)
 		if (diff > stat->max) {
 			stat->max = diff;
 			if (refresh_on_max)
+				need_refresh_max = true;
+		}
+		if (need_refresh_max) {
+			if (!pthread_mutex_trylock(&refresh_on_max_lock)) {
 				pthread_cond_signal(&refresh_on_max_cond);
+				pthread_mutex_unlock(&refresh_on_max_lock);
+				need_refresh_max = false;
+			}
 		}
 		stat->avg += (double) diff;
 
@@ -997,7 +1076,10 @@ static void display_help(int error)
 	       "-o RED   --oscope=RED      oscilloscope mode, reduce verbose output by RED\n"
 	       "-p PRIO  --priority=PRIO   priority of highest prio thread\n"
 	       "	 --policy=NAME     policy of measurement thread, where NAME may be one\n"
-	       "                           of: other, normal, batch, idle, fifo or rr.\n"
+	       "                           of: other, normal, batch, idle, fifo, rr, ext or deadline.\n"
+	       "         --dl-runtime=NS   DEADLINE runtime per worker (required, nanoseconds)\n"
+	       "         --dl-deadline=NS  DEADLINE relative deadline per worker (required)\n"
+	       "         --dl-period=NS    DEADLINE reservation period per worker (required)\n"
 	       "	 --priospread      spread priority levels starting at specified value\n"
 	       "-q       --quiet           print a summary only on exit\n"
 	       "-r       --relative        use relative timer instead of absolute\n"
@@ -1082,6 +1164,8 @@ static void handlepolicy(char *polname)
 		policy = SCHED_FIFO;
 	else if (strncasecmp(polname, "rr", 2) == 0)
 		policy = SCHED_RR;
+	else if (!strcasecmp(polname, "deadline") || !strcasecmp(polname, "dl"))
+		policy = SCHED_DEADLINE;
 	else if (strncasecmp(polname, "ext", 3) == 0)
 		policy = SCHED_EXT;
 	else	/* default policy if we don't recognize the request */
@@ -1102,14 +1186,17 @@ static char *policyname(int policy)
 	case SCHED_RR:
 		policystr = "rr";
 		break;
+	case SCHED_DEADLINE:
+		policystr = "deadline";
+		break;
+	case SCHED_EXT:
+		policystr = "ext";
+		break;
 	case SCHED_BATCH:
 		policystr = "batch";
 		break;
 	case SCHED_IDLE:
 		policystr = "idle";
-		break;
-	case SCHED_EXT:
-		policystr = "ext";
 		break;
 	}
 	return policystr;
@@ -1128,6 +1215,7 @@ enum option_values {
 	OPT_DBGCYCLIC, OPT_POLICY, OPT_HELP, OPT_NUMOPTS,
 	OPT_ALIGNED, OPT_SECALIGNED, OPT_LAPTOP, OPT_SMI,
 	OPT_TRACEMARK, OPT_POSIX_TIMERS, OPT_DEEPEST_IDLE_STATE,
+	OPT_DL_RUNTIME, OPT_DL_DEADLINE, OPT_DL_PERIOD,
 };
 
 /* Process commandline options */
@@ -1181,6 +1269,9 @@ static void process_options(int argc, char *argv[], int max_cpus)
 			{"verbose",          no_argument,       NULL, OPT_VERBOSE },
 			{"dbg_cyclictest",   no_argument,       NULL, OPT_DBGCYCLIC },
 			{"policy",           required_argument, NULL, OPT_POLICY },
+			{"dl-runtime",       required_argument, NULL, OPT_DL_RUNTIME },
+			{"dl-deadline",      required_argument, NULL, OPT_DL_DEADLINE },
+			{"dl-period",        required_argument, NULL, OPT_DL_PERIOD },
 			{"help",             no_argument,       NULL, OPT_HELP },
 			{"posix_timers",     no_argument,	NULL, OPT_POSIX_TIMERS },
 			{"deepest-idle-state", required_argument,	NULL, OPT_DEEPEST_IDLE_STATE },
@@ -1295,7 +1386,7 @@ static void process_options(int argc, char *argv[], int max_cpus)
 		case 'p':
 		case OPT_PRIORITY:
 			priority = atoi(optarg);
-			if (policy != SCHED_FIFO && policy != SCHED_RR)
+			if (policy != SCHED_FIFO && policy != SCHED_RR && policy != SCHED_DEADLINE)
 				policy = SCHED_FIFO;
 			break;
 		case 'q':
@@ -1368,6 +1459,15 @@ static void process_options(int argc, char *argv[], int max_cpus)
 			latency_target_value = atoi(optarg);
 			if (latency_target_value < 0)
 				latency_target_value = 0;
+			break;
+		case OPT_DL_RUNTIME:
+			dl_runtime = deadline_value(optarg);
+			break;
+		case OPT_DL_DEADLINE:
+			dl_deadline = deadline_value(optarg);
+			break;
+		case OPT_DL_PERIOD:
+			dl_period = deadline_value(optarg);
 			break;
 		case OPT_POLICY:
 			handlepolicy(optarg); break;
@@ -1445,6 +1545,16 @@ static void process_options(int argc, char *argv[], int max_cpus)
 		fprintf(stderr, "defaulting realtime priority to %d\n",
 			num_threads+1);
 		priority = num_threads+1;
+	}
+
+	if (policy == SCHED_DEADLINE) {
+		if (!dl_runtime || !dl_deadline || !dl_period ||
+		    dl_runtime > dl_deadline || dl_deadline > dl_period)
+			fatal("DEADLINE requires explicit 1024 <= runtime <= deadline <= period (ns)\n");
+		if (priority || priospread)
+			fatal("DEADLINE requires priority zero without priority spreading\n");
+	} else if (dl_runtime || dl_deadline || dl_period) {
+		fatal("--dl-runtime/--dl-deadline/--dl-period require --policy=deadline\n");
 	}
 
 	if (priority && (policy != SCHED_FIFO && policy != SCHED_RR)) {
@@ -1946,6 +2056,7 @@ static void set_main_thread_affinity(struct bitmask *cpumask)
 
 int main(int argc, char **argv)
 {
+	pthread_mutexattr_t mattr;
 	sigset_t sigset;
 	int signum = SIGALRM;
 	int mode;
@@ -1981,6 +2092,12 @@ int main(int argc, char **argv)
 			exit(EXIT_FAILURE);
 		}
 	}
+
+	pthread_mutexattr_init(&mattr);
+	pthread_mutexattr_setprotocol(&mattr, PTHREAD_PRIO_INHERIT);
+	pthread_mutex_init(&refresh_on_max_lock, &mattr);
+	pthread_mutex_init(&break_thread_id_lock, &mattr);
+	pthread_mutex_init(&trigger_lock, &mattr);
 
 	/* lock all memory (prevent swapping) */
 	if (lockall)
@@ -2218,10 +2335,11 @@ int main(int argc, char **argv)
 		}
 
 		par->prio = priority;
-		if (priority && (policy == SCHED_FIFO || policy == SCHED_RR))
+		if ((priority && (policy == SCHED_FIFO || policy == SCHED_RR)) ||
+		    policy == SCHED_EXT || policy == SCHED_DEADLINE)
 			par->policy = policy;
 		else {
-			par->policy = policy == SCHED_EXT ? SCHED_EXT : SCHED_OTHER;
+			par->policy = SCHED_OTHER;
 			force_sched_other = 1;
 		}
 		if (priospread)

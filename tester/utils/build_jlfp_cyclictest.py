@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fetch and build a separate SCHED_EXT cyclictest that preserves worker affinity."""
+"""Build the repository's EXT/DEADLINE cyclictest in a private rt-tests copy."""
 
 import argparse
 import difflib
@@ -14,7 +14,7 @@ import tempfile
 
 REPO_DIR = Path(__file__).resolve().parents[2]
 RT_TESTS_REPO = "https://git.kernel.org/pub/scm/utils/rt-tests/rt-tests.git"
-RT_TESTS_REVISION = "fd45df830803dd7f26d2ca8bdcf05fd7e0d62ae8"
+RT_TESTS_REVISION = "62da2befac98f811af8e56f2b7992fb09faa33d6"
 MODIFIED_SOURCE = REPO_DIR / "cyclictest/modified_cyclictest.c"
 HEADER = Path("src/cyclictest/rt_numa.h")
 SOURCE = Path("src/cyclictest/cyclictest.c")
@@ -30,16 +30,14 @@ def clone_source(source):
     checkout.rename(source)
 
 
-def guard_header(text):
-  context = ("static void rt_numa_set_numa_run_on_node(int node, int cpu)\n{\n"
-             "\tint res;\n\tres = numa_run_on_node(node);\n")
-  if text.count(context) != 1:
-    raise ValueError("expected unmodified cyclictest NUMA CPU-binding function")
-  guarded = ("static void rt_numa_set_numa_run_on_node(int node, int cpu)\n{\n"
-             "\t/* keep the inherited cpu mask for unpinned measurement threads */\n"
-             "\tif (cpu == -1)\n\t\treturn;\n\n"
-             "\tint res;\n\tres = numa_run_on_node(node);\n")
-  return text.replace(context, guarded)
+def install_source(checkout):
+  destination = checkout / SOURCE
+  original = destination.read_text()
+  modified = MODIFIED_SOURCE.read_text()
+  destination.write_text(modified)
+  return "".join(difflib.unified_diff(original.splitlines(keepends=True),
+                                    modified.splitlines(keepends=True),
+                                    fromfile="a/" + str(SOURCE), tofile="b/" + str(SOURCE)))
 
 
 def sha256(path):
@@ -54,8 +52,6 @@ def prepare_copy(source, output):
     raise ValueError("output directory must be outside the rt-tests source")
   if not source.exists():
     clone_source(source)
-  original = (source / HEADER).read_text()
-  modified = guard_header(original)
   watched = [HEADER, SOURCE]
   if (source / "cyclictest").is_file():
     watched.append(Path("cyclictest"))
@@ -63,7 +59,7 @@ def prepare_copy(source, output):
               "source_sha256": {str(path): sha256(source / path) for path in watched},
               "cyclictest_source": str(MODIFIED_SOURCE),
               "cyclictest_source_sha256": sha256(MODIFIED_SOURCE),
-              "change": "apply repository SCHED_EXT cyclictest; skip NUMA CPU rebinding when cpu == -1",
+              "change": "use repository EXT/DEADLINE cyclictest with startup gate and inherited-affinity support",
               "command": ["make", "-j2", "cyclictest"],
               "build_mode": "upstream Makefile with inherited environment",
               "build_environment": {key: os.environ.get(key) for key in
@@ -74,12 +70,8 @@ def prepare_copy(source, output):
     return set(names) & {".git", "bld", "cyclictest"} if Path(directory) == source else set()
   output.parent.mkdir(parents=True, exist_ok=True)
   shutil.copytree(source, output, ignore=ignore)
-  shutil.copyfile(MODIFIED_SOURCE, output / SOURCE)
-  (output / HEADER).write_text(modified)
-  patch = difflib.unified_diff(original.splitlines(keepends=True),
-                               modified.splitlines(keepends=True),
-                               fromfile="a/" + str(HEADER), tofile="b/" + str(HEADER))
-  (output / "numa-affinity.patch").write_text("".join(patch))
+  (output / "cyclictest.patch").write_text(install_source(output))
+  metadata["patch_sha256"] = sha256(output / "cyclictest.patch")
   (output / "build-metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")
   return metadata
 

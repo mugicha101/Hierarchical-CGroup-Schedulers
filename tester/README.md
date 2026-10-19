@@ -141,10 +141,11 @@ PREEMPT_RT. Treat the separately installed timer patches as an external
 prerequisite. Experiments never install dependencies or create the two configured
 cgroups; E1 DEADLINE temporarily manages child CPU partitions as described below.
 
-The new cyclictest build uses upstream revision
-`62da2befac98f811af8e56f2b7992fb09faa33d6` in a private checkout with EXT and
-explicit-reservation DEADLINE support, the inherited-affinity fix, and an optional
-E1 worker startup gate. Its readable patch and hash are saved with the build.
+The cyclictest implementation lives in `cyclictest/modified_cyclictest.c`, based on
+upstream revision `62da2befac98f811af8e56f2b7992fb09faa33d6`. It contains EXT and
+explicit-reservation DEADLINE support, inherited-affinity support, and an optional
+E1 worker startup gate. The experiment builder copies it into a private pinned
+checkout and saves its source hash and a generated diff against upstream.
 It does not replace `cyclictest/rt-tests` or build/use cyclicdeadline.
 Both cyclictest builders use upstream's Makefile without overriding optimization
 or repairing unrelated upstream bugs. Build metadata records inherited build
@@ -240,13 +241,14 @@ The private cyclictest build supports `--policy=deadline` (or `dl`) with three
 required per-worker options: `--dl-runtime=NS`, `--dl-deadline=NS`, and
 `--dl-period=NS`. Values are integer nanoseconds, with
 `1024 <= runtime <= deadline <= period <= INT64_MAX`. Use priority zero;
-priority spreading is rejected. The patch uses current `sched_setattr` and
+priority spreading is rejected. The implementation uses current `sched_setattr` and
 `sched_getattr`, rather than the experimental syscall in the
 [original DEADLINE cyclictest PR](https://github.com/jlelli/rt-tests/pull/1).
 It verifies every worker's installed reservation before sampling and retains
-cyclictest's timer/histogram behavior. The reviewable patch is
-`tester/patches/cyclictest.patch`, applied only to fresh pinned private builds;
-it also contains the existing EXT, startup-gate and NUMA affinity changes.
+cyclictest's timer/histogram behavior. All cyclictest changes, including EXT,
+the startup gate and the NUMA affinity guard, are maintained in
+`cyclictest/modified_cyclictest.c`. Builders copy this file and save a generated
+`cyclictest.patch` in each build's artifacts; no maintained header patch is needed.
 
 Configure E1 reservations under `experiments.overhead.e1.policies.deadline`:
 `cyclictest` and `stress` each contain `runtime_ns`, `deadline_ns`, and `period_ns`.
@@ -453,8 +455,10 @@ a saved capture.
 This existing traced comparison is separate from the upcoming trace-free overhead
 E1 experiment. Its settings live under `experiments.diagnostics.latency`.
 
-The older utility builder uses `cyclictest/rt-tests` and the repository's modified
-source in a private copy. The staged build instead patches pinned upstream source.
+Both builders use `cyclictest/modified_cyclictest.c`. The diagnostic utility makes
+a private copy of `cyclictest/rt-tests` (cloned at the shared pin if absent); the
+experiment builder creates a fresh pinned upstream checkout. Existing source
+checkouts are preserved.
 
 ```sh
 python3 tester/utils/build_jlfp_cyclictest.py --output-dir tester/build/cyclictest-affinity

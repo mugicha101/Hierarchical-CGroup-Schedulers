@@ -1,6 +1,11 @@
 Clone `https://git.kernel.org/pub/scm/utils/rt-tests/rt-tests.git` into `./rt-tests`
+and check out revision `62da2befac98f811af8e56f2b7992fb09faa33d6`.
 
-Modify `rt-tests/src/cyclictest/cyclictest.c` to match `modified_cyclictest.c` to allow cyclictest to set its policy to SCHED_EXT
+Copy `modified_cyclictest.c` to `rt-tests/src/cyclictest/cyclictest.c` and build
+with `make -C rt-tests cyclictest`. This file contains the EXT/DEADLINE support,
+optional experiment startup gate and inherited-affinity guard. No header changes
+are required. The tester's experiment and diagnostic builders use this same source
+in private builds; see `../tester/README.md` for those commands.
 
 Launch cgroup server with `cyclictest_config.json` as config file
 
