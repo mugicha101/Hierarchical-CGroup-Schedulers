@@ -8,6 +8,8 @@ from dataclasses import dataclass, field
 class Call:
   entry: dict
   callbacks: list = field(default_factory=list)
+  kernel_callbacks: list = field(default_factory=list)
+  outer_callbacks: list = field(default_factory=list)
 
 
 def union_duration(intervals):
@@ -19,7 +21,8 @@ def union_duration(intervals):
 
 
 class Pairing:
-  def __init__(self):
+  def __init__(self, callback_layer='scx'):
+    self.callback_layer = callback_layer
     self.stacks = {}
     self.last_timestamp = {}
     self.last_call_id = {}
@@ -51,6 +54,26 @@ class Pairing:
     if "reported_duration_ns" in record:
       result.update(boundary_duration_ns=boundary_duration, reported_duration_ns=duration)
     result.pop("phase")
+    if self.callback_layer == 'kernel':
+      if call.entry['layer'] == 'kernel':
+        parents = [frame for frame in stack if frame.entry['layer'] == 'class']
+        result['class_call_id'] = parents[-1].entry['call_id'] if parents else None
+        self.counts['kernel_without_class'] += not parents
+        for index, parent in enumerate(stack):
+          if parent.entry['layer'] != 'class':
+            continue
+          sample = (call.entry['timestamp_ns'], timestamp, duration)
+          parent.kernel_callbacks.append(sample)
+          if not any(frame.entry['layer'] == 'kernel' for frame in stack[index + 1:]):
+            parent.outer_callbacks.append(sample)
+      elif call.entry['layer'] == 'class':
+        total = sum(sample[2] for sample in call.outer_callbacks)
+        union = union_duration([(start, end) for start, end, _ in call.kernel_callbacks])
+        result.update(kernel_callback_calls=len(call.kernel_callbacks),
+                      kernel_callback_reported_ns=total, kernel_callback_boundary_union_ns=union,
+                      kernel_callback_percent=100 * total / duration if duration else None,
+                      class_residual_ns=duration - total, callback_exceeds_class=total > duration)
+        self.counts['callback_exceeds_class'] += total > duration
     if call.entry["layer"] == "scx":
       parents = [frame for frame in stack if frame.entry["layer"] in ("class", "kernel")]
       for parent in parents:
@@ -62,12 +85,13 @@ class Pairing:
       result["outer_layer"] = parents[-1].entry["layer"] if parents else None
       self.counts["scx_without_class"] += not parents
     else:
-      union = union_duration(call.callbacks)
-      result.update(observed_scx_calls=len(call.callbacks),
-                    observed_scx_sum_ns=sum(end - start for start, end in call.callbacks),
-                    observed_scx_union_ns=union, observed_scx_percent=100 * union / duration if duration else None)
       self.counts[call.entry["layer"] + "_calls"] += 1
-      self.counts[call.entry["layer"] + "_without_observed_scx"] += not call.callbacks
+      if self.callback_layer != 'kernel':
+        union = union_duration(call.callbacks)
+        result.update(observed_scx_calls=len(call.callbacks),
+                      observed_scx_sum_ns=sum(end - start for start, end in call.callbacks),
+                      observed_scx_union_ns=union, observed_scx_percent=100 * union / duration if duration else None)
+        self.counts[call.entry["layer"] + "_without_observed_scx"] += not call.callbacks
     self.counts["paired_calls"] += 1
     return result
 

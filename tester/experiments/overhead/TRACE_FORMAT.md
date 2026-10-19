@@ -2,8 +2,9 @@
 
 These utilities provide the offline analysis used by E2–E4. The standalone
 commands do not run experiments or change tracing. The experiment runners use
-`tester/utils/operation_convert.py` to adapt verified target-kernel tracepoint
-bindings. Target validation remains pending. Existing `sched_switch`/wakeup
+`tester/utils/bpftrace_convert.py` to normalize function probes and kernel SCX
+callback events. The older tracepoint adapter remains available for replay.
+Target validation remains pending. Existing `sched_switch`/wakeup
 events cannot be converted into operation durations.
 
 ```sh
@@ -87,8 +88,8 @@ The producer must meet these conditions:
   operations produce zero-sample rows. Omit SCX entries for an E2-only capture;
   uninstrumented callbacks are not reported as costing zero time.
 
-The adapter derives call IDs and parent IDs from each execution CPU/context's
-observed tracepoint stack. Context includes current PID, hard/soft IRQ flags and
+The historical tracepoint adapter derives call IDs and parent IDs from each
+execution CPU/context's observed tracepoint stack. Context includes current PID, hard/soft IRQ flags and
 recorded IRQ-handler nesting. The existing ftrace plugin exposes libtraceevent's
 `latency` field instead of raw `common_flags`; its IRQ column is decoded using the
 [kernel's documented format](https://www.kernel.org/doc/html/latest/trace/ftrace.html).
@@ -159,3 +160,33 @@ Input hashes are recorded and checked again after processing. A successful repor
 means structural analysis passed; it still says `analysis_only: true` and
 `experiment_validated: false`, because these utilities cannot validate the
 workload, scheduler configuration or completeness of probe coverage.
+
+## Kernel callback capture for E3/E4
+
+New bpftrace captures declare `callback_layer: "kernel"`. They contain `class`
+function boundaries and `kernel` SCX callback pairs, with no custom `scx` events.
+`reported_duration_ns` on kernel exits carries delta_ns. Kernel callback latency
+statistics use that value; `boundary_duration_ns` preserves the probe timestamps.
+The schema and historical custom-event meanings remain unchanged.
+
+Each class sample additionally contains `kernel_callback_calls`,
+`kernel_callback_reported_ns`, `kernel_callback_boundary_union_ns`,
+`kernel_callback_percent`, `class_residual_ns` and `callback_exceeds_class`.
+The reported total sums only outermost callbacks inside that class call's context;
+all nested callbacks still have individual samples. Boundary unions independently
+retain the observed occupied intervals. Callback samples include their nearest
+`class_call_id`, or null for standalone callbacks.
+
+Per-operation rows retain callback totals and
+`duration_weighted_kernel_callback_percent = 100 * sum(callback totals) / sum(class durations)`.
+Callback fields are null on kernel-operation rows. The legacy custom-SCX columns
+remain null for these captures. An uncalibrated residual is class duration minus
+reported callback total; negative residuals and fractions above 100% are retained
+and flagged, not clamped. Inclusive nested class totals must not be summed as
+scheduler CPU utilization. Tick emission calibration remains pending.
+
+The bpftrace producer derives contexts from current TID plus verified x86 IRQ
+state, and assigns IDs after stable per-CPU timestamp ordering. It verifies raw
+records against final BPF counters, clean shutdown acknowledgements/stderr and
+post-detachment recursion_misses using retained program references. Capture
+startup/stop may cut unselected boundary calls; selected incomplete calls fail.

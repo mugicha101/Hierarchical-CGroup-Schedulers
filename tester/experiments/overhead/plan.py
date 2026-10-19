@@ -3,7 +3,7 @@
 
 def plan(settings):
   return {
-      "status": "E1 implemented; E2-E4 draft runners; target validation pending",
+      "status": "E1-E4 implemented; target validation and calibration pending",
       "settings": settings,
       "e1": {
           "measurement": "end-to-end cyclictest scheduling latency",
@@ -14,23 +14,23 @@ def plan(settings):
       },
       "e2": {
           "measurement": "scheduling class operation latency",
-          "schedulers": ["other", "fifo", "qmap", "jlfp"],
+          "schedulers": ["other", "fifo", "deadline", "qmap", "jlfp"],
           "placement": "cyclictest on CPU 9; stress-ng pinned per workload CPU",
-          "status": "draft; confirmed class tracepoint bindings and target validation pending",
+          "status": "implemented with fentry/fexit; target matrix validation pending",
       },
       "e3": {
           "measurement": "JLFP callback versus enclosing kernel operation latency",
           "schedulers": ["jlfp"],
           "placement": "same pinned workload as E2",
-          "status": "draft; kernel op IDs/scope and target validation pending",
+          "status": "implemented with kernel SCX callbacks; patched-target validation pending",
           "tick_emission_calibration": "pending by request; no cost subtraction",
       },
       "e4": {
           "measurement": "JLFP operation latency with migratable workers",
           "schedulers": ["jlfp"],
           "placement": "cyclictest and stress-ng may migrate throughout workload cpuset",
-          "status": "draft; kernel op IDs/scope and target validation pending",
+          "status": "implemented with kernel SCX callbacks; patched-target validation pending",
           "tick_emission_calibration": "pending by request; no cost subtraction",
       },
-      "deadline_placement": "E1 only; temporary single-CPU partitions below the existing workload cgroup",
+      "deadline_placement": "E1/E2 when reservations configured; temporary single-CPU partitions in workload cgroup",
   }

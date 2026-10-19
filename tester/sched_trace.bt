@@ -1,0 +1,64 @@
+#!/usr/bin/env bpftrace
+// the experiment runner supplies literal probes, CPUs and target context layout
+#include "sched_trace_config.h"
+
+config = { print_maps_on_exit = false; missing_probes = "error"; }
+
+BEGIN
+{
+  @enabled = 0;
+  printf("CGS_READY\n");
+}
+
+CLASS_ENTRY_PROBES
+/CPU_ALLOWED && @enabled/
+{
+  $timestamp = nsecs(monotonic);
+  $context = IRQ_CONTEXT;
+  @counts[cpu, 0] = count();
+  printf("CGS %llu %u %u %u C E %s 0\n", $timestamp, cpu, tid, $context, func);
+}
+
+CLASS_EXIT_PROBES
+/CPU_ALLOWED && @enabled/
+{
+  $timestamp = nsecs(monotonic);
+  $context = IRQ_CONTEXT;
+  @counts[cpu, 1] = count();
+  printf("CGS %llu %u %u %u C X %s 0\n", $timestamp, cpu, tid, $context, func);
+}
+
+#ifdef SCX_CALLBACKS
+SCX_ENTRY_PROBE
+/CPU_ALLOWED && @enabled/
+{
+  $timestamp = nsecs(monotonic);
+  $context = IRQ_CONTEXT;
+  @counts[cpu, 2] = count();
+  printf("CGS %llu %u %u %u K E %u 0\n", $timestamp, cpu, tid, $context, args.op);
+}
+
+SCX_EXIT_PROBE
+/CPU_ALLOWED && @enabled/
+{
+  $timestamp = nsecs(monotonic);
+  $context = IRQ_CONTEXT;
+  @counts[cpu, 3] = count();
+  printf("CGS %llu %u %u %u K X %u %lld\n", $timestamp, cpu, tid, $context,
+         args.op, SCX_DURATION);
+}
+#endif
+
+// getpgid is a read-only control syscall issued by the recorder's owning process
+tracepoint:syscalls:sys_enter_getpgid
+/pid == CONTROL_PID/
+{
+  @enabled = args.pid;
+  printf("CGS_CONTROL %u\n", args.pid);
+}
+
+END
+{
+  printf("CGS_END\n");
+  print(@counts);
+}

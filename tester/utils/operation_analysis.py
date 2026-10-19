@@ -13,6 +13,8 @@ class Statistics:
     self.metadata = metadata
     self.histograms = defaultdict(Counter)
     self.callback_time = Counter()
+    self.kernel_time, self.kernel_union, self.kernel_calls = Counter(), Counter(), Counter()
+    self.kernel_callbacks = metadata.get('callback_layer') == 'kernel'
     self.has_callbacks = any(item["layer"] == "scx" for item in metadata["expected_operations"])
 
   def add(self, call):
@@ -20,6 +22,9 @@ class Statistics:
       key = cpu, call["layer"], call["operation"]
       self.histograms[key][call["duration_ns"]] += 1
       self.callback_time[key] += call.get("observed_scx_union_ns", 0)
+      self.kernel_time[key] += call.get('kernel_callback_reported_ns', 0)
+      self.kernel_union[key] += call.get('kernel_callback_boundary_union_ns', 0)
+      self.kernel_calls[key] += call.get('kernel_callback_calls', 0)
 
   def rows(self):
     for item in self.metadata["expected_operations"]:
@@ -35,6 +40,14 @@ class Statistics:
         measured = self.has_callbacks and item["layer"] in ("class", "kernel")
         row["observed_scx_union_ns"] = self.callback_time[key] if measured else None
         row["duration_weighted_scx_percent"] = 100 * self.callback_time[key] / total if measured and total else None
+        if self.kernel_callbacks:
+          measured = item['layer'] == 'class'
+          row.update(kernel_callback_calls=self.kernel_calls[key] if measured else None,
+                     kernel_callback_reported_ns=self.kernel_time[key] if measured else None,
+                     kernel_callback_boundary_union_ns=self.kernel_union[key] if measured else None,
+                     duration_weighted_kernel_callback_percent=100 * self.kernel_time[key] / total
+                         if measured and total else None,
+                     class_residual_ns=total - self.kernel_time[key] if measured else None)
         yield row
 
 
@@ -51,7 +64,7 @@ def analyse(capture, output):
   metadata_path = capture / "operations.metadata.json"
   output = Path(output).resolve()
   output.mkdir(parents=True, exist_ok=False)
-  pairing = operation_pairs.Pairing()
+  pairing = None
   report = {"valid": False, "analysis_only": True, "experiment_validated": False,
             "capture": str(capture), "timing": "inclusive elapsed nanoseconds; no IRQ/preemption or probe-cost subtraction",
             "attribution": "union of recorded descendant SCX calls, same execution CPU/context; declared callbacks only"}
@@ -59,12 +72,16 @@ def analyse(capture, output):
   try:
     report["inputs_sha256"] = {path.name: common.sha256(path) for path in (source, metadata_path)}
     metadata = common.read_json(metadata_path)
+    pairing = operation_pairs.Pairing(callback_layer=metadata.get('callback_layer') or 'scx')
     expected = operation_trace.validate_metadata(metadata)
     statistics = Statistics(metadata)
     latency_stats.summarize({}, **metadata["statistics"])
     report["metadata"] = metadata
     report["timing"] = metadata.get("timing", report["timing"])
     report["scx_instrumented"] = statistics.has_callbacks
+    report['kernel_callbacks_instrumented'] = statistics.kernel_callbacks
+    if statistics.kernel_callbacks:
+      report['attribution'] = 'outermost same-context kernel callback delta_ns per class call; boundary union retained'
     with partial.open("x") as calls:
       for record in operation_trace.read_records(source, metadata, expected):
         call = pairing.consume(record)
@@ -89,5 +106,6 @@ def analyse(capture, output):
     report["error"] = f"{type(error).__name__}: {error}"
     raise
   finally:
-    report.update(pairing_counts=dict(pairing.counts), unmatched_entries=pairing.open_calls())
+    report.update(pairing_counts=dict(pairing.counts) if pairing else {},
+                  unmatched_entries=pairing.open_calls() if pairing else [])
     common.write_json(output / "analysis.json", report)

@@ -118,7 +118,7 @@ class Workload:
 
 
 class Session:
-  def __init__(self, config, directory, scheduler=None, *, events=()):
+  def __init__(self, config, directory, scheduler=None, *, events=(), recording=None):
     self.config = config
     self.directory = Path(directory)
     self.timeout = config["process_timeout_s"]
@@ -135,7 +135,7 @@ class Session:
       (self.directory / name).mkdir()
     self.workloads = common.Processes(self.directory / "workloads", self.timeout)
     self.schedulers = common.Processes(self.directory / "scheduler", self.timeout)
-    self.recording = Recording(self.directory, events, self.timeout)
+    self.recording = recording if recording is not None else Recording(self.directory, events, self.timeout)
 
   def note(self, action, **details):
     self.history.append({"action": action, "time_ns": time.monotonic_ns(), **details})

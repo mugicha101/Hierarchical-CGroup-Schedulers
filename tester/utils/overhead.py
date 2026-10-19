@@ -12,14 +12,15 @@ from . import builds, common, operation_analysis, overhead_capture, overhead_con
 
 
 def prepare(config, experiment, cases, directory):
-  profile = 'off' if experiment == 'e2' else 'ops'
   targets = ['cyclictest'] + [name for name in ('qmap', 'jlfp')
                              if any(case['scheduler'] == name for case in cases)]
   manifests = {}
   for target in targets:
-    manifests[target] = builds.result(builds.build(config, target, trace=profile if target == 'jlfp' else 'off'))
+    manifests[target] = builds.result(builds.build(config, target, trace='off'))
   if not manifests['cyclictest'].get('e1_startup_gate'):
     raise ValueError('cyclictest requires the pre-measurement readiness gate')
+  if any(case['scheduler'] == 'deadline' for case in cases) and not manifests['cyclictest'].get('deadline_support'):
+    raise ValueError('cyclictest build lacks explicit DEADLINE support')
   common.write_json(directory / 'builds.json', manifests)
   binary = shutil.which('stress-ng')
   version = subprocess.run([binary, '--version'], check=True, capture_output=True, text=True,
@@ -46,7 +47,7 @@ def analyse(directory):
   if suite['status'] != 'succeeded' or not suite['cases'] or \
       [item['case'] for item in suite['cases']] != suite['planned_cases']:
     raise ValueError('completed cases differ from the planned matrix or the suite is incomplete')
-  seen, rows = set(), []
+  seen, rows, coverage = set(), [], {}
   for item in suite['cases']:
     root = (directory / item['directory']).resolve(strict=True)
     if not root.is_relative_to(directory) or root in seen:
@@ -54,6 +55,7 @@ def analyse(directory):
     seen.add(root)
     attempt = successful_attempt(root)
     capture = common.read_json(attempt / 'capture.json')
+    coverage[item['case']['scheduler']] = capture['trace_binding']
     if capture['case'] != item['case'] or capture['experiment'] != suite['experiment'] or \
         not capture['measurement'] or capture['cleanup'] != 'complete':
       raise ValueError('case differs from its capture metadata or cleanup is incomplete')
@@ -71,6 +73,7 @@ def analyse(directory):
                    'accepted_attempt': attempt.name, 'failed_attempts': len(failures),
                    'directory': str(attempt.relative_to(directory)), 'experiment_validated': False})
   common.write_json(directory / 'results.json', {'experiment': suite['experiment'], 'cases': rows,
+                    'coverage': coverage,
                     'experiment_validated': False, 'target_validation': 'pending',
                     'tick_emission_calibration': 'pending'})
   with (directory / 'results.csv').open('w', newline='') as output:
@@ -86,19 +89,23 @@ def run(config, experiment, *, scheduler=None, stress=None, analyse_only=None):
     print(f'Recomputed {len(rows)} operation rows: {analyse_only}')
     return Path(analyse_only)
   cases = list(overhead_config.cases(config, experiment, scheduler, stress))
-  profiles = {case['scheduler']: overhead_config.binding(config, experiment, case['scheduler']) for case in cases}
   if os.geteuid() != 0:
     raise PermissionError('root is required for scheduling policy, cgroup placement and private tracing')
+  if shutil.which('bpftrace') is None:
+    raise FileNotFoundError('bpftrace is required for E2-E4')
+  profiles = {policy: overhead_config.binding(config, experiment, policy)
+              for policy in dict.fromkeys(case['scheduler'] for case in cases)}
   if not float(config['duration_s']).is_integer():
     raise ValueError('cyclictest requires a whole number of seconds')
   directory = common.new_run(config, experiment)
   print(f'{experiment.upper()} artifacts: {directory}', flush=True)
   suite = {'experiment': experiment, 'config': config, 'status': 'running', 'command': sys.argv,
            'planned_cases': cases, 'cases': [], 'target_validation': 'pending',
-           'tick_emission_calibration': 'pending'}
+           'tick_emission_calibration': 'pending',
+           'deadline': 'conditional on explicit reservation settings; unset cases deferred'}
   common.write_json(directory / 'suite.json', suite)
   try:
-    report = preflight.inspect(config, traced=True)
+    report = preflight.inspect(config, traced=False)
     common.write_json(directory / 'preflight.json', report)
     if not report['ok']:
       raise ValueError(f'prerequisites missing; see {directory / "preflight.json"}')
@@ -114,8 +121,8 @@ def run(config, experiment, *, scheduler=None, stress=None, analyse_only=None):
         def capture(attempt, processes):
           result = overhead_capture.capture(config, attempt, experiment, case, binary,
                       manifests.get(case['scheduler']), stress_binary, profiles[case['scheduler']])
-          names = ('trace.dat', 'trace.dat.metadata.json', 'operations.jsonl', 'operations.metadata.json',
-                   'cyclictest.json', 'conversion.json')
+          names = ('bpftrace.stdout', 'bpftrace.stderr', 'bpftrace.json', 'sched_trace.bt', 'sched_trace_config.h',
+                   'operations.jsonl', 'operations.metadata.json', 'cyclictest.json', 'conversion.json')
           result['analysis_inputs_sha256'] = {name: common.sha256(attempt / name) for name in names}
           common.write_json(attempt / 'capture.json', result)
           return result

@@ -42,6 +42,9 @@ class Converter:
     self.contexts = Contexts()
     self.stacks = defaultdict(list)
     self.sequence, self.counts, self.last = Counter(), Counter(), {}
+    if 'class_operations' in profile:
+      self.bindings = {}
+      return
     layer = 'class' if profile['scope'] == 'sched_class' else 'kernel'
     mapping = {int(key): value for key, value in profile['operations'].items()}
     self.bindings = {profile['enter_event']: ('enter', layer, mapping),
@@ -58,17 +61,23 @@ class Converter:
     if timestamp < self.last.get(cpu, 0):
       raise ValueError(f'trace timestamps moved backwards on CPU {cpu}')
     self.last[cpu] = timestamp
-    if self.contexts.update(event) or event['name'] not in self.bindings:
-      return
-    phase, layer, mapping = self.bindings[event['name']]
-    op = event['fields']['op']
-    if op not in mapping:
-      raise ValueError(f"unknown operation ID {op} in {event['name']}; update the confirmed binding")
-    if layer == 'scx' and event['fields']['sched_cgrp_id'] != 0:
-      raise ValueError('E3/E4 expects only the root JLFP scheduler (sched_cgrp_id=0)')
-    context = self.contexts.key(event)
+    if 'phase' in event:
+      phase, layer, operation = event['phase'], event['layer'], event['operation']
+      if event['irq_context'] & 0x00f00000:
+        raise ValueError('operation in NMI context is unsupported')
+      context = f"pid:{event['pid']}/irq:{event['irq_context']}"
+    else:
+      if self.contexts.update(event) or event['name'] not in self.bindings:
+        return
+      phase, layer, mapping = self.bindings[event['name']]
+      op = event['fields']['op']
+      if op not in mapping:
+        raise ValueError(f"unknown operation ID {op} in {event['name']}; update the confirmed binding")
+      if layer == 'scx' and event['fields']['sched_cgrp_id'] != 0:
+        raise ValueError('E3/E4 expects only the root JLFP scheduler (sched_cgrp_id=0)')
+      context = self.contexts.key(event)
+      operation = mapping[op]
     stack = self.stacks[cpu, context]
-    operation = mapping[op]
     if phase == 'enter':
       self.sequence[cpu] += 1
       selected = stack[0]['selected'] if stack else self.start_ns <= timestamp < self.end_ns
@@ -94,8 +103,8 @@ class Converter:
     if frame['selected']:
       record = {'phase': phase, 'timestamp_ns': timestamp, 'cpu': cpu, 'context': context,
                 'call_id': frame['call_id']}
-      if layer != 'scx' and self.profile['duration_field']:
-        value = event['fields'][self.profile['duration_field']]
+      if 'reported_duration_ns' in event or ('phase' not in event and layer != 'scx' and self.profile['duration_field']):
+        value = event['reported_duration_ns'] if 'phase' in event else event['fields'][self.profile['duration_field']]
         if type(value) is not int or value < 0:
           raise ValueError('kernel operation duration must be nonnegative nanoseconds')
         record['reported_duration_ns'] = value
