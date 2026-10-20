@@ -1,17 +1,23 @@
-# E5 container capacity baseline
+# E5 container policies and overhead
 
-The runner checks whether Nginx and each configured database can sustain their
-offered request rates on one logical CPU. It uses SCHED_OTHER and reports CPU
-demand, throughput, errors, queue drops and latency. E5's RM/FIFO/JLFP hierarchy
-and E3-style overhead attribution remain pending; no scheduler or tracing is
-enabled by this baseline. Fixed-rate HTTP requests do not make Nginx worker
-threads periodic RM jobs.
+E5 runs Nginx alongside Redis, PostgreSQL or MongoDB on one logical CPU. A JLFP
+root prioritizes Nginx's JLFP leaf above the database's JLFP leaf. Nginx tasks use
+fixed priorities ordered by configurable nominal periods; database tasks use an
+equal priority. These demonstrate different ordering rules using existing
+schedulers. They do not implement periodic job releases, exact Linux FIFO or
+bandwidth enforcement. No scheduler source changes are required.
+
+The default configuration captures class operations and kernel SCX callbacks
+using the same fentry/fexit and tracepoint analysis as E3. The explicit native
+mode retains the original SCHED_OTHER capacity baseline.
 
 ## Setup and execution
 
-Install Docker and provision the images from `experiments.containers.e5.images`
-externally. The runner requires those exact images locally and never installs
-packages, pulls images, changes isolation or creates the parent cgroups.
+Provision Docker, the configured digest-pinned images, libbpf, clang-22 and
+bpftrace externally. Full tracing also needs the target kernel's
+`sched_ext:sched_ext_op_enter/exit` events with SCX_OP_IDX and `delta_ns` fields.
+Missing instrumentation fails preflight before starting workloads or schedulers.
+Unrelated ftrace events and function tracers must be disabled externally.
 
 ```sh
 python3 -m venv tester/build/e5-venv
@@ -21,60 +27,87 @@ sudo tester/build/e5-venv/bin/python tester/experiments/containers/run_e5.py --c
 python3 tester/experiments/containers/run_e5.py --analyse-only SUITE_DIR
 ```
 
-`tester/experiments/run.py e5` provides the same runner. The driver accepts
-`--config` before `e5`; the standalone runner accepts it after the script name.
-Offline analysis uses only the Python standard library and needs neither Docker
-nor root access. It writes the result tables into the suite directory; copy
-root-owned artifacts to a user-writable directory before replaying without root.
+`experiments/run.py e5` provides the same runner; put `--config` before `e5` for
+the shared driver. Replay needs only the Python standard library and writes into
+the suite directory. Copy root-owned captures to a writable directory if needed.
 
-Set the shared `workload_cgroup` and `controller_cgroup` to existing, disjoint
-process cgroups. For E5 capacity, the workload group must be empty throughout its
-subtree and confined to exactly one logical CPU. Parent CPU quotas must be
-unlimited. The controller group supplies client/controller placement and is
-restored after the suite. No separate CPU lists are configured.
+Set `workload_cgroup` and `controller_cgroup` to existing, disjoint process
+groups. The workload subtree must initially be empty and have exactly one logical
+CPU, matching the workload sizing experiment. All ancestor CPU quotas must be
+unlimited. The controller group supplies client and scheduler-process placement;
+the runner restores its original placement afterward. CPU lists come from the
+groups, with no separate CPU arguments.
 
-Docker creates its container cgroups under the workload group. With Docker's
-systemd driver, that group must be an existing systemd `.slice` at its canonical
-hierarchy path; with cgroupfs it may be an existing domain cgroup. Actual container
-ancestry, effective cpuset, every observed thread's affinity/policy and quota are
-checked before measurement. See Docker's
-[cgroup-parent documentation](https://docs.docker.com/reference/cli/dockerd/#default-cgroup-parent).
-Docker-created child groups and anonymous data volumes are removed afterward;
-the prepared parents are not removed.
+Docker creates its container groups under the existing workload group. Its
+systemd driver requires a canonical existing `.slice`; the cgroupfs driver
+accepts an existing domain group. Servers inherit that cpuset. The runner never
+installs packages, pulls images, creates the prepared parents or changes
+isolation/frequency settings. Only owned containers, anonymous volumes and
+scheduler instances are removed; the parents remain.
 
-## Configuration and measurements
+## Configuration and measurement
 
-The shared `duration_s` and `warmup_s` control measurement and warmup. E5 requires
-whole measurement seconds. `experiments.containers.e5` contains repetitions,
-image digests, memory limits, dataset/response sizes, client concurrency, queue
-capacity, per-pair request rates and capacity screening thresholds. Debug uses
-the same workloads with a shorter duration and one repetition.
+Shared `duration_s` and `warmup_s` control the measurement window. Measurement
+seconds must be whole numbers. `experiments.containers.e5` contains image digests,
+memory limits, dataset/response sizes, concurrency, queues, per-pair request
+rates, repetitions and capacity screening thresholds.
 
-Each case starts fresh containers, creates the dataset and prepares all clients
-before publishing a common start window. Nginx uses one worker, keepalive and
-no access log. Database requests are uniform read-only indexed lookups. Redis
-persistence is disabled; PostgreSQL and MongoDB retain their default persistence
-behavior. Servers bind to loopback and use the host network; clients execute
-outside the workload CPU.
+Its `scheduling` object selects:
 
-Capacity fits require the configured completion percentage, zero errors/drops,
-mean combined server CPU below its configured limit and host CPU busy time below
-its limit in each sampled one-second interval. A complete capture can fail these
-criteria; its result is retained and the runner exits with status 2 after reporting
-the suite. Cases are not retried or discarded to obtain a passing result.
+- `mode: "scx"`: a root and two leaf JLFP instances, built privately with custom
+  trace emissions and latency statistics disabled. Single-CPU shards allow the
+  leaves to cover the workload CPU. All observed server threads must use
+  SCHED_EXT; clients and scheduler processes stay in the controller group.
+- `container_weights`: Nginx must rank above the database. These are JLFP
+  priorities, not proportional CPU shares or quotas.
+- `nginx_period_ns`: initial worker/master labels are 1 ms/10 ms. A smaller label
+  gives a larger task weight (`2^63 - 1 - period_ns`). These labels order existing
+  event-loop processes; they do not control arrivals or job completion.
+- Database threads use the equal maximum task weight. New database threads
+  inherit SCHED_EXT and their absent map entry has the same effective default
+  weight. Observed Nginx restarts, priority changes or placement changes fail.
+- `trace: true`: require the full E3 capture. Debug configuration sets this to
+  `false` for functional sched_ext checks on an unpatched host; no overhead result
+  is produced. `mode: "native"` together with `trace: false` runs capacity only.
 
-Artifacts use the existing `tester/build/experiments` layout. Each suite retains
-its exact matrix, config, image/runtime versions, Docker commands, client logs,
-placement, raw nanosecond samples, one-second CPU counters and cleanup evidence.
-Replay verifies raw hashes, sample counts, request accounting and placement,
-then recomputes CPU demand and exact nearest-rank p99/max values. `results.json`
-and `results.csv` include failing cases. Incomplete suites and changed raw files
-are rejected. Reports retain `experiment_validated: false` pending target review.
+Fresh servers are seeded, then clients prepare connections before a common start
+window. Containers are briefly frozen while leaf schedulers and every existing
+thread's policy/weight are configured. This includes PostgreSQL connection
+backends. Containers resume before warmup. Policies, affinities, weights and
+scheduler identities are checked at setup and each CPU sample; task checks are
+retained. Leaves detach before the root and before removing Docker groups.
 
-Latency spans scheduled arrival through response, including delayed client
-admission and queueing. Actual request duration, admission lag, queue wait,
-first/second-half p99 and post-window completions remain visible. CPU headroom
-does not establish real-time latency bounds.
+Nginx uses one worker, keepalive, a static 1 KiB response and no access log.
+Database traffic reads uniformly selected indexed records from a hot dataset of
+10,000 values, 256 bytes each. Redis persistence is disabled. PostgreSQL and
+MongoDB retain their default persistence behavior. Servers bind to loopback with
+host networking; clients run outside the workload CPU.
 
-See [the original sizing measurements](WORKLOAD_SIZING.md) for the tested rates,
-the initial small-queue failure, longer PostgreSQL repeats and host limitations.
+## Results and replay
+
+The suite retains commands, image/build hashes, hierarchy identities, per-thread
+checks, raw request timing samples, one-second CPU counters and cleanup evidence.
+Replay verifies hashes, exact request accounting, placement and priorities, and
+recomputes CPU demand and nearest-rank latency statistics. `results.json` and
+`results.csv` retain complete cases that fail screening; cases are not retried to
+obtain a passing capacity result. Incomplete captures and changed files reject.
+
+Traced cases additionally retain bpftrace records/counters, miss evidence,
+normalized operations and `operation-analysis/` tables and paired calls. Replay
+recomputes E3's per-operation class/callback durations, outermost callback
+fractions and uncalibrated residuals. Lost events, misses, incomplete calls or
+missing nested callback samples invalidate the capture. Generic callback events
+identify an operation, not a scheduler instance: attribution aggregates the root
+and both leaves. It cannot separate their individual costs. Measurements include
+only work executing on the workload CPU; remote waker work is excluded. Probe,
+IRQ and preemption costs are not subtracted; tick calibration remains pending.
+
+Capacity screening requires the configured completion percentage, zero errors
+or queue drops, mean combined server CPU within its limit and one-second host
+busy time within its limit. Latency spans scheduled arrival through response;
+service time, admission lag, queue wait and post-window completions remain
+visible. CPU headroom does not establish real-time latency bounds. Reports keep
+`experiment_validated: false` pending target review.
+
+See [the native sizing measurements](WORKLOAD_SIZING.md) for the original rates
+and host limitations. Those measurements did not use sched_ext.

@@ -2,6 +2,7 @@
 
 import ctypes
 import ctypes.util
+import errno
 import json
 import os
 from pathlib import Path
@@ -12,7 +13,7 @@ from .common import cgroup_cpus, workload_cgroup
 POLICIES = {"other": os.SCHED_OTHER, "fifo": os.SCHED_FIFO, "rr": os.SCHED_RR, "ext": 7, "deadline": 6}
 
 
-def set_weight(weight, *, tid=None):
+def task_weight(*, tid=None, weight=None):
   library = ctypes.util.find_library("bpf")
   if library is None:
     raise RuntimeError("libbpf is required for JLFP task weights")
@@ -31,17 +32,27 @@ def set_weight(weight, *, tid=None):
     # PIDFD_THREAD is O_EXCL in linux/pidfd.h; task storage is per task
     pidfd = os.pidfd_open(os.getpid()) if tid is None else os.pidfd_open(tid, os.O_EXCL)
     try:
-      key, value = ctypes.c_int(pidfd), ctypes.c_uint64(weight)
-      if bpf.bpf_map_update_elem(fd, ctypes.byref(key), ctypes.byref(value), 0):
-        raise OSError(ctypes.get_errno(), "set JLFP task weight")
+      key = ctypes.c_int(pidfd)
+      if weight is not None:
+        value = ctypes.c_uint64(weight)
+        if bpf.bpf_map_update_elem(fd, ctypes.byref(key), ctypes.byref(value), 0):
+          raise OSError(ctypes.get_errno(), "set JLFP task weight")
       actual = ctypes.c_uint64()
-      if bpf.bpf_map_lookup_elem(fd, ctypes.byref(key), ctypes.byref(actual)) or \
-          actual.value != weight:
+      if bpf.bpf_map_lookup_elem(fd, ctypes.byref(key), ctypes.byref(actual)):
+        if weight is None and ctypes.get_errno() == errno.ENOENT:
+          return None
+        raise OSError(ctypes.get_errno(), "read JLFP task weight")
+      if weight is not None and actual.value != weight:
         raise RuntimeError("JLFP weight did not read back correctly")
+      return actual.value
     finally:
       os.close(pidfd)
   finally:
     os.close(fd)
+
+
+def set_weight(weight, *, tid=None):
+  return task_weight(tid=tid, weight=weight)
 
 
 def main(request, ready_fd, gate_fd):

@@ -1,4 +1,4 @@
-"""Configuration and case selection for the E5 container capacity baseline."""
+"""Configuration and case selection for E5 container experiments."""
 
 import re
 
@@ -10,7 +10,7 @@ def validate(settings):
   from .experiment_config import number, require_keys
   require_keys(settings, {"repetitions", "shards", "connections_per_shard", "queue_capacity",
                           "records", "payload_bytes", "response_bytes", "request_timeout_s",
-                          "images", "memory_mb", "profiles", "screening"}, "containers.e5")
+                          "images", "memory_mb", "profiles", "screening", "scheduling"}, "containers.e5")
   for key in ("repetitions", "shards", "connections_per_shard", "queue_capacity",
               "records", "payload_bytes", "response_bytes"):
     number(settings, key, integer=True)
@@ -32,6 +32,33 @@ def validate(settings):
   for key in settings["screening"]:
     if number(settings["screening"], key) > 100:
       raise ValueError(f"E5 {key} must be at most 100")
+  scheduling = settings["scheduling"]
+  require_keys(scheduling, {"mode", "trace", "slice_ns", "container_weights", "nginx_period_ns"},
+               "containers.e5.scheduling")
+  if scheduling["mode"] not in ("scx", "native") or type(scheduling["trace"]) is not bool:
+    raise ValueError("E5 scheduling requires mode scx/native and boolean trace")
+  if scheduling["mode"] == "native" and scheduling["trace"]:
+    raise ValueError("E5 native capacity baseline does not collect SCX overhead")
+  number(scheduling, "slice_ns", integer=True)
+  require_keys(scheduling["container_weights"], {"nginx", "database"}, "E5 container_weights")
+  weights = scheduling["container_weights"]
+  for name in weights:
+    number(weights, name, integer=True)
+  if not 1 <= weights["database"] < weights["nginx"] <= 10000:
+    raise ValueError("E5 requires nginx > database container weights within 1..10000")
+  periods = scheduling["nginx_period_ns"]
+  require_keys(periods, {"worker", "master"}, "E5 nginx_period_ns")
+  for role, period in periods.items():
+    if period is not None and (type(period) is not int or not 0 < period < (1 << 63) - 1):
+      raise ValueError(f"E5 {role} period must be null or a positive 63-bit integer")
+
+
+def scheduling(config):
+  return config["experiments"]["containers"]["e5"]["scheduling"]
+
+
+def stage(config):
+  return "scx_hierarchy" if scheduling(config)["mode"] == "scx" else "capacity_baseline"
 
 
 def cases(config, database=None):

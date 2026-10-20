@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run E5's native one-CPU Nginx/database capacity baseline."""
+"""Run E5's JLFP container hierarchy or configured native capacity baseline."""
 
 from pathlib import Path
 import sys

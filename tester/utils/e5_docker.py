@@ -1,6 +1,7 @@
 """Owned Docker containers below the configured existing workload cgroup."""
 
 import importlib.metadata
+from contextlib import contextmanager
 import json
 import os
 from pathlib import Path
@@ -11,7 +12,7 @@ import sys
 import time
 import uuid
 
-from . import common, lifecycle
+from . import common, e5_config, lifecycle
 
 CLIENT = Path(__file__).with_name("e5_client.py")
 
@@ -65,7 +66,7 @@ def prepare(config, directory, cases):
       raise ValueError(f"E5 capacity requires unlimited CPU quota at {parent}")
   state = lifecycle.root_state()
   if state["state"] != "disabled" or state["ops"] is not None:
-    raise ValueError("E5 capacity requires the SCX root scheduler to be detached")
+    raise ValueError("E5 requires the SCX root scheduler to be detached before setup")
   docker = Docker(directory, config["process_timeout_s"])
   info = json.loads(docker.run("info", "--format", "{{json .}}"))
   if info["CgroupVersion"] != "2":
@@ -163,6 +164,24 @@ class Pair:
         subprocess.run(command, stdout=log, stderr=subprocess.STDOUT,
                        timeout=self.config["process_timeout_s"], check=True)
 
+  @contextmanager
+  def paused(self):
+    paused = []
+    try:
+      for item in self.services.values():
+        self.docker.run("pause", item["name"])
+        paused.append(item["name"])
+      yield
+    finally:
+      errors = []
+      for name in reversed(paused):
+        try:
+          self.docker.run("unpause", name)
+        except Exception as error:
+          errors.append(str(error))
+      if errors:
+        raise common.CleanupError("unpause: " + "; ".join(errors))
+
   def placement(self):
     result = {}
     for name, item in self.services.items():
@@ -177,8 +196,9 @@ class Pair:
           affinities.add(tuple(sorted(os.sched_getaffinity(int(tid)))))
         except ProcessLookupError:
           pass
-      if policies != {os.SCHED_OTHER} or affinities != {(self.prepared["cpu"],)}:
-        raise ValueError(f"{name} policy/affinity differs from the native single-CPU baseline")
+      policy = 7 if e5_config.scheduling(self.config)["mode"] == "scx" else os.SCHED_OTHER
+      if policies != {policy} or affinities != {(self.prepared["cpu"],)}:
+        raise ValueError(f"{name} policy/affinity differs from the configured E5 placement")
       result[name] = {"cgroup": str(path), "policies": sorted(policies), "affinities": sorted(affinities),
                       "cpus": (path / "cpuset.cpus.effective").read_text().strip(),
                       "cpu_max": (path / "cpu.max").read_text().strip(),

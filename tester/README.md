@@ -584,11 +584,14 @@ individual function/callback boundaries. The older `operation_convert.py` adapte
 remains available for historical tracepoint captures. Standalone analysis does not
 start experiments or establish scientific validity.
 
-## Container E5 capacity baseline
+## Container E5 policies and overhead
 
-`experiments/containers/run_e5.py` and the shared driver's `e5` command run the
-native one-CPU Nginx/database capacity checks. Configuration is under
-`experiments.containers.e5`, with the shared duration and existing workload/
-controller cgroups. E5's RM/FIFO/JLFP policy hierarchy and overhead attribution
-remain pending. See [setup, execution and replay](experiments/containers/README.md)
-and [the original sizing results](experiments/containers/WORKLOAD_SIZING.md).
+`experiments/containers/run_e5.py` and the shared driver's `e5` command run a
+JLFP root with Nginx/database leaves on one logical CPU. Nginx uses nominal
+period-based fixed priorities, the database equal priorities, and the root favors
+Nginx. Default configuration enables E3-style class/callback overhead capture;
+debug configuration disables tracing explicitly for functional sched_ext checks.
+An explicit native mode retains the original capacity baseline. Configuration
+is under `experiments.containers.e5`, with shared durations and existing workload/
+controller cgroups. See [setup, semantics and replay](experiments/containers/README.md)
+and [the original native sizing results](experiments/containers/WORKLOAD_SIZING.md).

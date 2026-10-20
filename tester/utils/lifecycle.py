@@ -118,11 +118,11 @@ class Workload:
 
 
 class Session:
-  def __init__(self, config, directory, scheduler=None, *, events=(), recording=None):
+  def __init__(self, config, directory, scheduler=None, *, events=(), recording=None, hierarchy=False):
     self.config = config
     self.directory = Path(directory)
     self.timeout = config["process_timeout_s"]
-    self.cgroup, _ = common.placement(config)
+    self.cgroup, _ = common.placement(config, hierarchy=hierarchy)
     self.scheduler = scheduler
     self.root_process = None
     self.attached = None

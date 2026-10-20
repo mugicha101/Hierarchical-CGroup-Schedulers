@@ -259,6 +259,19 @@
           "minimum_completion_percent": 99.5,
           "max_combined_cpu_percent": 80,
           "max_cpu_busy_percent": 95
+        },
+        "scheduling": {
+          "mode": "scx",
+          "trace": false,
+          "slice_ns": 1000000,
+          "container_weights": {
+            "nginx": 2,
+            "database": 1
+          },
+          "nginx_period_ns": {
+            "worker": 1000000,
+            "master": 10000000
+          }
         }
       }
     },

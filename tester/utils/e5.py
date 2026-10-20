@@ -1,11 +1,11 @@
-"""E5 capacity cases with shared configuration, artifacts and offline replay."""
+"""Run E5's container hierarchy or its explicit native capacity baseline."""
 
 import csv
 import os
 from pathlib import Path
 import sys
 
-from . import common, e5_analysis, e5_capture, e5_config, e5_docker
+from . import builds, common, e5_analysis, e5_capture, e5_config, e5_docker, e5_overhead
 
 
 def print_report(result):
@@ -45,20 +45,25 @@ def run(config, *, database=None, analyse_only=None):
   if not float(config["duration_s"]).is_integer():
     raise ValueError("E5 requires a whole number of measurement seconds")
   cases = e5_config.cases(config, database)
+  scheduling = e5_config.scheduling(config)
   directory = common.new_run(config, "e5")
   print(f"E5 artifacts: {directory}", flush=True)
-  suite = {"status": "running", "stage": "capacity_baseline", "planned_cases": cases,
+  suite = {"status": "running", "stage": e5_config.stage(config), "planned_cases": cases,
            "cases": [], "command": sys.argv}
   common.write_json(directory / "suite.json", suite)
   try:
     with common.controller_placement(config):
       prepared = e5_docker.prepare(config, directory, cases)
+      profile = e5_overhead.prepare(config, directory) if scheduling["trace"] else None
+      manifest = builds.result(builds.build(config, "jlfp", trace="off")) if scheduling["mode"] == "scx" else None
+      if manifest is not None:
+        common.write_json(directory / "scheduler-build.json", manifest)
       for case in cases:
         name = f"{case['database']}-r{case['repetition']}"
         print(f"E5: {name} {case['rates']}", flush=True)
         output = directory / name
         output.mkdir()
-        e5_capture.capture(config, output, case, prepared)
+        e5_capture.capture(config, output, case, prepared, manifest, profile)
         suite["cases"].append({"case": case, "directory": name})
         common.write_json(directory / "suite.json", suite)
     suite["status"] = "succeeded"
@@ -70,6 +75,6 @@ def run(config, *, database=None, analyse_only=None):
   result = analyse(directory)
   metadata = common.read_json(directory / "run.json")
   common.write_json(directory / "run.json", {**metadata, "measurement": True,
-                    "experiment_validated": False, "stage": "capacity_baseline"})
+                    "experiment_validated": False, "stage": e5_config.stage(config)})
   print(f"E5 table: {directory / 'results.csv'}", flush=True)
   return result
