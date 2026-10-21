@@ -264,7 +264,6 @@ static __always_inline s32 jlfp_init_core(struct jlfp_arena __arena *a) {
   }
 
   // init cgroup data structs
-  a->base.self_cgroup_weight = DEFAULT_CGROUP_WEIGHT;
   u32 cid;
   u32 i;
   u32 nr_cids = scx_bpf_nr_cids();
@@ -284,7 +283,6 @@ static __always_inline s32 jlfp_init_core(struct jlfp_arena __arena *a) {
 
   // init task data structs
   a->dsq_id = 1;
-  a->base.self_cgroup_weight = a->base.cgroup_id ? DEFAULT_CGROUP_WEIGHT : WT_CGRP_WEIGHT_MASK;
   err = scx_bpf_create_dsq(a->dsq_id, -1);
   if (err) return err;
   bpf_for(cid, 0, nr_cids) {

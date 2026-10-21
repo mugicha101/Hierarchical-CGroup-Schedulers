@@ -297,10 +297,36 @@ static __always_inline void root_init() {
   }
 }
 
+// from qmap
+// gets weight of cgroup before attach
+static u32 cgroup_curr_weight(u64 cgid) {
+  struct cgroup_subsys_state *css;
+  struct cgroup *cgrp;
+  u32 weight = DEFAULT_CGROUP_WEIGHT;
+
+  cgrp = bpf_cgroup_from_id(cgid);
+  if (!cgrp)
+    return weight;
+
+  css = BPF_CORE_READ(cgrp, subsys[cpu_cgrp_id]);
+  if (css) {
+    struct task_group *tg = container_of(css, struct task_group, css);
+    u32 w = BPF_CORE_READ(tg, scx.weight);
+
+    if (w)
+      weight = w;
+  }
+  bpf_cgroup_release(cgrp);
+  return weight;
+}
+
 // init base_arena
 static __always_inline s32 base_init(struct base_arena __arena *a) {
   if (a->cgroup_id == 0) {
     root_init();
+    a->self_cgroup_weight = ROOT_CGROUP_WEIGHT;
+  } else {
+    a->self_cgroup_weight = cgroup_curr_weight(a->cgroup_id);
   }
 
   // copy global topology into arena
@@ -422,29 +448,6 @@ static __always_inline struct sub_sched_ctx __arena *sub_lookup(struct base_aren
     }
   }
   return NULL;
-}
-
-// from qmap
-// gets weight of cgroup before attach
-static u32 cgroup_curr_weight(u64 cgid) {
-  struct cgroup_subsys_state *css;
-  struct cgroup *cgrp;
-  u32 weight = DEFAULT_CGROUP_WEIGHT;
-
-  cgrp = bpf_cgroup_from_id(cgid);
-  if (!cgrp)
-    return weight;
-
-  css = BPF_CORE_READ(cgrp, subsys[cpu_cgrp_id]);
-  if (css) {
-    struct task_group *tg = container_of(css, struct task_group, css);
-    u32 w = BPF_CORE_READ(tg, scx.weight);
-
-    if (w)
-      weight = w;
-  }
-  bpf_cgroup_release(cgrp);
-  return weight;
 }
 
 static __always_inline task_ctx_t *base_init_task(struct base_arena __arena *a, struct task_struct *p, struct scx_init_task_args *args) {
