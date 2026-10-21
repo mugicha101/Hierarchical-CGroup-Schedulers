@@ -950,6 +950,20 @@ static __always_inline void jlfp_running_core(struct jlfp_arena __arena *a, stru
 
   if (likely(tctx)) get_jlfp_task_ctx(tctx)->pending_cid = NR_CPUS;
 
+  // recheck bound work queued while a higher-priority class owned this cpu
+  u64 nmig_dsq_id = jlfp_nmig_dsq_id(a, cid);
+  if (scx_bpf_dsq_nr_queued(nmig_dsq_id) > 0) {
+    struct task_struct *next = scx_bpf_dsq_peek(nmig_dsq_id);
+    if (next) {
+      task_ctx_t *next_ctx = get_task_ctx(next);
+      if (next_ctx && WT_STRIP_MISC(get_jlfp_task_ctx(next_ctx)->weight) > WT_STRIP_MISC(wt) &&
+          cmask_test(cid, &next_ctx->cpus_allowed) &&
+          (!is_migration_disabled(next) || scx_bpf_task_cid(next) == cid)) {
+        scx_bpf_kick_cid(cid, SCX_KICK_PREEMPT);
+      }
+    }
+  }
+
   // a higher task can enter the global queue after dispatch selected this task
   if (!WT_IS_NMIG(wt) && scx_bpf_dsq_nr_queued(a->dsq_id) > 0) {
     struct task_struct *next = scx_bpf_dsq_peek(a->dsq_id);
