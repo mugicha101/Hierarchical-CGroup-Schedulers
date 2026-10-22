@@ -28,9 +28,6 @@ static __always_inline bool jlfp_task_is_nmig(struct task_struct *p) {
   return is_migration_disabled(p) || p->nr_cpus_allowed == 1;
 }
 
-// running-weight metadata; min_effective uses misc bits for its selected cid
-#define JLFP_RT_IDLE_ORIGIN ((weight_tuple_t)1 << WT_MISC_SHIFT)
-
 static __always_inline u64 jlfp_nmig_dsq_id(struct jlfp_arena __arena *a, u32 cid) {
   return a->dsq_id + 1 + cid;
 }
@@ -94,6 +91,12 @@ static __always_inline bool init_jlfp_task_ctx(struct base_arena __arena *a, str
 #ifndef SCHED_RR
 #define SCHED_RR 2
 #endif
+
+// RT KTHREAD WAKEUP EDGE CASE: https://github.com/sched-ext/scx/pull/1094/commits/7d8b8e75812ab62454c734683de4944938b3edc2
+// per-cpu RT kthreads waking up scx task on idle cpu make cpu seem busy during enqueue
+// assumption: these kthreads should finish immediately after scheduler finishes, so not worth migrating
+// detecting this case and treating cpu as idle prevents unecessary migrations
+#define JLFP_RT_IDLE_ORIGIN ((weight_tuple_t)1 << WT_MISC_SHIFT)
 
 static __always_inline bool jlfp_percpu_kthread(struct task_struct *p) {
   return (BPF_CORE_READ(p, flags) & PF_KTHREAD) && BPF_CORE_READ(p, nr_cpus_allowed) == 1;
@@ -717,27 +720,40 @@ static void __always_inline jlfp_pick_cid(struct jlfp_arena __arena *a, struct t
       goto dispatch;
     }
 
+    // RT KTHREAD WAKEUP EDGE CASE
     if ((enq_flags & SCX_ENQ_WAKEUP) && !(enq_flags & SCX_ENQ_REENQ) &&
         prev_cid == scx_bpf_this_cid() && jlfp_percpu_rt_kthread(bpf_get_current_task_btf())) {
       u32 shard = a->base.topo.cids[prev_cid].shard_idx;
       struct shard_ctx *sctx = bpf_map_lookup_elem(&shard_ctx_map, &shard);
       u32 offset = prev_cid - a->base.topo.shards[shard].base_cid;
-      weight_tuple_t idle_rt = WT_STRIP_MISC(U128_MAX) | JLFP_RT_IDLE_ORIGIN;
+      const weight_tuple_t idle_rt = WT_STRIP_MISC(U128_MAX) | JLFP_RT_IDLE_ORIGIN;
+
+      // since this would bypass dispatch, check to see if anything in ldsq/nmig ldsq/gdsq
+      // notably: if ldsq is not empty then another scx task is trying to run on this cpu
+      // ops.running during switch back from rt kthread to the scx task should handle cases where this task has higher priority and is put in gdsq/nmig dsq instead of preempting the current scx task
+      // other 2 dsq checks prevent starving the gdsq/nmig dsq at cost of potential migration of enqueued task
+      // since this check happens on wakeup path, want the check to be quick
       if (sctx && offset < SCX_CID_SHARD_MAX_CPUS &&
           READ_ONCE(sctx->cid_running_weight[offset]) == idle_rt &&
           scx_bpf_dsq_nr_queued(SCX_DSQ_LOCAL_ON | prev_cid) == 0 &&
           scx_bpf_dsq_nr_queued(jlfp_nmig_dsq_id(a, prev_cid)) == 0 &&
           scx_bpf_dsq_nr_queued(a->dsq_id) == 0 && !bpf_res_spin_lock(&sctx->lock)) {
-        // consume the idle-origin handoff once; remote selections still see the rt weight
-        if (sctx->cid_running_weight[offset] == idle_rt &&
-            !sctx->cid_pending_weight[offset] && !sctx->cid_pending_owner[offset]) {
+
+        // SHARD LOCK CS START
+
+        if (sctx->cid_running_weight[offset] == idle_rt && !sctx->cid_pending_weight[offset] && !sctx->cid_pending_owner[offset]) {
+          // claim cpu by consuming idle-origin marker
+          // keep running weight at RT thread's running weight until task actually runs
           sctx->cid_running_weight[offset] = WT_STRIP_MISC(U128_MAX);
           set_pending_weight_locked(a, prev_cid, shard, task_wt, sctx, p->scx.tid);
           bpf_res_spin_unlock(&sctx->lock);
+
           get_jlfp_task_ctx(tctx)->pending_cid = prev_cid;
           goto dispatch;
         }
         bpf_res_spin_unlock(&sctx->lock);
+
+        // SHARD LOCK CS END
       }
     }
   }
