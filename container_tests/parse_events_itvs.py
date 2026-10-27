@@ -26,6 +26,8 @@ first pass: parse events and construct timelines and scheduling contexts
 
 second pass: calculate metric intervals for each scheduling context
   track hp blocking intervals when a cpu is occupied by a higher priority scheduling class and pending tasks exist
+  fair > SCX by default; --fair-below-scx treats fair execution as lower-priority work
+  native normal-priority tasks without active SCX metadata are treated as fair
   IRQ handlers, softirqs and IRQ vector entry/exit intervals count as higher-class work
   interrupted tasks accrue blocking time; IRQ time is excluded from CPU task time
   track global priority inversion intervals when a task is pending when a lower priority task or scheduling class is running (including idle)
@@ -57,9 +59,9 @@ class TaskStatus(Enum):
 
 Event = namedtuple("Event", "sched time cpu event_type details")
 
-# identify native classes that take precedence over SCX
-def is_higher_class(prio):
-  return prio is not None and prio < 100
+# fair and SCX share native priorities, so CPU classification identifies fair tasks
+def is_higher_class(prio, *, fair=False, fair_below_scx=False):
+  return prio is not None and (prio < 100 or (fair and not fair_below_scx))
 
 # recognize paired interrupt tracepoints without including softirq raises
 def is_irq_event(name):
@@ -520,7 +522,7 @@ class Sched:
     self.blocked = cover(itv for ctx in self.contexts.values() for itv in ctx.blocked)
 
 # build independent timelines, join their metadata and evaluate contexts
-def analyze(events, cpumasks, *, native, waking, real_nmig=False, cgrp_weights=None, skip_ns=0):
+def analyze(events, cpumasks, *, native, waking, real_nmig=False, cgrp_weights=None, skip_ns=0, fair_below_scx=False):
   start, end = events[0].time + skip_ns, events[-1].time
   if skip_ns < 0 or (skip_ns and start >= end):
     raise ValueError("Skip must leave a nonempty analysis window")
@@ -550,8 +552,9 @@ def analyze(events, cpumasks, *, native, waking, real_nmig=False, cgrp_weights=N
       (pid, prio), (task, cgrp_weight) = itv.value
       tracked = task is not None and task.status == TaskStatus.RUNNING and task.cpu == cpu
       priority = (cgrp_weight, task.weight) if tracked else None
-      itvs.append(Itv(itv.start, itv.end, CpuRun(is_higher_class(prio), priority,
-                                                     available=not native or pid == 0)))
+      fair = native and pid not in (None, 0) and not tracked and prio is not None and prio >= 100
+      itvs.append(Itv(itv.start, itv.end, CpuRun(is_higher_class(prio, fair=fair, fair_below_scx=fair_below_scx), priority,
+                            available=not native or pid == 0 or (fair and fair_below_scx))))
     cpus[cpu] = Timeline(itvs)
     if cpu in irqs:
       overlay = join(cpus[cpu], lambda _: irqs[cpu])
@@ -614,7 +617,7 @@ def report(cpus, scheds, total, verbose=False):
       print(f"{label} at time {time}")
 
 # display discovered relations and dispatch CPUs with a suggested replay command
-def dump_hierarchy(groups, trace, cgrp_weights=None, *, plugin_path=None, skip=0):
+def dump_hierarchy(groups, trace, cgrp_weights=None, *, plugin_path=None, skip=0, fair_below_scx=False):
   print("Scheduler hierarchy (all observed relations; CPUs dispatched to):")
   for group, info in sorted(groups.items()):
     parents = ",".join(map(str, sorted(info["parents"]))) or "-"
@@ -630,6 +633,8 @@ def dump_hierarchy(groups, trace, cgrp_weights=None, *, plugin_path=None, skip=0
     command.extend(["--plugin", plugin_path])
   if skip:
     command.extend(["--skip", str(skip)])
+  if fair_below_scx:
+    command.append("--fair-below-scx")
   print("\nSuggested command (adjust observed masks to match your workload):")
   print("  " + shlex.join(command))
 
@@ -639,6 +644,7 @@ def main():
   parser.add_argument("trace", metavar="TRACE.dat")
   parser.add_argument("-v", "--verbose", action="store_true", help="print inversion interval boundaries")
   parser.add_argument("--real-nmig", action="store_true", help="derive nmig from effective task masks when available")
+  parser.add_argument("--fair-below-scx", action="store_true", help="treat fair execution as lower priority than SCX (default: fair > SCX)")
   parser.add_argument("--dump-hierarchy", action="store_true", help="dump scheduler relations, execution CPUs and a suggested command")
   parser.add_argument("--plugin", metavar="PATH", help="ftrace babeltrace plugin file or directory (default: installed ftrace plugin)")
   parser.add_argument("--skip", type=float, default=0, metavar="SECONDS",
@@ -660,11 +666,13 @@ def main():
   events = list(parse_trace(read_trace(args.trace, args.plugin)))
   print(f"Read {len(events)} scheduler events.")
   print(f"IRQ entry/exit events: {sum(is_irq_event(event.event_type) for event in events)}")
+  print("Class order:", "fair < SCX" if args.fair_below_scx else "fair > SCX")
   if not events:
     print("No scheduler events found.")
     return
   if args.dump_hierarchy:
-    dump_hierarchy(discover_scheds(events), args.trace, cgrp_weights, plugin_path=args.plugin, skip=args.skip)
+    dump_hierarchy(discover_scheds(events), args.trace, cgrp_weights, plugin_path=args.plugin,
+                   skip=args.skip, fair_below_scx=args.fair_below_scx)
     return
   native = any(event.event_type == "sched:sched_switch" for event in events)
   waking = any(event.event_type == "sched:sched_waking" for event in events)
@@ -682,7 +690,8 @@ def main():
     print(f"Skipping {skip_ns}ns of warm-up; retaining earlier task and CPU state")
   print("Building timelines and analyzing contexts")
   cpus, scheds = analyze(events, cpumasks, native=native, waking=waking,
-                        real_nmig=args.real_nmig, cgrp_weights=cgrp_weights, skip_ns=skip_ns)
+                        real_nmig=args.real_nmig, cgrp_weights=cgrp_weights, skip_ns=skip_ns,
+                        fair_below_scx=args.fair_below_scx)
   report(cpus, scheds, events[-1].time - events[0].time - skip_ns, args.verbose)
 
 if __name__ == "__main__":

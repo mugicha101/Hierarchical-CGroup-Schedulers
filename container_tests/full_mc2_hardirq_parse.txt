@@ -2,29 +2,30 @@ Command:
 /usr/bin/python3 container_tests/parse_events_itvs.py container_tests/full_mc2_hardirq.dat --plugin tester/build/bt2-ftrace-to-ctf/build/babeltrace-plugin-ftrace.so --skip 1 --cmasks '15116=8-11 15207=12-15 15298=8-15' --weights '15116=100 15207=100 15298=50'
 
 Output:
-Reading trace: full_mc2_hardirq.dat
+Reading trace: container_tests/full_mc2_hardirq.dat
 Read 620999 scheduler events.
 IRQ entry/exit events: 0
+Class order: fair > SCX
 Skipping 1000000000ns of warm-up; retaining earlier task and CPU state
 Building timelines and analyzing contexts
 Total time: 36576370507ns
 Priority Inversion: 1037737574ns (2.84%)
-Higher-class blocking: 4305311ns (0.01%)
+Higher-class blocking: 380829976ns (1.04%)
 Scheduler 15207 effective CPUs: [12, 13, 14, 15]
 Scheduler 15207 Priority Inversion: 29837760ns (0.08%)
   Global PI: 29826816ns (0.08%)
   Partitioned PI: 10944ns (0.00%)
-  Higher-class blocking: 1634579ns (0.00%)
+  Higher-class blocking: 11010998ns (0.03%)
 Scheduler 15116 effective CPUs: [8, 9, 10, 11]
 Scheduler 15116 Priority Inversion: 28944005ns (0.08%)
   Global PI: 28888730ns (0.08%)
   Partitioned PI: 55275ns (0.00%)
-  Higher-class blocking: 886717ns (0.00%)
+  Higher-class blocking: 21810752ns (0.06%)
 Scheduler 15298 effective CPUs: [8, 9, 10, 11, 12, 13, 14, 15]
 Scheduler 15298 Priority Inversion: 1003925079ns (2.74%)
   Global PI: 1003925079ns (2.74%)
   Partitioned PI: 0ns (0.00%)
-  Higher-class blocking: 2332778ns (0.01%)
+  Higher-class blocking: 373508016ns (1.02%)
 CPU 0:
   Other/idle time: 36576370507ns (100.00%)
   Task time: 0ns (0.00%)
@@ -60,32 +61,32 @@ CPU 7:
 CPU 8:
   Other/idle time: 16682148396ns (45.61%)
   Task time: 19894222111ns (54.39%)
-  Higher-class time: 318947ns (0.00%)
+  Higher-class time: 120153276ns (0.33%)
 CPU 9:
   Other/idle time: 17798342033ns (48.66%)
   Task time: 18778028474ns (51.34%)
-  Higher-class time: 223864ns (0.00%)
+  Higher-class time: 111422477ns (0.30%)
 CPU 10:
   Other/idle time: 22585151843ns (61.75%)
   Task time: 13991218664ns (38.25%)
-  Higher-class time: 425487ns (0.00%)
+  Higher-class time: 66376926ns (0.18%)
 CPU 11:
   Other/idle time: 24457330376ns (66.87%)
   Task time: 12119040131ns (33.13%)
-  Higher-class time: 329982ns (0.00%)
+  Higher-class time: 66311088ns (0.18%)
 CPU 12:
   Other/idle time: 12774697118ns (34.93%)
   Task time: 23801673389ns (65.07%)
-  Higher-class time: 500818ns (0.00%)
+  Higher-class time: 155615729ns (0.43%)
 CPU 13:
   Other/idle time: 11717257428ns (32.04%)
   Task time: 24859113079ns (67.96%)
-  Higher-class time: 495641ns (0.00%)
+  Higher-class time: 160202946ns (0.44%)
 CPU 14:
   Other/idle time: 13324617786ns (36.43%)
   Task time: 23251752721ns (63.57%)
-  Higher-class time: 355630ns (0.00%)
+  Higher-class time: 149613136ns (0.41%)
 CPU 15:
   Other/idle time: 12049813042ns (32.94%)
   Task time: 24526557465ns (67.06%)
-  Higher-class time: 1807602ns (0.00%)
+  Higher-class time: 160156128ns (0.44%)
