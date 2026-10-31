@@ -104,7 +104,7 @@ struct base_arena {
   u64 cgroup_id; // 0 if root
   u64 max_tasks; // max tasks allowed in the cgroup (include non-scx, stores a cmask for all tasks)
   
-  // set on init/cpuctl_weight_update
+  // matches cgroup's cpu.weight
   u64 self_cgroup_weight;
 
   // subscheduler state

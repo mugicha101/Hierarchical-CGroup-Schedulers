@@ -341,6 +341,13 @@ void BPF_STRUCT_OPS(jlfp_tick, struct task_struct *p) {
   SCXTP_EMIT_OP_EXIT(tick, aa.base.cgroup_id);
 }
 
+// temporary workaround until better system to notify subscheds of own cgroup weight change
+SEC("fentry/scx_group_set_weight")
+int BPF_PROG(on_group_set_weight, struct task_group *tg, unsigned long weight)
+{
+  return base_update_self_weight(&aa.base, tg, weight);
+}
+
 // based on scx_pair
 // allows cid_form schedulers to detect when a cpu is used for higher priority work
 // this replaces ops.cpu_acquire and ops.cpu_release which are deprecated in sched_ext_ops and unusable in cid_form schedulers

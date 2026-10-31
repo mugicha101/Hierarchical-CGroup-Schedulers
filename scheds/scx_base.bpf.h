@@ -530,4 +530,13 @@ static __always_inline void base_update_idle(struct base_arena __arena *a, s32 c
     cmask_clear(cid, &a->idle_cids.mask);
 }
 
+// temporary workaround until better system to notify subscheds of own cgroup weight change
+// each scheduler instance attaches a probe to fentry/scx_group_set_weight to track its own weight changes
+static __always_inline int base_update_self_weight(struct base_arena __arena *a, struct task_group *tg, unsigned long weight) {
+  if (a->cgroup_id && BPF_CORE_READ(tg, css.cgroup, kn, id) == a->cgroup_id) {
+    a->self_cgroup_weight = weight;
+  }
+  return 0;
+}
+
 #endif
