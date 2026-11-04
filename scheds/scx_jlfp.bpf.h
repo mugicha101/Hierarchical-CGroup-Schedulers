@@ -609,10 +609,16 @@ static __always_inline u64 jlfp_try_task_dispatch(struct jlfp_arena __arena *a, 
 
   lstat_record(&lctx, &a->stats[cid].task_dispatch);
 
-  // rerun the previous task
-  if (!moved_pid && prev_wt && likely(prev && pctx)) {
-    moved_pid = prev->pid;
-    scx_bpf_task_set_slice(prev, slice);
+  // need to handle prev
+  if (prev_wt && likely(prev && pctx)) {
+    if (!moved_pid) {
+      // rerun prev
+      moved_pid = prev->pid;
+      scx_bpf_task_set_slice(prev, slice);
+    } else if (BPF_CORE_READ(prev, scx.slice)) {
+      // enqueue prev
+      scx_bpf_task_set_slice(prev, 0);
+    }
   }
 
   return moved_pid;
@@ -898,12 +904,17 @@ static void __always_inline jlfp_pick_cid(struct jlfp_arena __arena *a, struct t
 
   dispatch:
 
-  // if slice not 0, retain prev slice since was likely preempted by higher priority task, bypassing dispatch
+  // if slice not 0, retain prev slice since we need dispatch to run to remove inversions
   // this allows dispatch to fix any gdsq/nmig dsq inversions when slice expires
-  // this case should be pretty rare
-  if (unlikely(p->scx.slice)) slice = p->scx.slice;
+  if (unlikely(p->scx.slice && p->scx.slice < slice)) slice = p->scx.slice;
 
   // SCX_ENQ_PREEMPT handles the kicking
+  // NOTE: if higher priority task is running, prior scx task slice not cleared
+  // this means prior task can be stuck behind current one, and will run next without dispatch running
+  // however ops.running check prevents this prior task from outweighing GDSQ, so inversion limited to prior task not being able to run for a slice
+  // scx_bpf_dsq_reenq(SCX_DSQ_LOCAL_ON | cid, 0) does not fix this since might reenq inserted task
+  // IMMED is designed to fix this but sched_switch sees higher priority class after REENQ loop so not a great fix
+  // also causes migrations due to not being able to handle PREEMPT_RT per-cpu kthread case
   scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | (target_cid & (NR_CPUS - 1)), slice, SCX_ENQ_PREEMPT);
 
   u32 cid = scx_bpf_this_cid();
