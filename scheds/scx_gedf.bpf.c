@@ -121,12 +121,12 @@ s32 BPF_STRUCT_OPS(gedf_select_cid, struct task_struct *p, s32 prev_cid, u64 wak
   struct latency_ctx lctx;
   lstat_start(&lctx);
   check_completion(p);
-  jlfp_pick_cid(&aa.jlfp, p, (u32)prev_cid, SCX_ENQ_WAKEUP | wake_flags, get_task_weight(p), aa.jlfp.slice);
+  u32 target_cid = jlfp_pick_cid(&aa.jlfp, p, (u32)prev_cid, SCX_ENQ_WAKEUP | wake_flags, get_task_weight(p), aa.jlfp.slice);
   u32 cid = scx_bpf_this_cid();
   lstat_record(&lctx, &aa.jlfp.stats[cid].select_cid);
 
   SCXTP_EMIT_OP_EXIT(select_cpu, aa.jlfp.base.cgroup_id);
-  return prev_cid; // should be ignored since enqueue shouldn't run
+  return target_cid;
 }
 
 void BPF_STRUCT_OPS(gedf_enqueue, struct task_struct *p, u64 enq_flags)

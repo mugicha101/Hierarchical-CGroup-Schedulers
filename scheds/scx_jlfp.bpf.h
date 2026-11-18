@@ -654,7 +654,8 @@ static __always_inline bool jlfp_try_sub_dispatch(struct jlfp_arena __arena *a, 
 
 // inserts into a local, per-cid, or global dsq from select_cid or enqueue
 // insertion from select_cid skips the enqueue callback
-static void __always_inline jlfp_pick_cid(struct jlfp_arena __arena *a, struct task_struct *p, u32 prev_cid, u64 enq_flags, u64 task_weight, u64 slice) {
+// returns the local target cid, or prev_cid for non-local queues
+static u32 __always_inline jlfp_pick_cid(struct jlfp_arena __arena *a, struct task_struct *p, u32 prev_cid, u64 enq_flags, u64 task_weight, u64 slice) {
   struct latency_ctx lctx;
   lstat_start(&lctx);
 
@@ -664,7 +665,7 @@ static void __always_inline jlfp_pick_cid(struct jlfp_arena __arena *a, struct t
   u32 reenq_reason = BPF_CORE_READ(p, scx.flags) & SCX_TASK_REENQ_REASON_MASK;
   if ((enq_flags & SCX_ENQ_REENQ) && reenq_reason == SCX_TASK_REENQ_CAP) {
     scx_bpf_error("capability issue: pid=%d enq_flags=%llu", p->pid, enq_flags);
-    return;
+    return prev_cid;
   }
 
   prev_cid = prev_cid & (NR_CPUS - 1); // for verifier
@@ -683,17 +684,17 @@ static void __always_inline jlfp_pick_cid(struct jlfp_arena __arena *a, struct t
     u32 pending_shard = a->base.topo.cids[pending_cid].shard_idx;
     if (unlikely(pending_shard >= NR_CPUS)) {
       scx_bpf_error("Invalid pending shard %u", pending_shard);
-      return;
+      return prev_cid;
     }
     u32 shard_offset = pending_cid - a->base.topo.shards[pending_shard].base_cid;
     if (unlikely(pending_cid < a->base.topo.shards[pending_shard].base_cid || shard_offset >= SCX_CID_SHARD_MAX_CPUS)) {
       scx_bpf_error("Failed to fetch pending cid %u or pending shard %u", pending_cid, pending_shard);
-      return;
+      return prev_cid;
     }
     struct shard_ctx *sctx = bpf_map_lookup_elem(&shard_ctx_map, &pending_shard);
     if (unlikely(!sctx)) {
       scx_bpf_error("Failed to lookup pending shard %u", pending_shard);
-      return;
+      return prev_cid;
     }
     if (unlikely(bpf_res_spin_lock(&sctx->lock))) {
       scx_bpf_error("Failed to lock pending shard %u", pending_shard);
@@ -924,7 +925,7 @@ static void __always_inline jlfp_pick_cid(struct jlfp_arena __arena *a, struct t
   // NO DISPATCH
   dispatch_fail:
 
-  target_cid = NR_CPUS;
+  target_cid = prev_cid;
 
   // keep bound tasks out of the global queue shared by other cids
   u64 vtime = WT_VTIME_FROM_LOWER(WT_LOWER(task_wt));
@@ -942,6 +943,8 @@ static void __always_inline jlfp_pick_cid(struct jlfp_arena __arena *a, struct t
       e->weight = WT_LOWER(task_wt);
     );
   }
+
+  return target_cid;
 }
 
 static __always_inline void jlfp_running_core(struct jlfp_arena __arena *a, struct task_struct *p, task_ctx_t *tctx, weight_tuple_t wt, struct latency_ctx *lctx) {
