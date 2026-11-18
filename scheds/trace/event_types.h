@@ -81,6 +81,15 @@ struct scxtp_event_stopping {
   __u8 runnable;
 };
 
+// op uses the target kernel's SCX_OP_IDX numbering
+struct scxtp_event_op_entry {
+  __u32 op;
+};
+
+struct scxtp_event_op_exit {
+  __u32 op;
+};
+
 // shared by the BPF declarations and kernel kfunc registration
 #define SCXTP_EVENT_LIST(EVENT) \
   EVENT(init) \
@@ -96,5 +105,7 @@ struct scxtp_event_stopping {
   EVENT(enqueue_args) \
   EVENT(select_cid_args) \
   EVENT(running) \
-  EVENT(stopping)
+  EVENT(stopping) \
+  EVENT(op_entry) \
+  EVENT(op_exit)
 #endif

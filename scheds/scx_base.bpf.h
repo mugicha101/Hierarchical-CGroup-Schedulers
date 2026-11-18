@@ -130,7 +130,7 @@ static __always_inline void root_init() {
   u32 nr_cids = scx_bpf_nr_cids();
   if (nr_cids > BASE_MAX_CPUS)
     nr_cids = BASE_MAX_CPUS;
-  bpf_printk("[INFO] [JLFP] [INIT] nr_cids=%u", nr_cids);
+  bpf_printk("[INFO] [SCX] [INIT] nr_cids=%u", nr_cids);
   
   // init topology
   // note: cannot assume zero initialized due to pinning
@@ -150,7 +150,7 @@ static __always_inline void root_init() {
   bpf_for(cid, 0, nr_cids) {
     struct scx_cid_topo t = {};
     scx_bpf_cid_topo(cid, &t, sizeof(t));
-    bpf_printk("[INFO] [JLFP] [INIT] core_cid=%u core_idx=%d llc_cid=%d llc_idx=%d node_cid=%d node_idx=%d shard_cid=%d shard_idx=%d",
+    bpf_printk("[INFO] [SCX] [INIT] core_cid=%u core_idx=%d llc_cid=%d llc_idx=%d node_cid=%d node_idx=%d shard_cid=%d shard_idx=%d",
       t.core_cid,
       t.core_idx,
       t.llc_cid,
@@ -211,7 +211,7 @@ static __always_inline void root_init() {
     core_td->shard_idx = t.shard_idx;
     core_td->llc_idx = t.llc_idx;
     core_td->node_idx = t.node_idx;
-    bpf_printk("[INFO] [JLFP] [INIT] new core: %lld", t.core_idx);
+    bpf_printk("[INFO] [SCX] [INIT] new core: %lld", t.core_idx);
 
     if (t.shard_idx < topo->nr_shards) {
       bpf_assert(shard_td->base_cid == t.shard_cid);
@@ -225,7 +225,7 @@ static __always_inline void root_init() {
     shard_td->nr_cids = 1;
     shard_td->llc_idx = t.llc_idx;
     shard_td->node_idx = t.node_idx;
-    bpf_printk("[INFO] [JLFP] [INIT] new shard: %lld", t.shard_idx);
+    bpf_printk("[INFO] [SCX] [INIT] new shard: %lld", t.shard_idx);
 
     if (t.llc_idx < topo->nr_llcs) {
       bpf_assert(llc_td->base_cid == t.llc_cid);
@@ -238,7 +238,7 @@ static __always_inline void root_init() {
     llc_td->nr_cids = 1;
     llc_td->nr_shards = 1;
     llc_td->node_idx = t.node_idx;
-    bpf_printk("[INFO] [JLFP] [INIT] new llc: %lld", t.llc_idx);
+    bpf_printk("[INFO] [SCX] [INIT] new llc: %lld", t.llc_idx);
 
     if (t.node_idx < topo->nr_nodes) {
       bpf_assert(node_td->base_cid == t.node_cid);
@@ -250,9 +250,9 @@ static __always_inline void root_init() {
     node_td->base_shard = t.shard_idx;
     node_td->nr_cids = 1;
     node_td->nr_shards = 1;
-    bpf_printk("[INFO] [JLFP] [INIT] new node: %lld", t.node_idx);
+    bpf_printk("[INFO] [SCX] [INIT] new node: %lld", t.node_idx);
   }
-  bpf_printk("[INFO] [JLFP] [INIT] topo nr_cids=%u nr_cores=%u nr_shards=%u nr_llcs=%u nr_nodes=%u",
+  bpf_printk("[INFO] [SCX] [INIT] topo nr_cids=%u nr_cores=%u nr_shards=%u nr_llcs=%u nr_nodes=%u",
     topo->nr_cids,
     topo->nr_cores,
     topo->nr_shards,
@@ -293,14 +293,40 @@ static __always_inline void root_init() {
       shard_td->shard_dist_order[(node_td->nr_shards + j) & (BASE_MAX_CPUS-1)] = j + (j < off ? (u32)0 : node_td->nr_shards);
     }
     
-    bpf_printk("[INFO] [JLFP] [INIT] shard[%u] shard_dist_order: %u %u %u", i, shard_td->shard_dist_order[0], shard_td->shard_dist_order[1], shard_td->shard_dist_order[2]);
+    bpf_printk("[INFO] [SCX] [INIT] shard[%u] shard_dist_order: %u %u %u", i, shard_td->shard_dist_order[0], shard_td->shard_dist_order[1], shard_td->shard_dist_order[2]);
   }
+}
+
+// from qmap
+// gets weight of cgroup before attach
+static u32 cgroup_curr_weight(u64 cgid) {
+  struct cgroup_subsys_state *css;
+  struct cgroup *cgrp;
+  u32 weight = DEFAULT_CGROUP_WEIGHT;
+
+  cgrp = bpf_cgroup_from_id(cgid);
+  if (!cgrp)
+    return weight;
+
+  css = BPF_CORE_READ(cgrp, subsys[cpu_cgrp_id]);
+  if (css) {
+    struct task_group *tg = container_of(css, struct task_group, css);
+    u32 w = BPF_CORE_READ(tg, scx.weight);
+
+    if (w)
+      weight = w;
+  }
+  bpf_cgroup_release(cgrp);
+  return weight;
 }
 
 // init base_arena
 static __always_inline s32 base_init(struct base_arena __arena *a) {
   if (a->cgroup_id == 0) {
     root_init();
+    a->self_cgroup_weight = ROOT_CGROUP_WEIGHT;
+  } else {
+    a->self_cgroup_weight = cgroup_curr_weight(a->cgroup_id);
   }
 
   // copy global topology into arena
@@ -400,7 +426,7 @@ static __always_inline s32 base_init(struct base_arena __arena *a) {
     bpf_for(j, 0, shard_td->nr_cids) {
       cmask_set(shard_td->base_cid + j, mask);
     }
-    bpf_printk("[INFO] [JLFP] [INIT] shard[%u] shard_td->nr_cids=%llu base=%llu nr_cids=%llu cmask=%06llx", i, shard_td->nr_cids, mask->base, mask->nr_cids, cmask_to_u64(mask));
+    bpf_printk("[INFO] [SCX] [INIT] shard[%u] shard_td->nr_cids=%llu base=%llu nr_cids=%llu cmask=%06llx", i, shard_td->nr_cids, mask->base, mask->nr_cids, cmask_to_u64(mask));
   }
 
   // TODO: handle subschedulers in capabilities ops
@@ -422,29 +448,6 @@ static __always_inline struct sub_sched_ctx __arena *sub_lookup(struct base_aren
     }
   }
   return NULL;
-}
-
-// from qmap
-// gets weight of cgroup before attach
-static u32 cgroup_curr_weight(u64 cgid) {
-  struct cgroup_subsys_state *css;
-  struct cgroup *cgrp;
-  u32 weight = DEFAULT_CGROUP_WEIGHT;
-
-  cgrp = bpf_cgroup_from_id(cgid);
-  if (!cgrp)
-    return weight;
-
-  css = BPF_CORE_READ(cgrp, subsys[cpu_cgrp_id]);
-  if (css) {
-    struct task_group *tg = container_of(css, struct task_group, css);
-    u32 w = BPF_CORE_READ(tg, scx.weight);
-
-    if (w)
-      weight = w;
-  }
-  bpf_cgroup_release(cgrp);
-  return weight;
 }
 
 static __always_inline task_ctx_t *base_init_task(struct base_arena __arena *a, struct task_struct *p, struct scx_init_task_args *args) {
@@ -525,6 +528,15 @@ static __always_inline void base_update_idle(struct base_arena __arena *a, s32 c
     cmask_set(cid, &a->idle_cids.mask);
   else
     cmask_clear(cid, &a->idle_cids.mask);
+}
+
+// temporary workaround until better system to notify subscheds of own cgroup weight change
+// each scheduler instance attaches a probe to fentry/scx_group_set_weight to track its own weight changes
+static __always_inline int base_update_self_weight(struct base_arena __arena *a, struct task_group *tg, unsigned long weight) {
+  if (a->cgroup_id && BPF_CORE_READ(tg, css.cgroup, kn, id) == a->cgroup_id) {
+    a->self_cgroup_weight = weight;
+  }
+  return 0;
 }
 
 #endif

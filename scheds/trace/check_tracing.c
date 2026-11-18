@@ -21,7 +21,8 @@ int main(int argc, char **argv)
       fprintf(stderr, "Failed to open JLFP skeleton\n");
       return 1;
     }
-    tracing = skel->rodata->scxtp_lowfreq_compiled;
+    tracing = skel->rodata->scxtp_lowfreq_compiled ||
+              skel->rodata->scxtp_hotpath_compiled || skel->rodata->scxtp_op_compiled;
     scx_jlfp__destroy(skel);
   } else if (!strcmp(argv[1], "scx_gedf")) {
     struct scx_gedf *skel = scx_gedf__open();
@@ -29,7 +30,8 @@ int main(int argc, char **argv)
       fprintf(stderr, "Failed to open GEDF skeleton\n");
       return 1;
     }
-    tracing = skel->rodata->scxtp_lowfreq_compiled;
+    tracing = skel->rodata->scxtp_lowfreq_compiled ||
+              skel->rodata->scxtp_hotpath_compiled || skel->rodata->scxtp_op_compiled;
     scx_gedf__destroy(skel);
   } else {
     fprintf(stderr, "Unknown scheduler: %s\n", argv[1]);

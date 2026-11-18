@@ -28,9 +28,6 @@ static __always_inline bool jlfp_task_is_nmig(struct task_struct *p) {
   return is_migration_disabled(p) || p->nr_cpus_allowed == 1;
 }
 
-// running-weight metadata; min_effective uses misc bits for its selected cid
-#define JLFP_RT_IDLE_ORIGIN ((weight_tuple_t)1 << WT_MISC_SHIFT)
-
 static __always_inline u64 jlfp_nmig_dsq_id(struct jlfp_arena __arena *a, u32 cid) {
   return a->dsq_id + 1 + cid;
 }
@@ -94,6 +91,12 @@ static __always_inline bool init_jlfp_task_ctx(struct base_arena __arena *a, str
 #ifndef SCHED_RR
 #define SCHED_RR 2
 #endif
+
+// RT KTHREAD WAKEUP EDGE CASE: https://github.com/sched-ext/scx/pull/1094/commits/7d8b8e75812ab62454c734683de4944938b3edc2
+// per-cpu RT kthreads waking up scx task on idle cpu make cpu seem busy during enqueue
+// assumption: these kthreads should finish immediately after scheduler finishes, so not worth migrating
+// detecting this case and treating cpu as idle prevents unecessary migrations
+#define JLFP_RT_IDLE_ORIGIN ((weight_tuple_t)1 << WT_MISC_SHIFT)
 
 static __always_inline bool jlfp_percpu_kthread(struct task_struct *p) {
   return (BPF_CORE_READ(p, flags) & PF_KTHREAD) && BPF_CORE_READ(p, nr_cpus_allowed) == 1;
@@ -264,7 +267,6 @@ static __always_inline s32 jlfp_init_core(struct jlfp_arena __arena *a) {
   }
 
   // init cgroup data structs
-  a->base.self_cgroup_weight = DEFAULT_CGROUP_WEIGHT;
   u32 cid;
   u32 i;
   u32 nr_cids = scx_bpf_nr_cids();
@@ -284,7 +286,6 @@ static __always_inline s32 jlfp_init_core(struct jlfp_arena __arena *a) {
 
   // init task data structs
   a->dsq_id = 1;
-  a->base.self_cgroup_weight = a->base.cgroup_id ? DEFAULT_CGROUP_WEIGHT : WT_CGRP_WEIGHT_MASK;
   err = scx_bpf_create_dsq(a->dsq_id, -1);
   if (err) return err;
   bpf_for(cid, 0, nr_cids) {
@@ -608,10 +609,16 @@ static __always_inline u64 jlfp_try_task_dispatch(struct jlfp_arena __arena *a, 
 
   lstat_record(&lctx, &a->stats[cid].task_dispatch);
 
-  // rerun the previous task
-  if (!moved_pid && prev_wt && likely(prev && pctx)) {
-    moved_pid = prev->pid;
-    scx_bpf_task_set_slice(prev, slice);
+  // need to handle prev
+  if (prev_wt && likely(prev && pctx)) {
+    if (!moved_pid) {
+      // rerun prev
+      moved_pid = prev->pid;
+      scx_bpf_task_set_slice(prev, slice);
+    } else if (BPF_CORE_READ(prev, scx.slice)) {
+      // enqueue prev
+      scx_bpf_task_set_slice(prev, 0);
+    }
   }
 
   return moved_pid;
@@ -647,7 +654,8 @@ static __always_inline bool jlfp_try_sub_dispatch(struct jlfp_arena __arena *a, 
 
 // inserts into a local, per-cid, or global dsq from select_cid or enqueue
 // insertion from select_cid skips the enqueue callback
-static void __always_inline jlfp_pick_cid(struct jlfp_arena __arena *a, struct task_struct *p, u32 prev_cid, u64 enq_flags, u64 task_weight, u64 slice) {
+// returns the local target cid, or prev_cid for non-local queues
+static u32 __always_inline jlfp_pick_cid(struct jlfp_arena __arena *a, struct task_struct *p, u32 prev_cid, u64 enq_flags, u64 task_weight, u64 slice) {
   struct latency_ctx lctx;
   lstat_start(&lctx);
 
@@ -657,7 +665,7 @@ static void __always_inline jlfp_pick_cid(struct jlfp_arena __arena *a, struct t
   u32 reenq_reason = BPF_CORE_READ(p, scx.flags) & SCX_TASK_REENQ_REASON_MASK;
   if ((enq_flags & SCX_ENQ_REENQ) && reenq_reason == SCX_TASK_REENQ_CAP) {
     scx_bpf_error("capability issue: pid=%d enq_flags=%llu", p->pid, enq_flags);
-    return;
+    return prev_cid;
   }
 
   prev_cid = prev_cid & (NR_CPUS - 1); // for verifier
@@ -676,17 +684,17 @@ static void __always_inline jlfp_pick_cid(struct jlfp_arena __arena *a, struct t
     u32 pending_shard = a->base.topo.cids[pending_cid].shard_idx;
     if (unlikely(pending_shard >= NR_CPUS)) {
       scx_bpf_error("Invalid pending shard %u", pending_shard);
-      return;
+      return prev_cid;
     }
     u32 shard_offset = pending_cid - a->base.topo.shards[pending_shard].base_cid;
     if (unlikely(pending_cid < a->base.topo.shards[pending_shard].base_cid || shard_offset >= SCX_CID_SHARD_MAX_CPUS)) {
       scx_bpf_error("Failed to fetch pending cid %u or pending shard %u", pending_cid, pending_shard);
-      return;
+      return prev_cid;
     }
     struct shard_ctx *sctx = bpf_map_lookup_elem(&shard_ctx_map, &pending_shard);
     if (unlikely(!sctx)) {
       scx_bpf_error("Failed to lookup pending shard %u", pending_shard);
-      return;
+      return prev_cid;
     }
     if (unlikely(bpf_res_spin_lock(&sctx->lock))) {
       scx_bpf_error("Failed to lock pending shard %u", pending_shard);
@@ -719,27 +727,40 @@ static void __always_inline jlfp_pick_cid(struct jlfp_arena __arena *a, struct t
       goto dispatch;
     }
 
+    // RT KTHREAD WAKEUP EDGE CASE
     if ((enq_flags & SCX_ENQ_WAKEUP) && !(enq_flags & SCX_ENQ_REENQ) &&
         prev_cid == scx_bpf_this_cid() && jlfp_percpu_rt_kthread(bpf_get_current_task_btf())) {
       u32 shard = a->base.topo.cids[prev_cid].shard_idx;
       struct shard_ctx *sctx = bpf_map_lookup_elem(&shard_ctx_map, &shard);
       u32 offset = prev_cid - a->base.topo.shards[shard].base_cid;
-      weight_tuple_t idle_rt = WT_STRIP_MISC(U128_MAX) | JLFP_RT_IDLE_ORIGIN;
+      const weight_tuple_t idle_rt = WT_STRIP_MISC(U128_MAX) | JLFP_RT_IDLE_ORIGIN;
+
+      // since this would bypass dispatch, check to see if anything in ldsq/nmig ldsq/gdsq
+      // notably: if ldsq is not empty then another scx task is trying to run on this cpu
+      // ops.running during switch back from rt kthread to the scx task should handle cases where this task has higher priority and is put in gdsq/nmig dsq instead of preempting the current scx task
+      // other 2 dsq checks prevent starving the gdsq/nmig dsq at cost of potential migration of enqueued task
+      // since this check happens on wakeup path, want the check to be quick
       if (sctx && offset < SCX_CID_SHARD_MAX_CPUS &&
           READ_ONCE(sctx->cid_running_weight[offset]) == idle_rt &&
           scx_bpf_dsq_nr_queued(SCX_DSQ_LOCAL_ON | prev_cid) == 0 &&
           scx_bpf_dsq_nr_queued(jlfp_nmig_dsq_id(a, prev_cid)) == 0 &&
           scx_bpf_dsq_nr_queued(a->dsq_id) == 0 && !bpf_res_spin_lock(&sctx->lock)) {
-        // consume the idle-origin handoff once; remote selections still see the rt weight
-        if (sctx->cid_running_weight[offset] == idle_rt &&
-            !sctx->cid_pending_weight[offset] && !sctx->cid_pending_owner[offset]) {
+
+        // SHARD LOCK CS START
+
+        if (sctx->cid_running_weight[offset] == idle_rt && !sctx->cid_pending_weight[offset] && !sctx->cid_pending_owner[offset]) {
+          // claim cpu by consuming idle-origin marker
+          // keep running weight at RT thread's running weight until task actually runs
           sctx->cid_running_weight[offset] = WT_STRIP_MISC(U128_MAX);
           set_pending_weight_locked(a, prev_cid, shard, task_wt, sctx, p->scx.tid);
           bpf_res_spin_unlock(&sctx->lock);
+
           get_jlfp_task_ctx(tctx)->pending_cid = prev_cid;
           goto dispatch;
         }
         bpf_res_spin_unlock(&sctx->lock);
+
+        // SHARD LOCK CS END
       }
     }
   }
@@ -884,12 +905,17 @@ static void __always_inline jlfp_pick_cid(struct jlfp_arena __arena *a, struct t
 
   dispatch:
 
-  // if slice not 0, retain prev slice since was likely preempted by higher priority task, bypassing dispatch
+  // if slice not 0, retain prev slice since we need dispatch to run to remove inversions
   // this allows dispatch to fix any gdsq/nmig dsq inversions when slice expires
-  // this case should be pretty rare
-  if (unlikely(p->scx.slice)) slice = p->scx.slice;
+  if (unlikely(p->scx.slice && p->scx.slice < slice)) slice = p->scx.slice;
 
   // SCX_ENQ_PREEMPT handles the kicking
+  // NOTE: if higher priority task is running, prior scx task slice not cleared
+  // this means prior task can be stuck behind current one, and will run next without dispatch running
+  // however ops.running check prevents this prior task from outweighing GDSQ, so inversion limited to prior task not being able to run for a slice
+  // scx_bpf_dsq_reenq(SCX_DSQ_LOCAL_ON | cid, 0) does not fix this since might reenq inserted task
+  // IMMED is designed to fix this but sched_switch sees higher priority class after REENQ loop so not a great fix
+  // also causes migrations due to not being able to handle PREEMPT_RT per-cpu kthread case
   scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | (target_cid & (NR_CPUS - 1)), slice, SCX_ENQ_PREEMPT);
 
   u32 cid = scx_bpf_this_cid();
@@ -899,7 +925,7 @@ static void __always_inline jlfp_pick_cid(struct jlfp_arena __arena *a, struct t
   // NO DISPATCH
   dispatch_fail:
 
-  target_cid = NR_CPUS;
+  target_cid = prev_cid;
 
   // keep bound tasks out of the global queue shared by other cids
   u64 vtime = WT_VTIME_FROM_LOWER(WT_LOWER(task_wt));
@@ -917,6 +943,8 @@ static void __always_inline jlfp_pick_cid(struct jlfp_arena __arena *a, struct t
       e->weight = WT_LOWER(task_wt);
     );
   }
+
+  return target_cid;
 }
 
 static __always_inline void jlfp_running_core(struct jlfp_arena __arena *a, struct task_struct *p, task_ctx_t *tctx, weight_tuple_t wt, struct latency_ctx *lctx) {
@@ -951,6 +979,20 @@ static __always_inline void jlfp_running_core(struct jlfp_arena __arena *a, stru
   // SHARD LOCK CS END
 
   if (likely(tctx)) get_jlfp_task_ctx(tctx)->pending_cid = NR_CPUS;
+
+  // recheck bound work queued while a higher-priority class owned this cpu
+  u64 nmig_dsq_id = jlfp_nmig_dsq_id(a, cid);
+  if (scx_bpf_dsq_nr_queued(nmig_dsq_id) > 0) {
+    struct task_struct *next = scx_bpf_dsq_peek(nmig_dsq_id);
+    if (next) {
+      task_ctx_t *next_ctx = get_task_ctx(next);
+      if (next_ctx && WT_STRIP_MISC(get_jlfp_task_ctx(next_ctx)->weight) > WT_STRIP_MISC(wt) &&
+          cmask_test(cid, &next_ctx->cpus_allowed) &&
+          (!is_migration_disabled(next) || scx_bpf_task_cid(next) == cid)) {
+        scx_bpf_kick_cid(cid, SCX_KICK_PREEMPT);
+      }
+    }
+  }
 
   // a higher task can enter the global queue after dispatch selected this task
   if (!WT_IS_NMIG(wt) && scx_bpf_dsq_nr_queued(a->dsq_id) > 0) {
