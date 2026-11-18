@@ -1,6 +1,6 @@
 ## Project Goal
 
-The goal of this project is to provide a framework for implementing realtime schedulers using the latest Linux scheduling features planned for kernel version 7.3. Specifically, we utilize Linux's native extendible scheduling framework (sched_ext) with new features such as hierarchical cgroup schedulers, userspace-shared arena memory, and topologically aware CPU to CID mappings, to implement various realtime scheduling policies such as Global Earliest Deadline First. The benefits of using mainline Linux over forks such as LITMUS-RT is maintenance cost: It's a lot easier to update to the newest kernel build and keep the system stable if there's minimal kernel modifications. As such, this project uses kernel modifications sparingly, and most features work without kmods/patches. Additionally, non-realtime sched_ext schedulers such as the community-made Rust userspace schedulers can be used as sub-policies for mixed-criticality scheduling.
+Experimental schedulers for implementing preemptive and hierarchical realtime schedulers in the Linux extensible scheduling class (sched_ext).
 
 ## Linux Schedulers Setup
 
